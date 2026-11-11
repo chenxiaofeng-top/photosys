@@ -1,0 +1,97 @@
+name: Desktop builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            artifact: PhotoSys-windows-x64
+            paths: src-tauri/target/release/bundle/nsis/*.exe
+          - runner: ubuntu-24.04
+            artifact: PhotoSys-linux-x64
+            paths: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/appimage/*.AppImage
+          - runner: macos-15
+            artifact: PhotoSys-macos-universal
+            tauri_args: --target universal-apple-darwin
+            paths: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        run: |
+          # The Azure mirror can stall DNS lookups on hosted runners.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://mirror.math.princeton.edu/pub/ubuntu|' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" update -o APT::Update::Error-Mode=any
+          sudo apt-get "${apt_options[@]}" install -y build-essential ca-certificates curl wget file pkg-config \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf xdg-utils
+
+      - name: Set up Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - run: npm ci
+
+      - name: Run Rust and SQLite tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build desktop packages
+        run: npm run tauri build -- ${{ matrix.tauri_args }} -- --locked
+
+      - name: Verify universal macOS executable
+        if: runner.os == 'macOS'
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/PhotoSys.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")
+          lipo "$app/Contents/MacOS/$executable" -verify_arch arm64 x86_64
+
+      - name: Check expected packages
+        shell: pwsh
+        env:
+          PACKAGE_PATHS: ${{ matrix.paths }}
+        run: |
+          foreach ($pattern in ($env:PACKAGE_PATHS.Trim() -split '\r?\n')) {
+            $packages = Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue
+            if (-not ($packages | Where-Object { $_.Length -gt 0 })) {
+              throw "Missing or empty package matching $pattern"
+            }
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.paths }}
+          if-no-files-found: error
