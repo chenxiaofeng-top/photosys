@@ -3,6 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import { formatBytes } from "./formatBytes";
+import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
 type Kind = "photo" | "video";
 
@@ -32,6 +33,7 @@ interface Summary {
   scanId: number;
   total: number;
   issues: number;
+  thumbnailConcurrency: number;
   preferenceWarning: string | null;
 }
 
@@ -147,6 +149,7 @@ function scanProgress() {
 }
 
 function showScan(selected: string, scanned: Summary) {
+  setLibraryThumbnailConcurrency(scanned.thumbnailConcurrency);
   if (selected !== directory.value) {
     kind.value = "all";
     dateMode.value = "all";

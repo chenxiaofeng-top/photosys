@@ -7,7 +7,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -23,12 +24,20 @@ use crate::duplicates::{Candidate, FileStamp, Root, display_path, is_link};
 use crate::media_date::{self, Media};
 
 const PAGE_SIZE: usize = 24;
+const MAX_THUMBNAIL_CONCURRENCY: usize = 3;
 const STATE_ERROR: &str = "无法读取媒体库状态，请重启应用后重试。";
 const STALE_SCAN: &str = "媒体库已变化，请刷新。";
 static SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
-static THUMBNAIL_SLOTS: Semaphore = Semaphore::const_new(2);
+static THUMBNAIL_CONCURRENCY: LazyLock<usize> =
+    LazyLock::new(|| thumbnail_concurrency(thread::available_parallelism().map_or(1, usize::from)));
+static THUMBNAIL_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(*THUMBNAIL_CONCURRENCY));
 static DETAIL_SLOTS: Semaphore = Semaphore::const_new(1);
+
+fn thumbnail_concurrency(threads: usize) -> usize {
+    (threads / 2).clamp(1, MAX_THUMBNAIL_CONCURRENCY)
+}
 
 pub(crate) fn include_in_scan(entry: &DirEntry) -> bool {
     entry.depth() == 0 || entry.file_name() != favorites::DATA_DIR
@@ -63,6 +72,7 @@ pub(crate) struct Summary {
     scan_id: u64,
     total: usize,
     issues: usize,
+    thumbnail_concurrency: usize,
     preference_warning: Option<String>,
 }
 
@@ -450,6 +460,7 @@ fn open_library(
         scan_id: scanned.scan.id,
         total: scanned.scan.items.len(),
         issues: scanned.scan.issues.len(),
+        thumbnail_concurrency: *THUMBNAIL_CONCURRENCY,
         preference_warning: None,
     };
     *session()? = Some(scanned);
@@ -564,7 +575,7 @@ pub(crate) async fn library_preview(
     let slots = if detail {
         &DETAIL_SLOTS
     } else {
-        &THUMBNAIL_SLOTS
+        &*THUMBNAIL_SLOTS
     };
     let permit = slots.acquire().await.map_err(|_| STATE_ERROR)?;
     tauri::async_runtime::spawn_blocking(move || {

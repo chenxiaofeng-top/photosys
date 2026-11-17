@@ -1,6 +1,6 @@
 type LoadThumbnail = () => Promise<void>;
 
-const maxActive = 2;
+let maxActive = 1;
 const waiting = new Set<LoadThumbnail>();
 let active = 0;
 
@@ -14,6 +14,10 @@ function drain() {
       drain();
     });
   }
+}
+
+export function setLibraryThumbnailConcurrency(limit: number) {
+  maxActive = limit;
 }
 
 export function queueLibraryThumbnail(load: LoadThumbnail) {

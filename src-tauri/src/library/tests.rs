@@ -23,6 +23,20 @@ fn all() -> Filter {
 }
 
 #[test]
+fn reserves_capacity_for_the_desktop_and_bounds_thumbnail_concurrency() {
+    assert_eq!(thumbnail_concurrency(1), 1);
+    assert_eq!(thumbnail_concurrency(2), 1);
+    assert_eq!(thumbnail_concurrency(4), 2);
+    assert_eq!(thumbnail_concurrency(6), 3);
+    assert_eq!(thumbnail_concurrency(64), 3);
+    let _thumbnails = THUMBNAIL_SLOTS
+        .try_acquire_many(*THUMBNAIL_CONCURRENCY as u32)
+        .unwrap();
+    assert!(THUMBNAIL_SLOTS.try_acquire().is_err());
+    let _detail = DETAIL_SLOTS.try_acquire().unwrap();
+}
+
+#[test]
 fn sorts_dates_and_filters_mixed_media_with_on_demand_preview() {
     let directory = tempdir().unwrap();
     let path = directory.path();
