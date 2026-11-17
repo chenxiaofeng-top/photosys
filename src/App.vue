@@ -2,6 +2,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
+import MediaLibrary from "./MediaLibrary.vue";
 import SimilarPhotosPanel from "./SimilarPhotosPanel.vue";
 import { formatBytes } from "./formatBytes";
 
@@ -34,11 +35,37 @@ const running = ref(false);
 const result = ref<ArchiveSummary>();
 const progress = ref<ArchiveProgress>();
 const error = ref("");
-const view = ref<"archive" | "duplicates" | "similar">("archive");
-const viewTitles = { archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片" };
+const viewTitles = {
+  library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片",
+};
+type View = keyof typeof viewTitles;
+const view = ref<View>("library");
+const libraryDirectory = ref("");
+const libraryBusy = ref(false);
 const duplicatesBusy = ref(false);
 const similarBusy = ref(false);
-const fileTaskBusy = computed(() => choosing.value || running.value || duplicatesBusy.value || similarBusy.value);
+const duplicatesPanel = ref<InstanceType<typeof DuplicatesPanel>>();
+const similarPanel = ref<InstanceType<typeof SimilarPhotosPanel>>();
+const fileTaskBusy = computed(() =>
+  libraryBusy.value || choosing.value || running.value || duplicatesBusy.value || similarBusy.value,
+);
+
+function navigate(target: View) {
+  if (fileTaskBusy.value) return;
+  const directory = libraryDirectory.value;
+  if (view.value === "library" && directory) {
+    if (target === "archive" && source.value !== directory) {
+      source.value = directory;
+      result.value = undefined;
+      error.value = "";
+    } else if (target === "duplicates") {
+      duplicatesPanel.value?.useDirectory(directory);
+    } else if (target === "similar") {
+      similarPanel.value?.useDirectory(directory);
+    }
+  }
+  view.value = target;
+}
 
 async function chooseFolder(kind: "source" | "destination") {
   if (choosing.value || running.value) return;
@@ -91,26 +118,21 @@ async function startArchive() {
 </script>
 
 <template>
-  <main>
+  <main :class="{ 'library-layout': view === 'library' }">
     <header>
       <p class="app-name">PhotoSys</p>
       <nav class="view-nav" aria-label="功能">
-        <button type="button" class="secondary" :aria-pressed="view === 'archive'"
-          :disabled="fileTaskBusy" @click="view = 'archive'">
-          照片与视频归档
-        </button>
-        <button type="button" class="secondary" :aria-pressed="view === 'duplicates'"
-          :disabled="fileTaskBusy" @click="view = 'duplicates'">
-          重复文件
-        </button>
-        <button type="button" class="secondary" :aria-pressed="view === 'similar'"
-          :disabled="fileTaskBusy" @click="view = 'similar'">
-          相似照片
+        <button v-for="(title, target) in viewTitles" :key="target" type="button" class="secondary"
+          :aria-pressed="view === target" :disabled="fileTaskBusy" @click="navigate(target)">
+          {{ title }}
         </button>
       </nav>
       <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
+
+    <MediaLibrary v-show="view === 'library'" @busy-change="libraryBusy = $event"
+      @directory-change="libraryDirectory = $event" />
 
     <form v-if="view === 'archive'" @submit.prevent="startArchive">
       <div class="folder">
@@ -178,8 +200,8 @@ async function startArchive() {
       <p v-if="result.reportPath" class="report">复制说明：<span>{{ result.reportPath }}</span></p>
       <p v-if="result.reportError" class="error">无法写入复制说明。{{ result.reportError }}</p>
     </section>
-    <DuplicatesPanel v-show="view === 'duplicates'" @busy-change="duplicatesBusy = $event" />
-    <SimilarPhotosPanel v-show="view === 'similar'" @busy-change="similarBusy = $event" />
+    <DuplicatesPanel v-show="view === 'duplicates'" ref="duplicatesPanel" @busy-change="duplicatesBusy = $event" />
+    <SimilarPhotosPanel v-show="view === 'similar'" ref="similarPanel" @busy-change="similarBusy = $event" />
   </main>
 </template>
 
@@ -198,6 +220,11 @@ main {
   max-width: 42rem;
   margin: 0 auto;
   padding: clamp(1.25rem, 6vw, 3.5rem);
+}
+
+main.library-layout {
+  max-width: 72rem;
+  padding: clamp(1rem, 4vw, 2.5rem);
 }
 
 header {

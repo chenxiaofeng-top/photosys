@@ -95,16 +95,22 @@ function resetScan() {
   page.value = 1;
 }
 
+function useDirectory(folder: string) {
+  if (directory.value === folder) return;
+  directory.value = folder;
+  error.value = "";
+  resetScan();
+}
+
+defineExpose({ useDirectory });
+
 async function chooseDirectory() {
   if (busy.value) return;
   task.value = "choosing";
   error.value = "";
   try {
     const folder = await invoke<string | null>("choose_folder", { title: "选择查重目录" });
-    if (folder !== null && directory.value !== folder) {
-      directory.value = folder;
-      resetScan();
-    }
+    if (folder !== null) useDirectory(folder);
   } catch (cause) {
     error.value = `无法选择目录。${String(cause)}`;
   } finally {

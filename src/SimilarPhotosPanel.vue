@@ -103,17 +103,23 @@ function resetResults() {
   closeGroup();
 }
 
+function useDirectory(folder: string) {
+  if (directory.value === folder) return;
+  directory.value = folder;
+  scanError.value = "";
+  notice.value = "";
+  resetResults();
+}
+
+defineExpose({ useDirectory });
+
 async function chooseDirectory() {
   if (busy.value) return;
   choosing.value = true;
   scanError.value = "";
   try {
     const folder = await invoke<string | null>("choose_folder", { title: "选择相似照片扫描目录" });
-    if (folder !== null && directory.value !== folder) {
-      directory.value = folder;
-      notice.value = "";
-      resetResults();
-    }
+    if (folder !== null) useDirectory(folder);
   } catch (cause) {
     scanError.value = `无法选择目录。${String(cause)}`;
   } finally {

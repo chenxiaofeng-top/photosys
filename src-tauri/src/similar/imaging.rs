@@ -17,7 +17,7 @@ pub(super) const MAX_PIXELS: u64 = 64_000_000;
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
-pub(super) fn supported(path: &Path) -> bool {
+pub(crate) fn supported(path: &Path) -> bool {
     matches!(
         ImageFormat::from_path(path),
         Ok(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff)

@@ -102,7 +102,9 @@ pub fn run(
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|entry| entry.path() != destination);
+        .filter_entry(|entry| {
+            entry.path() != destination && crate::library::include_in_scan(entry)
+        });
 
     for entry in entries {
         let entry = match entry {

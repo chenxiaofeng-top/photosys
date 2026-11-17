@@ -2,6 +2,8 @@ mod cache;
 mod imaging;
 mod matching;
 
+pub(crate) use imaging::supported as supports_preview;
+
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -222,6 +224,12 @@ fn discover(
     while let Some(entry) = entries.next() {
         checkpoint(cancelled)?;
         if let Ok(entry) = entry {
+            if !crate::library::include_in_scan(&entry) {
+                if entry.file_type().is_dir() {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
             let relative = entry
                 .path()
                 .strip_prefix(&root.path)
@@ -558,7 +566,6 @@ pub(crate) async fn similar_preview(
     detail: bool,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _preview = PREVIEW.lock().map_err(|_| STATE_ERROR)?;
         let scan = result(scan_id)?;
         let photo = scan
             .photos
@@ -570,7 +577,8 @@ pub(crate) async fn similar_preview(
     .map_err(|error| format!("无法加载照片预览。{error}"))?
 }
 
-fn preview(root: &Root, photo: &Candidate, detail: bool) -> Result<String, String> {
+pub(crate) fn preview(root: &Root, photo: &Candidate, detail: bool) -> Result<String, String> {
+    let _preview = PREVIEW.lock().map_err(|_| STATE_ERROR)?;
     let stale = |_| "照片已变化或已移除，请重新扫描。";
     let mut file = root.open_matching(photo).map_err(stale)?;
     let image = imaging::preview(&mut file, photo.stamp.size, detail);

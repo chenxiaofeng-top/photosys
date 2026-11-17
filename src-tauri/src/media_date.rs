@@ -61,9 +61,17 @@ pub fn from_filename(path: &Path) -> Option<NaiveDate> {
 }
 
 pub fn from_metadata(parser: &mut MediaParser, path: &Path, media: Media) -> Option<NaiveDate> {
+    from_open_file(parser, File::open(path).ok()?, media)
+}
+
+pub(crate) fn from_open_file(
+    parser: &mut MediaParser,
+    file: File,
+    media: Media,
+) -> Option<NaiveDate> {
     match media {
-        Media::LivePhoto => live_photo_date(parser, path),
-        _ => parse_file(parser, File::open(path).ok()?, media),
+        Media::LivePhoto => live_photo_date(parser, file),
+        _ => parse_file(parser, file, media),
     }
 }
 
@@ -115,8 +123,8 @@ fn valid_year(date: NaiveDate) -> bool {
     (1..=9999).contains(&date.year())
 }
 
-fn live_photo_date(parser: &mut MediaParser, path: &Path) -> Option<NaiveDate> {
-    let mut archive = ZipArchive::new(File::open(path).ok()?).ok()?;
+fn live_photo_date(parser: &mut MediaParser, file: File) -> Option<NaiveDate> {
+    let mut archive = ZipArchive::new(file).ok()?;
     for media in [Media::Photo, Media::Video] {
         for index in 0..archive.len() {
             let Ok(mut member) = archive.by_index(index) else {

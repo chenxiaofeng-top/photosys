@@ -14,6 +14,8 @@ use walkdir::WalkDir;
 use platform::FileIdentity;
 
 pub(crate) use platform::is_link;
+#[cfg(windows)]
+pub(crate) use platform::shell_path;
 pub(crate) use platform::trash;
 
 const READ_BUFFER: usize = 64 * 1024;
@@ -158,12 +160,17 @@ impl Root {
         Ok(Self { path, identity })
     }
 
-    pub(crate) fn open_file(&self, relative: &Path) -> io::Result<File> {
+    pub(crate) fn verify_directory(&self) -> io::Result<()> {
         if self.path.canonicalize()? != self.path
             || directory_identity(&self.path)? != self.identity
         {
             return Err(io::Error::other("扫描目录已变化，请重新扫描。"));
         }
+        Ok(())
+    }
+
+    pub(crate) fn open_file(&self, relative: &Path) -> io::Result<File> {
+        self.verify_directory()?;
         let mut path = self.path.clone();
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
@@ -377,6 +384,12 @@ pub(crate) fn scan(
                 continue;
             }
         };
+        if !crate::library::include_in_scan(&entry) {
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
+            continue;
+        }
         let relative = entry.path().strip_prefix(&root.path).unwrap();
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,

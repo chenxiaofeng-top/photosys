@@ -96,23 +96,13 @@ pub(crate) fn trash(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-pub(crate) fn trash(path: &Path) -> Result<(), String> {
+pub(crate) fn shell_path(path: &Path) -> Result<std::ffi::OsString, String> {
     use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Prefix};
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-        CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    };
-    use windows::Win32::UI::Shell::{
-        FOF_NO_UI, FOF_NORECURSION, FOF_WANTNUKEWARNING, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
-    };
-    use windows::core::PCWSTR;
 
     // The Shell needs DOS drive or UNC syntax instead of std's verbatim prefix.
     let mut components = path.components();
-    let shell_path = match components.next() {
+    match components.next() {
         Some(Component::Prefix(prefix)) => {
             let mut base = match prefix.kind() {
                 Prefix::VerbatimDisk(drive) => OsString::from(format!("{}:", char::from(drive))),
@@ -126,10 +116,27 @@ pub(crate) fn trash(path: &Path) -> Result<(), String> {
                 _ => prefix.as_os_str().to_os_string(),
             };
             base.push(components.as_path());
-            base
+            Ok(base)
         }
-        _ => return Err("无法识别回收站所需的 Windows 路径。".into()),
+        _ => Err("无法识别 Windows 文件路径。".into()),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn trash(path: &Path) -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
+    use windows::Win32::UI::Shell::{
+        FOF_NO_UI, FOF_NORECURSION, FOF_WANTNUKEWARNING, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    };
+    use windows::core::PCWSTR;
+
+    let shell_path = shell_path(path)?;
     let wide_path: Vec<_> = shell_path.encode_wide().chain([0]).collect();
 
     struct ComApartment;

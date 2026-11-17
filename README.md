@@ -1,6 +1,16 @@
 # PhotoSys
 
-PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用，用于复制和按月归档照片与视频。
+PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用，用于浏览、收藏、查重和归档本地照片与视频。
+
+## 便携媒体库
+
+将 Linux x64 的 `PhotoSys.AppImage` 放到相册根目录。在文件属性中授予执行权限，或运行 `chmod +x PhotoSys.AppImage`，然后双击。PhotoSys 自动扫描 AppImage 所在目录及其子目录。安装版和开发版在「媒体库」中点击「选择目录」。在外部添加、删除或改名文件后，点击「刷新」更新列表。
+
+如果 Linux 环境无法挂载 AppImage，可在相册目录运行 `APPIMAGE_EXTRACT_AND_RUN=1 ./PhotoSys.AppImage`。
+
+媒体库按拍摄日期从新到旧排列，支持按类型、日期范围、日期未知和收藏筛选。可以在应用内预览 JPG/JPEG、PNG、WebP 和 TIFF，或者通过系统默认应用打开照片或播放视频。从媒体库切换到归档、查重或相似照片时，会带入当前目录。
+
+第一次收藏时，PhotoSys 在相册根目录的隐藏目录 `.photosys` 中建立 `library.sqlite`。搬家时先关闭 PhotoSys，再复制整个相册目录（包括 AppImage 和隐藏目录）。收藏按相对路径保存，因此整个相册换位置后仍可使用。单独移动或重命名媒体文件后，收藏仍对应原相对路径。只读目录可以浏览，保存收藏需要对相册数据目录有写入权限。
 
 ## 归档照片与视频
 

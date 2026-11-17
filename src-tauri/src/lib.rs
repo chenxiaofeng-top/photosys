@@ -1,5 +1,6 @@
 mod archive;
 mod duplicates;
+mod library;
 mod media_date;
 mod similar;
 
@@ -111,6 +112,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            library::library_startup_directory,
+            library::scan_library,
+            library::library_items,
+            library::library_issues,
+            library::library_preview,
+            library::set_library_favorite,
+            library::open_library_item,
             archive_media,
             scan_duplicates,
             trash_duplicates,
