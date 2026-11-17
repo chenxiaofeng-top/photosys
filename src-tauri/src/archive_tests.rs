@@ -75,7 +75,7 @@ fn sorts_using_filename_then_capture_time_and_preserves_live_photos() {
     put(&source, "流水号12026060790.png", b"no metadata");
     put(&source, "readme.txt", b"ignored");
 
-    let summary = run(&source, &destination).unwrap();
+    let summary = run(&source, &destination, |_| {}).unwrap();
     assert_eq!(
         (summary.found, summary.copied, summary.other, summary.failed),
         (9, 9, 2, 0)
@@ -119,7 +119,7 @@ fn handles_same_size_collisions_and_finds_duplicates_past_gaps() {
     put(&month, "20230607.jpg", b"preexisting");
     put(&month, "20230607_3.jpg", b"same name B");
 
-    let first = run(&source, &destination).unwrap();
+    let first = run(&source, &destination, |_| {}).unwrap();
     assert_eq!(
         (first.copied, first.duplicates, first.renamed, first.failed),
         (1, 2, 1, 0)
@@ -140,7 +140,7 @@ fn handles_same_size_collisions_and_finds_duplicates_past_gaps() {
             .contains("重命名明细")
     );
 
-    let second = run(&source, &destination).unwrap();
+    let second = run(&source, &destination, |_| {}).unwrap();
     assert_eq!((second.copied, second.duplicates, second.failed), (0, 3, 0));
     assert_ne!(first_report, second.report_path.unwrap());
     assert!(Path::new(&first_report).exists());
@@ -161,9 +161,9 @@ fn excludes_nested_destination_and_reports_partial_failures() {
     )
     .unwrap();
 
-    assert!(run(&source, &source).is_err());
-    assert!(run(&destination, &source).is_err());
-    let summary = run(&source, &destination).unwrap();
+    assert!(run(&source, &source, |_| {}).is_err());
+    assert!(run(&destination, &source, |_| {}).is_err());
+    let summary = run(&source, &destination, |_| {}).unwrap();
     assert_eq!((summary.found, summary.copied, summary.failed), (2, 1, 1));
     assert!(source.join("2024-05-02.png").is_file());
     assert!(destination.join("2026/2026-05/2026-05-02.png").is_file());
@@ -176,9 +176,115 @@ fn excludes_nested_destination_and_reports_partial_failures() {
 #[test]
 fn writes_a_report_for_an_empty_source() {
     let (_root, source, destination) = folders();
-    let summary = run(&source, &destination).unwrap();
+    let mut progress = Vec::new();
+    let summary = run(&source, &destination, |update| progress.push(update)).unwrap();
     assert_eq!(summary.found, 0);
     assert!(Path::new(&summary.report_path.unwrap()).is_file());
+    assert_eq!(
+        progress,
+        [
+            ArchiveProgress::Scanning { found: 0 },
+            ArchiveProgress::Reporting {
+                processed: 0,
+                total: 0,
+            },
+        ]
+    );
+}
+
+#[test]
+fn reports_copy_duplicate_and_failure_in_processed_total() {
+    let (_root, source, destination) = folders();
+    put(&source, "a_2026-06-01.jpg", b"copy");
+    put(&source, "b_2026-06-02.jpg", b"duplicate");
+    put(&source, "c_2024-06-01.jpg", b"fail");
+    put(&source, "notes.txt", b"ignored");
+    put(&destination, "2026/2026-06/b_2026-06-02.jpg", b"duplicate");
+    put(&destination, "2024", b"blocks directory creation");
+
+    let mut progress = Vec::new();
+    let summary = run(&source, &destination, |update| progress.push(update)).unwrap();
+    assert_eq!(
+        (summary.copied, summary.duplicates, summary.failed),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        progress.first(),
+        Some(&ArchiveProgress::Scanning { found: 0 })
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .find(|update| matches!(update, ArchiveProgress::Archiving { .. })),
+        Some(&ArchiveProgress::Archiving {
+            processed: 0,
+            total: 3,
+            current_file: "a_2026-06-01.jpg".into(),
+            transfer: None,
+        })
+    );
+    assert_eq!(
+        progress.last(),
+        Some(&ArchiveProgress::Reporting {
+            processed: 3,
+            total: 3,
+        })
+    );
+}
+
+#[test]
+fn reports_written_bytes_during_copy_and_skips_duplicate_and_empty_transfers() {
+    let (_root, source, destination) = folders();
+    let contents = vec![0x42; COPY_BUFFER_SIZE * 2 + 1];
+    put(&source, "video.mov", &contents);
+    put(&source, "empty.mov", b"");
+
+    let mut progress = Vec::new();
+    let video = source.join("video.mov");
+    assert!(
+        copy_media(&video, &destination, |update| progress
+            .push(update.unwrap()))
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(fs::read(destination.join("video.mov")).unwrap(), contents);
+    assert!(progress.len() >= 3);
+    assert!(progress.first().unwrap().bytes_written < contents.len() as u64);
+    assert!(
+        progress
+            .windows(2)
+            .all(|updates| updates[0].bytes_written < updates[1].bytes_written)
+    );
+    assert!(
+        progress
+            .iter()
+            .all(|update| update.total_bytes == contents.len() as u64)
+    );
+    assert_eq!(
+        progress.last().unwrap().bytes_written,
+        contents.len() as u64
+    );
+
+    let mut comparisons = 0;
+    assert!(
+        copy_media(&video, &destination, |update| {
+            assert!(update.is_none());
+            comparisons += 1;
+        })
+        .unwrap()
+        .is_none()
+    );
+    assert!(comparisons > 1);
+
+    let mut empty_updates = Vec::new();
+    assert!(
+        copy_media(&source.join("empty.mov"), &destination, |update| {
+            empty_updates.push(update);
+        })
+        .unwrap()
+        .is_some()
+    );
+    assert!(empty_updates.is_empty());
 }
 
 #[cfg(unix)]
@@ -193,7 +299,7 @@ fn keeps_copy_statistics_when_the_report_cannot_be_written() {
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o555)).unwrap();
     // A privileged test runner can still write into a read-only directory.
     let report_is_blocked = NamedTempFile::new_in(&destination).is_err();
-    let summary = run(&source, &destination);
+    let summary = run(&source, &destination, |_| {});
     fs::set_permissions(&destination, permissions).unwrap();
 
     let summary = summary.unwrap();

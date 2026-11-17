@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use nom_exif::MediaParser;
@@ -11,6 +12,38 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::media_date::{self, Media};
+
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const COPY_BUFFER_SIZE: usize = 256 * 1024;
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ArchiveProgress {
+    Scanning {
+        found: u64,
+    },
+    Archiving {
+        processed: u64,
+        total: u64,
+        current_file: String,
+        transfer: Option<CopyProgress>,
+    },
+    Reporting {
+        processed: u64,
+        total: u64,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyProgress {
+    bytes_written: u64,
+    total_bytes: u64,
+}
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +65,11 @@ struct ArchiveRun {
     errors: Vec<(PathBuf, String)>,
 }
 
-pub fn run(source: &Path, destination: &Path) -> Result<ArchiveSummary, String> {
+pub fn run(
+    source: &Path,
+    destination: &Path,
+    mut on_progress: impl FnMut(ArchiveProgress),
+) -> Result<ArchiveSummary, String> {
     let source = checked_directory(source, "源目录")?;
     let destination = checked_directory(destination, "目标目录")?;
     if source == destination {
@@ -48,7 +85,19 @@ pub fn run(source: &Path, destination: &Path) -> Result<ArchiveSummary, String> 
         renames: Vec::new(),
         errors: Vec::new(),
     };
-    let mut parser = MediaParser::new();
+    on_progress(ArchiveProgress::Scanning { found: 0 });
+    let mut last_update = Instant::now();
+    let mut progress_due = |phase_changed| {
+        let now = Instant::now();
+        if phase_changed || now.duration_since(last_update) >= PROGRESS_INTERVAL {
+            last_update = now;
+            true
+        } else {
+            false
+        }
+    };
+
+    let mut candidates = Vec::new();
     let entries = WalkDir::new(&source)
         .follow_links(false)
         .sort_by_file_name()
@@ -68,10 +117,40 @@ pub fn run(source: &Path, destination: &Path) -> Result<ArchiveSummary, String> 
         if entry.file_type().is_file()
             && let Some(media) = Media::from_path(entry.path())
         {
-            job.archive_file(&mut parser, entry.path(), media, &destination);
+            candidates.push((entry.into_path(), media));
+            if progress_due(false) {
+                on_progress(ArchiveProgress::Scanning {
+                    found: candidates.len() as u64,
+                });
+            }
         }
     }
 
+    let total = candidates.len() as u64;
+    job.summary.found = total;
+    let mut parser = MediaParser::new();
+    for (index, (path, media)) in candidates.into_iter().enumerate() {
+        let processed = index as u64;
+        let mut report_file = |phase_changed, transfer| {
+            if progress_due(phase_changed) {
+                on_progress(ArchiveProgress::Archiving {
+                    processed,
+                    total,
+                    current_file: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    transfer,
+                });
+            }
+        };
+        report_file(index == 0, None);
+        job.archive_file(&mut parser, &path, media, &destination, |transfer| {
+            report_file(false, transfer);
+        });
+    }
+
+    on_progress(ArchiveProgress::Reporting {
+        processed: job.summary.copied + job.summary.duplicates + job.summary.failed,
+        total,
+    });
     let finished = Local::now();
     let report_name = format!("复制说明_{}.txt", started.format("%Y%m%d_%H%M%S"));
     let started = started.format("%Y-%m-%d %H:%M:%S %:z");
@@ -116,8 +195,8 @@ impl ArchiveRun {
         source: &Path,
         media: Media,
         destination: &Path,
+        on_progress: impl FnMut(Option<CopyProgress>),
     ) {
-        self.summary.found += 1;
         let date = media_date::from_filename(source)
             .or_else(|| media_date::from_metadata(parser, source, media));
 
@@ -129,7 +208,7 @@ impl ArchiveRun {
                 }
                 None => ensure_subdirectory(destination, "其它")?,
             };
-            copy_media(source, &directory)
+            copy_media(source, &directory, on_progress)
         })();
 
         match result {
@@ -208,12 +287,19 @@ fn ensure_subdirectory(parent: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn copy_media(source: &Path, directory: &Path) -> io::Result<Option<(PathBuf, bool)>> {
+fn copy_media(
+    source: &Path,
+    directory: &Path,
+    mut on_progress: impl FnMut(Option<CopyProgress>),
+) -> io::Result<Option<(PathBuf, bool)>> {
     let name = source.file_name().unwrap();
     let size = source.metadata()?.len();
     let mut pending = None;
     loop {
-        let Some(number) = available_number(source, directory, name, size)? else {
+        let Some(number) = available_number(source, directory, name, size, &mut || {
+            on_progress(None);
+        })?
+        else {
             return Ok(None);
         };
         let path = directory.join(numbered_name(name, number));
@@ -221,7 +307,23 @@ fn copy_media(source: &Path, directory: &Path) -> io::Result<Option<(PathBuf, bo
             Some(file) => file,
             None => {
                 let mut file = NamedTempFile::new_in(directory)?;
-                io::copy(&mut File::open(source)?, &mut file)?;
+                let mut input = File::open(source)?;
+                let mut buffer = vec![0; COPY_BUFFER_SIZE];
+                let mut bytes_written = 0;
+                loop {
+                    let count = match input.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => count,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    };
+                    file.write_all(&buffer[..count])?;
+                    bytes_written += count as u64;
+                    on_progress(Some(CopyProgress {
+                        bytes_written,
+                        total_bytes: size,
+                    }));
+                }
                 file.as_file().sync_all()?;
                 file
             }
@@ -239,9 +341,10 @@ fn available_number(
     directory: &Path,
     name: &OsStr,
     size: u64,
+    on_compare: &mut impl FnMut(),
 ) -> io::Result<Option<u64>> {
     let original = directory.join(name);
-    match match_file(source, &original, size)? {
+    match match_file(source, &original, size, on_compare)? {
         Candidate::Missing => return Ok(Some(0)),
         Candidate::Identical => return Ok(None),
         Candidate::Occupied => {}
@@ -277,7 +380,7 @@ fn available_number(
     let mut available = 1;
     for number in suffixes {
         let path = directory.join(numbered_name(name, number));
-        match match_file(source, &path, size)? {
+        match match_file(source, &path, size, on_compare)? {
             Candidate::Identical => return Ok(None),
             Candidate::Occupied if number == available => available += 1,
             _ => {}
@@ -292,7 +395,12 @@ enum Candidate {
     Occupied,
 }
 
-fn match_file(source: &Path, candidate: &Path, size: u64) -> io::Result<Candidate> {
+fn match_file(
+    source: &Path,
+    candidate: &Path,
+    size: u64,
+    on_compare: &mut impl FnMut(),
+) -> io::Result<Candidate> {
     let metadata = match fs::symlink_metadata(candidate) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Candidate::Missing),
@@ -300,14 +408,24 @@ fn match_file(source: &Path, candidate: &Path, size: u64) -> io::Result<Candidat
     };
     if metadata.is_file()
         && metadata.len() == size
-        && same_bytes(&mut File::open(source)?, &mut File::open(candidate)?, size)?
+        && same_bytes(
+            &mut File::open(source)?,
+            &mut File::open(candidate)?,
+            size,
+            on_compare,
+        )?
     {
         return Ok(Candidate::Identical);
     }
     Ok(Candidate::Occupied)
 }
 
-fn same_bytes(first: &mut File, second: &mut File, mut remaining: u64) -> io::Result<bool> {
+fn same_bytes(
+    first: &mut File,
+    second: &mut File,
+    mut remaining: u64,
+    on_compare: &mut impl FnMut(),
+) -> io::Result<bool> {
     let mut left = [0; 64 * 1024];
     let mut right = [0; 64 * 1024];
     while remaining > 0 {
@@ -318,6 +436,7 @@ fn same_bytes(first: &mut File, second: &mut File, mut remaining: u64) -> io::Re
             return Ok(false);
         }
         remaining -= length as u64;
+        on_compare();
     }
     Ok(first.read(&mut left[..1])? == 0 && second.read(&mut right[..1])? == 0)
 }

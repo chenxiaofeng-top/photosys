@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { ref } from "vue";
 
 interface ArchiveSummary {
@@ -14,12 +14,35 @@ interface ArchiveSummary {
   reportError: string | null;
 }
 
+interface CopyProgress {
+  bytesWritten: number;
+  totalBytes: number;
+}
+
+type ArchiveProgress =
+  | { phase: "scanning"; found: number }
+  | { phase: "archiving"; processed: number; total: number; currentFile: string; transfer: CopyProgress | null }
+  | { phase: "reporting"; processed: number; total: number };
+
 const source = ref("");
 const destination = ref("");
 const choosing = ref(false);
 const running = ref(false);
 const result = ref<ArchiveSummary>();
+const progress = ref<ArchiveProgress>();
 const error = ref("");
+
+const byteUnits = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+const byteFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+
+function formatBytes(bytes: number) {
+  let unit = 0;
+  while (bytes >= 1024 && unit < byteUnits.length - 1) {
+    bytes /= 1024;
+    unit++;
+  }
+  return `${byteFormatter.format(bytes)} ${byteUnits[unit]}`;
+}
 
 async function chooseFolder(kind: "source" | "destination") {
   if (choosing.value || running.value) return;
@@ -49,15 +72,23 @@ async function startArchive() {
   running.value = true;
   error.value = "";
   result.value = undefined;
+  progress.value = { phase: "scanning", found: 0 };
+  let receivingProgress = true;
 
   try {
+    const channel = new Channel<ArchiveProgress>((update) => {
+      if (receivingProgress) progress.value = update;
+    });
     result.value = await invoke<ArchiveSummary>("archive_media", {
       source: source.value,
       destination: destination.value,
+      progress: channel,
     });
   } catch (cause) {
     error.value = String(cause);
   } finally {
+    receivingProgress = false;
+    progress.value = undefined;
     running.value = false;
   }
 }
@@ -96,7 +127,27 @@ async function startArchive() {
         <button type="submit" :disabled="!source || !destination || choosing || running">
           {{ running ? "正在复制…" : "开始复制" }}
         </button>
-        <p v-if="running" role="status">正在扫描并复制媒体文件。</p>
+      </div>
+      <div v-if="progress" class="archive-progress">
+        <template v-if="progress.phase === 'scanning'">
+          <p role="status">正在扫描媒体文件…</p>
+          <progress aria-label="扫描进度"></progress>
+          <p>已发现 {{ progress.found }} 个文件</p>
+        </template>
+        <template v-else>
+          <template v-if="progress.total > 0">
+            <p>已处理 {{ progress.processed }} / {{ progress.total }} 个文件（{{ Math.floor(progress.processed / progress.total * 100) }}%）</p>
+            <progress aria-label="总体归档进度" :value="progress.processed" :max="progress.total"></progress>
+          </template>
+          <p v-if="progress.phase === 'reporting'" role="status">正在生成复制说明…</p>
+          <template v-else>
+            <p class="current-file">正在处理 {{ progress.currentFile }}</p>
+            <template v-if="progress.transfer && progress.transfer.totalBytes > 0">
+              <progress aria-label="当前文件复制进度" :value="progress.transfer.bytesWritten" :max="progress.transfer.totalBytes"></progress>
+              <p>{{ formatBytes(progress.transfer.bytesWritten) }} / {{ formatBytes(progress.transfer.totalBytes) }}</p>
+            </template>
+          </template>
+        </template>
       </div>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
     </form>
@@ -205,7 +256,27 @@ label {
   margin-top: 1.25rem;
 }
 
-.actions p,
+.archive-progress {
+  display: grid;
+  gap: 0.375rem;
+  margin-top: 1rem;
+  color: #395d57;
+  font-variant-numeric: tabular-nums;
+}
+
+.archive-progress p {
+  margin: 0;
+}
+
+.archive-progress progress {
+  width: 100%;
+  accent-color: #176252;
+}
+
+.current-file {
+  overflow-wrap: anywhere;
+}
+
 .report {
   margin: 0;
   color: #395d57;
