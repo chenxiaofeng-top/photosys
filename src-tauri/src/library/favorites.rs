@@ -5,32 +5,30 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, params};
+use tempfile::NamedTempFile;
 
 use crate::duplicates::{Root, is_link};
 
 pub(super) const DATA_DIR: &str = ".photosys";
+const SCHEMA: &str = "CREATE TABLE favorites (path BLOB PRIMARY KEY) WITHOUT ROWID";
 
-fn database(root: &Root, create: bool) -> Result<Option<PathBuf>, String> {
+fn data_directory(root: &Root) -> Result<Option<PathBuf>, String> {
     root.verify_directory().map_err(|error| error.to_string())?;
     let directory = root.path.join(DATA_DIR);
-    if create {
-        match fs::create_dir(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
     match fs::symlink_metadata(&directory) {
-        Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => {}
-        Ok(_) => return Err("相册内的 .photosys 必须是普通目录。".into()),
-        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => Ok(Some(directory)),
+        Ok(_) => Err("相册内的 .photosys 必须是普通目录。".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
+}
+
+fn database(directory: &Path) -> Result<Option<PathBuf>, String> {
     let path = directory.join("library.sqlite");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !is_link(&metadata) => Ok(Some(path)),
         Ok(_) => Err("收藏数据库必须是普通文件。".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(create.then_some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -46,11 +44,44 @@ pub(super) fn path_key(relative: &Path) -> Vec<u8> {
     path
 }
 
-pub(super) fn read(root: &Root) -> Result<HashSet<Vec<u8>>, String> {
-    let Some(path) = database(root, false)? else {
-        return Ok(HashSet::new());
+pub(super) fn read(root: &Root) -> Result<Option<HashSet<Vec<u8>>>, String> {
+    let Some(directory) = data_directory(root)? else {
+        return Ok(None);
     };
-    read_all(&path).map_err(|error| error.to_string())
+    database(&directory)?
+        .map(|path| read_all(&path).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+pub(super) fn initialize(root: &Root) -> Result<HashSet<Vec<u8>>, String> {
+    let directory = match data_directory(root)? {
+        Some(directory) => directory,
+        None => {
+            match fs::create_dir(root.path.join(DATA_DIR)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            data_directory(root)?.ok_or("媒体库数据目录已被移除。")?
+        }
+    };
+    if let Some(path) = database(&directory)? {
+        return read_all(&path).map_err(|error| error.to_string());
+    }
+
+    let temporary = NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
+    Connection::open_with_flags(
+        temporary.path(),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .and_then(|connection| connection.execute(SCHEMA, []))
+    .map_err(|error| error.to_string())?;
+    match temporary.persist_noclobber(directory.join("library.sqlite")) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.error.to_string()),
+    }
+    read(root)?.ok_or_else(|| "收藏数据库已被移除。".into())
 }
 
 fn read_all(path: &Path) -> rusqlite::Result<HashSet<Vec<u8>>> {
@@ -58,34 +89,29 @@ fn read_all(path: &Path) -> rusqlite::Result<HashSet<Vec<u8>>> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    connection.busy_timeout(Duration::from_secs(2))?;
     let mut rows = connection.prepare("SELECT path FROM favorites")?;
     rows.query_map([], |row| row.get(0))?.collect()
 }
 
 pub(super) fn write(root: &Root, relative: &Path, favorite: bool) -> Result<(), String> {
-    if let Some(path) = database(root, favorite)? {
-        update(&path, relative, favorite).map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn update(path: &Path, relative: &Path, favorite: bool) -> rusqlite::Result<()> {
-    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    if favorite {
-        flags |= OpenFlags::SQLITE_OPEN_CREATE;
-    }
-    let mut connection = Connection::open_with_flags(path, flags)?;
-    connection.busy_timeout(Duration::from_secs(2))?;
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "CREATE TABLE IF NOT EXISTS favorites (path BLOB PRIMARY KEY) WITHOUT ROWID",
-        [],
-    )?;
+    let directory = data_directory(root)?.ok_or("媒体库数据目录已被移除。")?;
+    let path = database(&directory)?.ok_or("收藏数据库已被移除。")?;
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
     let sql = if favorite {
         "INSERT INTO favorites (path) VALUES (?1) ON CONFLICT DO NOTHING"
     } else {
         "DELETE FROM favorites WHERE path = ?1"
     };
-    transaction.execute(sql, params![path_key(relative)])?;
-    transaction.commit()
+    connection
+        .execute(sql, params![path_key(relative)])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

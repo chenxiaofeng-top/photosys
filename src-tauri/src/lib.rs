@@ -112,7 +112,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             choose_folder,
-            library::library_startup_directory,
+            library::scan_startup_library,
             library::scan_library,
             library::library_items,
             library::library_issues,

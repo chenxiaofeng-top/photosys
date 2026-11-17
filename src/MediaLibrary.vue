@@ -32,7 +32,12 @@ interface Summary {
   scanId: number;
   total: number;
   issues: number;
-  favoritesWarning: string | null;
+  preferenceWarning: string | null;
+}
+
+interface OpenedLibrary {
+  directory: string;
+  summary: Summary;
 }
 
 const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string] }>();
@@ -106,11 +111,8 @@ const opening = ref(false);
 
 onMounted(async () => {
   try {
-    const initial = await invoke<string | null>("library_startup_directory");
-    if (initial) {
-      await scanDirectory(initial);
-      return;
-    }
+    const initial = await invoke<OpenedLibrary | null>("scan_startup_library", { progress: scanProgress() });
+    if (initial) showScan(initial.directory, initial.summary);
   } catch (cause) {
     scanError.value = String(cause);
   } finally {
@@ -121,10 +123,9 @@ onMounted(async () => {
 async function chooseDirectory() {
   if (busy.value) return;
   task.value = "choosing";
-  scanError.value = "";
   try {
     const selected = await invoke<string | null>("choose_folder", { title: "选择媒体库目录" });
-    if (selected) await scanDirectory(selected);
+    if (selected) await scanDirectory(selected, "select");
   } catch (cause) {
     scanError.value = `无法选择目录。${String(cause)}`;
   } finally {
@@ -132,31 +133,40 @@ async function chooseDirectory() {
   }
 }
 
-async function scanDirectory(selected: string) {
+function scanProgress() {
+  return new Channel<{ found: number }>((update) => {
+    if (task.value === "starting") task.value = "scanning";
+    if (task.value === "scanning") found.value = update.found;
+  });
+}
+
+function showScan(selected: string, scanned: Summary) {
+  if (selected !== directory.value) {
+    kind.value = "all";
+    dateMode.value = "all";
+    from.value = "";
+    to.value = "";
+    favoritesOnly.value = false;
+  }
+  directory.value = selected;
+  emit("directoryChange", selected);
+  results.value = undefined;
+  issues.value = undefined;
+  issuesOpen.value = false;
+  issuePage.value = 0;
+  requestedPage.value = 0;
+  summary.value = scanned;
+}
+
+async function scanDirectory(selected: string, mode: "select" | "refresh") {
+  if (mode === "refresh" && busy.value) return;
   task.value = "scanning";
   scanError.value = "";
   favoriteError.value = "";
   found.value = 0;
   try {
-    const progress = new Channel<{ found: number }>((update) => {
-      if (task.value === "scanning") found.value = update.found;
-    });
-    const scanned = await invoke<Summary>("scan_library", { directory: selected, progress });
-    if (selected !== directory.value) {
-      kind.value = "all";
-      dateMode.value = "all";
-      from.value = "";
-      to.value = "";
-      favoritesOnly.value = false;
-    }
-    directory.value = selected;
-    emit("directoryChange", selected);
-    results.value = undefined;
-    issues.value = undefined;
-    issuesOpen.value = false;
-    issuePage.value = 0;
-    requestedPage.value = 0;
-    summary.value = scanned;
+    const scanned = await invoke<Summary>("scan_library", { directory: selected, mode, progress: scanProgress() });
+    showScan(selected, scanned);
   } catch (cause) {
     scanError.value = String(cause);
   } finally {
@@ -226,7 +236,7 @@ async function openItem() {
     <div class="folder-row">
       <input id="library-directory" :value="directory" placeholder="尚未选择目录" readonly />
       <button type="button" class="secondary" :disabled="busy" @click="chooseDirectory">选择目录</button>
-      <button v-if="directory" type="button" class="secondary" :disabled="busy" @click="scanDirectory(directory)">刷新</button>
+      <button v-if="directory" type="button" class="secondary" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</button>
     </div>
     <p v-if="task === 'scanning'" class="status" role="status">正在扫描，已发现 {{ found }} 个媒体文件…</p>
     <p v-if="scanError" class="error" role="alert">{{ scanError }}</p>
@@ -252,7 +262,7 @@ async function openItem() {
         <label class="favorite-filter"><input v-model="favoritesOnly" type="checkbox" /> 仅收藏</label>
       </div>
 
-      <p v-if="summary.favoritesWarning" class="error" role="alert">{{ summary.favoritesWarning }}</p>
+      <p v-if="summary.preferenceWarning" class="error" role="alert">{{ summary.preferenceWarning }}</p>
       <p v-if="favoriteError" class="error" role="alert">{{ favoriteError }}</p>
       <p v-if="itemsError" class="error" role="alert">{{ itemsError }}</p>
       <p v-else-if="results" class="status" role="status">

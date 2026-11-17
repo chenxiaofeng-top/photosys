@@ -6,8 +6,10 @@ use tempfile::tempdir;
 
 use super::*;
 
-fn session_for(path: &Path) -> (Session, Option<String>) {
-    Session::from_scan(Scan::read(1, Root::new(path).unwrap(), |_| {}))
+fn session_for(path: &Path) -> Session {
+    let root = Root::new(path).unwrap();
+    let keys = favorites::read(&root).unwrap().unwrap_or_default();
+    Session::from_scan(Scan::read(1, root, |_| {}), keys)
 }
 
 fn all() -> Filter {
@@ -45,8 +47,7 @@ fn sorts_dates_and_filters_mixed_media_with_on_demand_preview() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(path.join("2024"), path.join("linked-photos")).unwrap();
 
-    let (session, warning) = session_for(path);
-    assert!(warning.is_none());
+    let session = session_for(path);
     let page = session.items(all(), 0).unwrap();
     assert_eq!(page.total, 3);
     let [video, photo, broken] = page.items.as_slice() else {
@@ -113,17 +114,14 @@ fn favorites_follow_the_library_root_and_refresh_reads_file_changes() {
     let photo = Path::new("旅行").join("照片.jpg");
     fs::write(original.join(&photo), []).unwrap();
 
-    let (session, warning) = session_for(&original);
-    assert!(warning.is_none());
-    assert!(!original.join(".photosys").exists());
-    favorites::write(&session.scan.root, &photo, true).unwrap();
-    favorites::write(&session.scan.root, &photo, true).unwrap();
-    drop(session);
+    let root = Root::new(&original).unwrap();
+    assert!(favorites::initialize(&root).unwrap().is_empty());
+    favorites::write(&root, &photo, true).unwrap();
+    favorites::write(&root, &photo, true).unwrap();
 
     let moved = temp.path().join("album moved");
     fs::rename(&original, &moved).unwrap();
-    let (session, warning) = session_for(&moved);
-    assert!(warning.is_none());
+    let session = session_for(&moved);
     let favorites = || Filter {
         favorites_only: true,
         ..all()
@@ -135,7 +133,7 @@ fn favorites_follow_the_library_root_and_refresh_reads_file_changes() {
 
     fs::rename(moved.join(&photo), moved.join("renamed.jpg")).unwrap();
     fs::write(moved.join("new.mp4"), []).unwrap();
-    let (rescan, _) = session_for(&moved);
+    let rescan = session_for(&moved);
     assert_eq!(rescan.items(all(), 0).unwrap().total, 2);
     assert_eq!(rescan.items(favorites(), 0).unwrap().total, 0);
     assert!(
@@ -147,13 +145,10 @@ fn favorites_follow_the_library_root_and_refresh_reads_file_changes() {
     );
 
     fs::rename(moved.join("renamed.jpg"), moved.join(&photo)).unwrap();
-    let (rescan, _) = session_for(&moved);
+    let rescan = session_for(&moved);
     assert_eq!(rescan.items(favorites(), 0).unwrap().total, 1);
     super::favorites::write(&rescan.scan.root, &photo, false).unwrap();
-    assert_eq!(
-        session_for(&moved).0.items(favorites(), 0).unwrap().total,
-        0
-    );
+    assert_eq!(session_for(&moved).items(favorites(), 0).unwrap().total, 0);
 }
 
 #[test]
@@ -162,7 +157,7 @@ fn clamps_pages_to_matching_items() {
     for i in 0..PAGE_SIZE + 3 {
         fs::write(root.path().join(format!("frame-{i:02}.png")), []).unwrap();
     }
-    let (session, _) = session_for(root.path());
+    let session = session_for(root.path());
     let first = session.items(all(), 0).unwrap();
     let last = session.items(all(), usize::MAX).unwrap();
     assert_eq!(first.items.len(), PAGE_SIZE);
@@ -184,14 +179,20 @@ fn read_only_album_still_browses_when_favorite_write_fails() {
     }
     let root = tempdir().unwrap();
     fs::write(root.path().join("photo.png"), []).unwrap();
+    let data = root.path().join(".photosys");
+    let database = data.join("library.sqlite");
+    favorites::initialize(&Root::new(root.path()).unwrap()).unwrap();
     let unreadable = root.path().join("unreadable.png");
     fs::write(&unreadable, []).unwrap();
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555)).unwrap();
-    let (session, warning) = session_for(root.path());
+    let session = session_for(root.path());
     let write = favorites::write(&session.scan.root, Path::new("photo.png"), true);
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(warning.is_none());
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(session.items(all(), 0).unwrap().total, 1);
     assert_eq!(session.scan.issues[0].path, "unreadable.png");
     assert!(write.is_err());
@@ -205,8 +206,124 @@ fn does_not_follow_a_symlink_to_portable_data() {
     std::os::unix::fs::symlink(outside.path(), root.path().join(".photosys")).unwrap();
     let root = Root::new(root.path()).unwrap();
     assert!(favorites::read(&root).is_err());
+    assert!(favorites::initialize(&root).is_err());
     assert!(favorites::write(&root, Path::new("photo.png"), true).is_err());
     assert!(!outside.path().join("library.sqlite").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn does_not_follow_a_symlink_to_the_database() {
+    let album = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("library.sqlite");
+    let data = album.path().join(".photosys");
+    fs::create_dir(&data).unwrap();
+    std::os::unix::fs::symlink(&target, data.join("library.sqlite")).unwrap();
+
+    let root = Root::new(album.path()).unwrap();
+    assert!(favorites::read(&root).is_err());
+    assert!(favorites::initialize(&root).is_err());
+    assert!(!target.exists());
+}
+
+#[test]
+fn startup_prefers_portable_library_then_remembered_directory() {
+    let portable = tempdir().unwrap();
+    let remembered = tempdir().unwrap();
+    let config = tempdir().unwrap();
+    let preference = config.path().join("app/library-directory");
+    let discover = || find_startup_library(Some(portable.path()), Ok(&preference));
+
+    assert!(discover().unwrap().is_none());
+    assert!(!portable.path().join(".photosys").exists());
+    assert!(!preference.exists());
+
+    save_preference(&preference, remembered.path().to_str().unwrap()).unwrap();
+    assert!(discover().unwrap().is_none());
+    assert!(!remembered.path().join(".photosys").exists());
+    let root = Root::new(remembered.path()).unwrap();
+    favorites::initialize(&root).unwrap();
+    assert_eq!(discover().unwrap().unwrap().root.path, root.path);
+
+    let portable_root = Root::new(portable.path()).unwrap();
+    favorites::initialize(&portable_root).unwrap();
+    assert_eq!(discover().unwrap().unwrap().root.path, portable_root.path);
+    assert_eq!(
+        read_preference(&preference).unwrap().as_deref(),
+        Some(remembered.path())
+    );
+
+    fs::write(portable.path().join(".photosys/library.sqlite"), b"corrupt").unwrap();
+    assert_eq!(discover().unwrap().unwrap().root.path, root.path);
+    drop(remembered);
+    assert!(discover().is_err());
+}
+
+#[test]
+fn opens_empty_libraries_and_preserves_current_session_on_failure() {
+    let empty = tempdir().unwrap();
+    let directory = empty.path().to_str().unwrap();
+    assert!(open_directory(directory, OpenMode::Refresh, |_| {}).is_err());
+    assert!(!empty.path().join(".photosys").exists());
+
+    let opened = open_directory(directory, OpenMode::Select, |_| {}).unwrap();
+    assert_eq!(opened.total, 0);
+    assert!(
+        startup_candidate(empty.path())
+            .unwrap()
+            .unwrap()
+            .keys
+            .is_empty()
+    );
+
+    let partial = tempdir().unwrap();
+    fs::create_dir(partial.path().join(".photosys")).unwrap();
+    let directory = partial.path().to_str().unwrap();
+    let opened = open_directory(directory, OpenMode::Select, |_| {}).unwrap();
+    let refreshed = open_directory(directory, OpenMode::Refresh, |_| {}).unwrap();
+    assert_eq!(refreshed.total, opened.total);
+
+    let invalid = tempdir().unwrap();
+    let invalid_data = invalid.path().join(".photosys");
+    fs::create_dir(&invalid_data).unwrap();
+    let invalid_db = invalid_data.join("library.sqlite");
+    fs::write(&invalid_db, b"corrupt database").unwrap();
+    let invalid_directory = invalid.path().to_str().unwrap();
+    assert!(open_directory(invalid_directory, OpenMode::Select, |_| {}).is_err());
+    assert_eq!(fs::read(&invalid_db).unwrap(), b"corrupt database");
+    assert!(scan(refreshed.scan_id).is_ok());
+
+    fs::remove_dir_all(&invalid_data).unwrap();
+    fs::write(&invalid_data, b"blocking file").unwrap();
+    assert!(open_directory(invalid_directory, OpenMode::Select, |_| {}).is_err());
+    assert_eq!(fs::read(&invalid_data).unwrap(), b"blocking file");
+    assert!(scan(refreshed.scan_id).is_ok());
+}
+
+#[test]
+fn concurrent_initialization_keeps_one_valid_database() {
+    let album = tempdir().unwrap();
+    let ready = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let root = Root::new(album.path()).unwrap();
+                ready.wait();
+                assert!(favorites::initialize(&root).unwrap().is_empty());
+            });
+        }
+    });
+    let data = album.path().join(".photosys");
+    assert_eq!(fs::read_dir(data).unwrap().count(), 1);
+    let root = Root::new(album.path()).unwrap();
+    let photo = Path::new("photo.png");
+    favorites::write(&root, photo, true).unwrap();
+    assert!(
+        favorites::initialize(&root)
+            .unwrap()
+            .contains(&favorites::path_key(photo))
+    );
 }
 
 #[cfg(target_os = "linux")]

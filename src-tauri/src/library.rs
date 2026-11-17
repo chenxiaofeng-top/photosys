@@ -2,6 +2,8 @@ mod favorites;
 mod platform;
 
 use std::collections::HashSet;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,6 +13,8 @@ use chrono::NaiveDate;
 use nom_exif::MediaParser;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
+use tauri::{AppHandle, Manager};
+use tempfile::NamedTempFile;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::duplicates::{Candidate, FileStamp, Root, display_path, is_link};
@@ -55,7 +59,20 @@ pub(crate) struct Summary {
     scan_id: u64,
     total: usize,
     issues: usize,
-    favorites_warning: Option<String>,
+    preference_warning: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum OpenMode {
+    Select,
+    Refresh,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OpenedLibrary {
+    directory: String,
+    summary: Summary,
 }
 
 #[derive(Serialize)]
@@ -243,25 +260,17 @@ struct Session {
 }
 
 impl Session {
-    fn from_scan(scan: Scan) -> (Self, Option<String>) {
-        let (favorites, warning) = match favorites::read(&scan.root) {
-            Ok(keys) => (
-                scan.items
-                    .iter()
-                    .filter(|item| keys.contains(&favorites::path_key(&item.file.relative)))
-                    .map(|item| item.file.id)
-                    .collect(),
-                None,
-            ),
-            Err(error) => (HashSet::new(), Some(format!("无法读取收藏。{error}"))),
-        };
-        (
-            Self {
-                scan: Arc::new(scan),
-                favorites,
-            },
-            warning,
-        )
+    fn from_scan(scan: Scan, keys: HashSet<Vec<u8>>) -> Self {
+        let favorites = scan
+            .items
+            .iter()
+            .filter(|item| keys.contains(&favorites::path_key(&item.file.relative)))
+            .map(|item| item.file.id)
+            .collect();
+        Self {
+            scan: Arc::new(scan),
+            favorites,
+        }
     }
 
     fn items(&self, filter: Filter, requested: usize) -> Result<Page<ItemView>, String> {
@@ -317,40 +326,196 @@ fn appimage_parent(path: &Path) -> Option<&Path> {
     path.parent()
 }
 
-#[tauri::command]
-pub(crate) fn library_startup_directory() -> Result<Option<String>, String> {
+fn portable_directory() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
-    if let Some(path) = std::env::var_os("APPIMAGE")
-        && let Some(parent) = appimage_parent(Path::new(&path))
     {
-        return parent
-            .to_str()
-            .map(|value| Some(value.into()))
-            .ok_or_else(|| "AppImage 所在路径无法显示，请使用可显示的目录名称。".into());
+        std::env::var_os("APPIMAGE")
+            .as_deref()
+            .and_then(|path| appimage_parent(Path::new(path)))
+            .map(Path::to_path_buf)
     }
-    Ok(None)
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn directory_preference(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|path| path.join("library-directory"))
+        .map_err(|error| error.to_string())
+}
+
+fn read_preference(path: &Path) -> io::Result<Option<PathBuf>> {
+    match fs::read_to_string(path) {
+        Ok(directory) => {
+            let directory = PathBuf::from(directory);
+            Ok(directory.is_absolute().then_some(directory))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn save_preference(path: &Path, directory: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("缺少应用配置目录。"))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(directory.as_bytes())?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+struct StartupLibrary {
+    directory: String,
+    root: Root,
+    keys: HashSet<Vec<u8>>,
+}
+
+fn startup_candidate(directory: &Path) -> Result<Option<StartupLibrary>, String> {
+    let root = match Root::new(directory) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "无法打开媒体库目录 {}。{error}",
+                directory.display()
+            ));
+        }
+    };
+    let Some(keys) = favorites::read(&root)
+        .map_err(|error| format!("无法读取 {} 的收藏数据库。{error}", directory.display()))?
+    else {
+        return Ok(None);
+    };
+    let directory = directory
+        .to_str()
+        .ok_or("媒体库目录的路径无法显示，请选择其他目录。")?
+        .to_owned();
+    Ok(Some(StartupLibrary {
+        directory,
+        root,
+        keys,
+    }))
+}
+
+fn find_startup_library(
+    portable: Option<&Path>,
+    preference: Result<&Path, String>,
+) -> Result<Option<StartupLibrary>, String> {
+    let portable_error = match portable
+        .map(startup_candidate)
+        .transpose()
+        .map(Option::flatten)
+    {
+        Ok(Some(library)) => return Ok(Some(library)),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let remembered = preference
+        .and_then(|path| read_preference(path).map_err(|error| error.to_string()))
+        .map_err(|error| format!("无法读取上次选择的媒体库目录。{error}"))?;
+    if let Some(directory) = remembered
+        && let Some(library) = startup_candidate(&directory)?
+    {
+        return Ok(Some(library));
+    }
+    portable_error.map_or(Ok(None), Err)
+}
+
+fn open_library(
+    root: Root,
+    keys: HashSet<Vec<u8>>,
+    progress: impl FnMut(Progress),
+) -> Result<Summary, String> {
+    let scanned = Session::from_scan(
+        Scan::read(SCAN_ID.fetch_add(1, Ordering::Relaxed), root, progress),
+        keys,
+    );
+    scanned
+        .scan
+        .root
+        .verify_directory()
+        .map_err(|error| error.to_string())?;
+    let summary = Summary {
+        scan_id: scanned.scan.id,
+        total: scanned.scan.items.len(),
+        issues: scanned.scan.issues.len(),
+        preference_warning: None,
+    };
+    *session()? = Some(scanned);
+    Ok(summary)
+}
+
+fn open_directory(
+    directory: &str,
+    mode: OpenMode,
+    progress: impl FnMut(Progress),
+) -> Result<Summary, String> {
+    let root =
+        Root::new(Path::new(directory)).map_err(|error| format!("无法打开媒体库目录。{error}"))?;
+    let keys =
+        match favorites::read(&root).map_err(|error| format!("无法读取收藏数据库。{error}"))?
+        {
+            Some(keys) => keys,
+            None if matches!(mode, OpenMode::Select) => favorites::initialize(&root)
+                .map_err(|error| format!("无法初始化媒体库。{error}"))?,
+            None => return Err("找不到收藏数据库。请重新选择媒体库目录。".into()),
+        };
+    open_library(root, keys, progress)
+}
+
+#[tauri::command]
+pub(crate) async fn scan_startup_library(
+    app: AppHandle,
+    progress: Channel<Progress>,
+) -> Result<Option<OpenedLibrary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::file_task()?;
+        let portable = portable_directory();
+        let preference = directory_preference(&app);
+        let Some(StartupLibrary {
+            directory,
+            root,
+            keys,
+        }) = find_startup_library(
+            portable.as_deref(),
+            preference.as_deref().map_err(String::clone),
+        )?
+        else {
+            return Ok(None);
+        };
+        let summary = open_library(root, keys, |update| {
+            let _ = progress.send(update);
+        })?;
+        Ok(Some(OpenedLibrary { directory, summary }))
+    })
+    .await
+    .map_err(|error| format!("媒体库启动扫描异常结束。{error}"))?
 }
 
 #[tauri::command]
 pub(crate) async fn scan_library(
+    app: AppHandle,
     directory: String,
+    mode: OpenMode,
     progress: Channel<Progress>,
 ) -> Result<Summary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
-        let root = Root::new(Path::new(&directory))
-            .map_err(|error| format!("无法打开媒体库目录。{error}"))?;
-        let scan = Scan::read(SCAN_ID.fetch_add(1, Ordering::Relaxed), root, |update| {
+        let mut summary = open_directory(&directory, mode, |update| {
             let _ = progress.send(update);
-        });
-        let (scanned, favorites_warning) = Session::from_scan(scan);
-        let summary = Summary {
-            scan_id: scanned.scan.id,
-            total: scanned.scan.items.len(),
-            issues: scanned.scan.issues.len(),
-            favorites_warning,
-        };
-        *session()? = Some(scanned);
+        })?;
+        if matches!(mode, OpenMode::Select)
+            && let Err(error) = directory_preference(&app).and_then(|path| {
+                save_preference(&path, &directory).map_err(|error| error.to_string())
+            })
+        {
+            summary.preference_warning = Some(format!("无法记住本次选择的媒体库目录。{error}"));
+        }
         Ok(summary)
     })
     .await
