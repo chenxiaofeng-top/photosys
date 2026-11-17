@@ -17,9 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.23"
 chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+image_hasher = { version = "3.1", default-features = false }
 nom-exif = "3.8"
 regex = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tauri = { version = "2", features = [] }

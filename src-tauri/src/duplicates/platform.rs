@@ -24,7 +24,7 @@ pub(super) fn open(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-pub(super) fn is_link(metadata: &Metadata) -> bool {
+pub(crate) fn is_link(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;

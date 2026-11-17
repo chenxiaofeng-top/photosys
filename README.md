@@ -8,6 +8,12 @@ PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用�
 
 每次任务结束后，目标目录根目录会生成一份 `复制说明_yyyyMMdd_HHmmss.txt`。界面会显示本次统计和说明文件路径。
 
+## 查找相似照片
+
+打开「相似照片」，选择目录后开始扫描。应用递归查找 JPG/JPEG、PNG、WebP 和 TIFF，可按「同图变体」或「疑似连拍」筛选结果。展开相似组后，可任选两张照片并排查看预览和文件信息。照片仅供查看。
+
+同图变体包括压缩、缩放、格式转换和轻微调色后的版本。疑似连拍还会检查 EXIF 拍摄时间，要求相差不超过 5 秒。复扫会使用本地 SQLite 索引复用未变化照片的图像特征。暂未支持的照片格式和读图失败会列在「问题明细」中。
+
 ## 开发环境
 
 安装 Node.js 24 LTS 和 npm，再通过 [rustup](https://rustup.rs/) 安装 Rust stable。安装后重新打开终端，确认 `node --version`、`npm --version` 和 `rustc --version` 可用。

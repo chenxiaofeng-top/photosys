@@ -13,6 +13,7 @@ use walkdir::WalkDir;
 
 use platform::FileIdentity;
 
+pub(crate) use platform::is_link;
 pub(crate) use platform::trash;
 
 const READ_BUFFER: usize = 64 * 1024;
@@ -76,24 +77,24 @@ struct FileView {
 }
 
 #[derive(Debug)]
-struct Candidate {
-    id: usize,
-    relative: PathBuf,
-    stamp: FileStamp,
+pub(crate) struct Candidate {
+    pub(crate) id: usize,
+    pub(crate) relative: PathBuf,
+    pub(crate) stamp: FileStamp,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     identity: FileIdentity,
     links: u64,
-    size: u64,
+    pub(crate) size: u64,
     modified: SystemTime,
     #[cfg(unix)]
     changed: (i64, i64),
 }
 
 impl FileStamp {
-    fn read(file: &File) -> io::Result<Self> {
+    pub(crate) fn read(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if platform::is_link(&metadata) || !metadata.is_file() {
             return Err(changed());
@@ -111,10 +112,26 @@ impl FileStamp {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
+
+    pub(crate) fn cache_key(&self) -> Vec<u8> {
+        let modified = DateTime::<Utc>::from(self.modified);
+        let mut key = Vec::with_capacity(60);
+        for field in [self.identity.0, self.identity.1, self.links, self.size] {
+            key.extend_from_slice(&field.to_le_bytes());
+        }
+        key.extend_from_slice(&modified.timestamp().to_le_bytes());
+        key.extend_from_slice(&modified.timestamp_subsec_nanos().to_le_bytes());
+        #[cfg(unix)]
+        {
+            key.extend_from_slice(&self.changed.0.to_le_bytes());
+            key.extend_from_slice(&self.changed.1.to_le_bytes());
+        }
+        key
+    }
 }
 
 impl Candidate {
-    fn path_label(&self) -> String {
+    pub(crate) fn path_label(&self) -> String {
         display_path(&self.relative)
     }
 
@@ -129,19 +146,19 @@ impl Candidate {
     }
 }
 
-struct Root {
-    path: PathBuf,
+pub(crate) struct Root {
+    pub(crate) path: PathBuf,
     identity: FileIdentity,
 }
 
 impl Root {
-    fn new(path: &Path) -> io::Result<Self> {
+    pub(crate) fn new(path: &Path) -> io::Result<Self> {
         let path = path.canonicalize()?;
         let identity = directory_identity(&path)?;
         Ok(Self { path, identity })
     }
 
-    fn open_file(&self, relative: &Path) -> io::Result<File> {
+    pub(crate) fn open_file(&self, relative: &Path) -> io::Result<File> {
         if self.path.canonicalize()? != self.path
             || directory_identity(&self.path)? != self.identity
         {
@@ -168,7 +185,7 @@ impl Root {
         platform::open(&path)
     }
 
-    fn open_matching(&self, candidate: &Candidate) -> io::Result<File> {
+    pub(crate) fn open_matching(&self, candidate: &Candidate) -> io::Result<File> {
         let file = self.open_file(&candidate.relative)?;
         if FileStamp::read(&file)? != candidate.stamp {
             return Err(changed());
@@ -176,7 +193,7 @@ impl Root {
         Ok(file)
     }
 
-    fn verify_read(&self, file: &File, candidate: &Candidate) -> io::Result<()> {
+    pub(crate) fn verify_read(&self, file: &File, candidate: &Candidate) -> io::Result<()> {
         if FileStamp::read(file)? != candidate.stamp {
             return Err(changed());
         }
@@ -273,7 +290,7 @@ fn check_eof(file: &mut File) -> io::Result<()> {
     }
 }
 
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     match path.to_str() {
         Some(path) => path.into(),
         None => format!("{:?}", path.as_os_str()),

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
+import SimilarPhotosPanel from "./SimilarPhotosPanel.vue";
 import { formatBytes } from "./formatBytes";
 
 interface ArchiveSummary {
@@ -33,8 +34,11 @@ const running = ref(false);
 const result = ref<ArchiveSummary>();
 const progress = ref<ArchiveProgress>();
 const error = ref("");
-const view = ref<"archive" | "duplicates">("archive");
+const view = ref<"archive" | "duplicates" | "similar">("archive");
+const viewTitles = { archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片" };
 const duplicatesBusy = ref(false);
+const similarBusy = ref(false);
+const fileTaskBusy = computed(() => choosing.value || running.value || duplicatesBusy.value || similarBusy.value);
 
 async function chooseFolder(kind: "source" | "destination") {
   if (choosing.value || running.value) return;
@@ -92,15 +96,19 @@ async function startArchive() {
       <p class="app-name">PhotoSys</p>
       <nav class="view-nav" aria-label="功能">
         <button type="button" class="secondary" :aria-pressed="view === 'archive'"
-          :disabled="choosing || running || duplicatesBusy" @click="view = 'archive'">
+          :disabled="fileTaskBusy" @click="view = 'archive'">
           照片与视频归档
         </button>
         <button type="button" class="secondary" :aria-pressed="view === 'duplicates'"
-          :disabled="choosing || running || duplicatesBusy" @click="view = 'duplicates'">
+          :disabled="fileTaskBusy" @click="view = 'duplicates'">
           重复文件
         </button>
+        <button type="button" class="secondary" :aria-pressed="view === 'similar'"
+          :disabled="fileTaskBusy" @click="view = 'similar'">
+          相似照片
+        </button>
       </nav>
-      <h1>{{ view === "archive" ? "照片与视频归档" : "重复文件" }}</h1>
+      <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
 
@@ -171,6 +179,7 @@ async function startArchive() {
       <p v-if="result.reportError" class="error">无法写入复制说明。{{ result.reportError }}</p>
     </section>
     <DuplicatesPanel v-show="view === 'duplicates'" @busy-change="duplicatesBusy = $event" />
+    <SimilarPhotosPanel v-show="view === 'similar'" @busy-change="similarBusy = $event" />
   </main>
 </template>
 

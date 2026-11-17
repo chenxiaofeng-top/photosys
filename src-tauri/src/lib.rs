@@ -1,6 +1,7 @@
 mod archive;
 mod duplicates;
 mod media_date;
+mod similar;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -112,7 +113,13 @@ pub fn run() {
             choose_folder,
             archive_media,
             scan_duplicates,
-            trash_duplicates
+            trash_duplicates,
+            similar::scan_similar,
+            similar::cancel_similar,
+            similar::similar_groups,
+            similar::similar_members,
+            similar::similar_issues,
+            similar::similar_preview
         ])
         .run(tauri::generate_context!())
         .expect("could not start PhotoSys");
