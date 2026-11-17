@@ -1,39 +1,56 @@
-mod database;
+mod archive;
+mod media_date;
 
-use std::fs;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Mutex, TryLockError};
 
-use database::Database;
-use tauri::{Manager, State};
+use archive::ArchiveSummary;
+use tauri::WebviewWindow;
+use tauri_plugin_dialog::DialogExt;
+
+static ARCHIVE_TASK: Mutex<()> = Mutex::new(());
 
 #[tauri::command]
-fn load_note(database: State<'_, Mutex<Database>>) -> Result<String, String> {
-    database
-        .lock()
-        .map_err(|error| error.to_string())?
-        .load_note()
-        .map_err(|error| error.to_string())
+async fn choose_folder(window: WebviewWindow, title: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_title(title)
+            .blocking_pick_folder()
+            .map(|folder| {
+                folder
+                    .into_path()
+                    .map_err(|error| error.to_string())?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| "所选目录的路径无法显示，请选择其他目录。".to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn save_note(database: State<'_, Mutex<Database>>, text: String) -> Result<(), String> {
-    database
-        .lock()
-        .map_err(|error| error.to_string())?
-        .save_note(&text)
-        .map_err(|error| error.to_string())
+async fn archive_media(source: String, destination: String) -> Result<ArchiveSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = ARCHIVE_TASK.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => "已有归档任务正在运行。".to_string(),
+            TryLockError::Poisoned(_) => "归档任务异常结束，请重启应用后重试。".to_string(),
+        })?;
+
+        archive::run(Path::new(&source), Path::new(&destination))
+    })
+    .await
+    .map_err(|error| format!("归档任务异常结束。{error}"))?
 }
 
 pub fn run() {
     tauri::Builder::default()
-        .setup(|app| {
-            let directory = app.path().app_local_data_dir()?;
-            fs::create_dir_all(&directory)?;
-            let database = Database::open(&directory.join("photosys.sqlite3"))?;
-            app.manage(Mutex::new(database));
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![load_note, save_note])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![choose_folder, archive_media])
         .run(tauri::generate_context!())
         .expect("could not start PhotoSys");
 }

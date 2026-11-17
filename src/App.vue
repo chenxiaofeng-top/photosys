@@ -1,81 +1,122 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
-import { computed, onMounted, ref } from "vue";
+import { ref } from "vue";
 
-const text = ref("");
-const savedText = ref("");
-const loading = ref(true);
-const loaded = ref(false);
-const saving = ref(false);
+interface ArchiveSummary {
+  found: number;
+  copied: number;
+  duplicates: number;
+  renamed: number;
+  other: number;
+  failed: number;
+  scanErrors: number;
+  reportPath: string | null;
+  reportError: string | null;
+}
+
+const source = ref("");
+const destination = ref("");
+const choosing = ref(false);
+const running = ref(false);
+const result = ref<ArchiveSummary>();
 const error = ref("");
-const dirty = computed(() => text.value !== savedText.value);
 
-const status = computed(() => {
-  if (loading.value) return "正在读取本地笔记…";
-  if (saving.value) return "正在保存…";
-  if (dirty.value) return "有未保存的修改";
-  return "已与本地数据库同步";
-});
-
-async function loadNote() {
-  loading.value = true;
+async function chooseFolder(kind: "source" | "destination") {
+  if (choosing.value || running.value) return;
+  choosing.value = true;
   error.value = "";
 
   try {
-    const storedText = await invoke<string>("load_note");
-    text.value = storedText;
-    savedText.value = storedText;
-    loaded.value = true;
+    const folder = await invoke<string | null>("choose_folder", {
+      title: kind === "source" ? "选择源目录" : "选择目标目录",
+    });
+    if (folder !== null) {
+      const selected = kind === "source" ? source : destination;
+      if (selected.value !== folder) {
+        selected.value = folder;
+        result.value = undefined;
+      }
+    }
   } catch (cause) {
-    error.value = `无法读取笔记。${String(cause)}`;
+    error.value = `无法选择目录。${String(cause)}`;
   } finally {
-    loading.value = false;
+    choosing.value = false;
   }
 }
 
-async function saveNote() {
-  if (!loaded.value || saving.value || !dirty.value) return;
-
-  const draft = text.value;
-  saving.value = true;
+async function startArchive() {
+  if (!source.value || !destination.value || choosing.value || running.value) return;
+  running.value = true;
   error.value = "";
+  result.value = undefined;
 
   try {
-    await invoke("save_note", { text: draft });
-    savedText.value = draft;
+    result.value = await invoke<ArchiveSummary>("archive_media", {
+      source: source.value,
+      destination: destination.value,
+    });
   } catch (cause) {
-    error.value = `无法保存笔记。${String(cause)}`;
+    error.value = String(cause);
   } finally {
-    saving.value = false;
+    running.value = false;
   }
 }
-
-onMounted(loadNote);
 </script>
 
 <template>
   <main>
     <header>
       <p class="app-name">PhotoSys</p>
-      <h1>本地笔记</h1>
+      <h1>照片与视频归档</h1>
+      <p class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
 
-    <form @submit.prevent="saveNote">
-      <label for="note">笔记内容</label>
-      <textarea id="note" v-model="text" rows="8" :disabled="!loaded" />
+    <form @submit.prevent="startArchive">
+      <div class="folder">
+        <label for="source">源目录</label>
+        <div class="folder-row">
+          <input id="source" :value="source" placeholder="尚未选择源目录" readonly />
+          <button type="button" class="secondary" :disabled="choosing || running" @click="chooseFolder('source')">
+            选择源目录
+          </button>
+        </div>
+      </div>
+
+      <div class="folder">
+        <label for="destination">目标目录</label>
+        <div class="folder-row">
+          <input id="destination" :value="destination" placeholder="尚未选择目标目录" readonly />
+          <button type="button" class="secondary" :disabled="choosing || running" @click="chooseFolder('destination')">
+            选择目标目录
+          </button>
+        </div>
+      </div>
 
       <div class="actions">
-        <p v-if="error" class="error" role="alert">{{ error }}</p>
-        <p v-else role="status">{{ status }}</p>
-
-        <button v-if="!loaded && !loading" type="button" @click="loadNote">
-          重新读取
+        <button type="submit" :disabled="!source || !destination || choosing || running">
+          {{ running ? "正在复制…" : "开始复制" }}
         </button>
-        <button v-else type="submit" :disabled="!loaded || saving || !dirty">
-          {{ saving ? "保存中…" : "保存" }}
-        </button>
+        <p v-if="running" role="status">正在扫描并复制媒体文件。</p>
       </div>
+      <p v-if="error" class="error" role="alert">{{ error }}</p>
     </form>
+
+    <section v-if="result" aria-labelledby="archive-result" role="status">
+      <h2 id="archive-result">
+        {{ result.failed || result.scanErrors || result.reportError ? "归档结束，有错误" : "归档完成" }}
+      </h2>
+      <dl>
+        <div><dt>发现媒体</dt><dd>{{ result.found }}</dd></div>
+        <div><dt>成功复制</dt><dd>{{ result.copied }}</dd></div>
+        <div><dt>重复跳过</dt><dd>{{ result.duplicates }}</dd></div>
+        <div><dt>重命名</dt><dd>{{ result.renamed }}</dd></div>
+        <div><dt>归入其它</dt><dd>{{ result.other }}</dd></div>
+        <div><dt>复制失败</dt><dd>{{ result.failed }}</dd></div>
+        <div v-if="result.scanErrors"><dt>扫描错误</dt><dd>{{ result.scanErrors }}</dd></div>
+      </dl>
+      <p v-if="result.reportPath" class="report">复制说明：<span>{{ result.reportPath }}</span></p>
+      <p v-if="result.reportError" class="error">无法写入复制说明。{{ result.reportError }}</p>
+    </section>
   </main>
 </template>
 
@@ -111,11 +152,27 @@ h1 {
   font-size: 2rem;
 }
 
-form {
+h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.description {
+  margin: 0.5rem 0 0;
+  color: #395d57;
+}
+
+form,
+section {
   padding: clamp(1rem, 4vw, 1.75rem);
   background: #fff;
   border: 1px solid #c9d9d4;
   border-radius: 0.875rem;
+}
+
+section,
+.folder + .folder {
+  margin-top: 1rem;
 }
 
 label {
@@ -124,45 +181,46 @@ label {
   font-weight: 650;
 }
 
-textarea {
-  display: block;
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 8rem;
-  padding: 0.75rem;
-  resize: vertical;
+.folder-row,
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.folder-row input {
+  flex: 1 1 14rem;
+  min-width: 0;
+  padding: 0.625rem 0.75rem;
   border: 1px solid #829d95;
   border-radius: 0.5rem;
-  color: inherit;
   background: #fcfefd;
+  color: inherit;
   font: inherit;
-  line-height: 1.6;
 }
 
 .actions {
-  display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  justify-content: space-between;
   gap: 0.75rem;
-  margin-top: 1rem;
+  margin-top: 1.25rem;
 }
 
-.actions p {
+.actions p,
+.report {
   margin: 0;
   color: #395d57;
+}
+
+.error {
+  margin: 0.75rem 0 0;
+  color: #9c2626;
   overflow-wrap: anywhere;
 }
 
-.actions .error {
-  color: #9c2626;
-}
-
 button {
-  min-width: 6rem;
   min-height: 2.5rem;
   padding: 0.5rem 1rem;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 0.5rem;
   background: #176252;
   color: #fff;
@@ -171,14 +229,43 @@ button {
   cursor: pointer;
 }
 
+button.secondary {
+  border-color: #a6c4bb;
+  background: #f0f7f4;
+  color: #194f44;
+}
+
 button:disabled {
   background: #dde8e3;
   color: #536863;
   cursor: default;
 }
 
-:is(button, textarea):focus-visible {
+:is(button, input):focus-visible {
   outline: 2px solid #126353;
   outline-offset: 2px;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(5rem, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+dt {
+  color: #395d57;
+  font-size: 0.875rem;
+}
+
+dd {
+  margin: 0.25rem 0 0;
+  font-size: 1.25rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.report span {
+  overflow-wrap: anywhere;
 }
 </style>
