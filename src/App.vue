@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { ref } from "vue";
+import DuplicatesPanel from "./DuplicatesPanel.vue";
+import { formatBytes } from "./formatBytes";
 
 interface ArchiveSummary {
   found: number;
@@ -31,18 +33,8 @@ const running = ref(false);
 const result = ref<ArchiveSummary>();
 const progress = ref<ArchiveProgress>();
 const error = ref("");
-
-const byteUnits = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-const byteFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
-
-function formatBytes(bytes: number) {
-  let unit = 0;
-  while (bytes >= 1024 && unit < byteUnits.length - 1) {
-    bytes /= 1024;
-    unit++;
-  }
-  return `${byteFormatter.format(bytes)} ${byteUnits[unit]}`;
-}
+const view = ref<"archive" | "duplicates">("archive");
+const duplicatesBusy = ref(false);
 
 async function chooseFolder(kind: "source" | "destination") {
   if (choosing.value || running.value) return;
@@ -98,11 +90,21 @@ async function startArchive() {
   <main>
     <header>
       <p class="app-name">PhotoSys</p>
-      <h1>照片与视频归档</h1>
-      <p class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
+      <nav class="view-nav" aria-label="功能">
+        <button type="button" class="secondary" :aria-pressed="view === 'archive'"
+          :disabled="choosing || running || duplicatesBusy" @click="view = 'archive'">
+          照片与视频归档
+        </button>
+        <button type="button" class="secondary" :aria-pressed="view === 'duplicates'"
+          :disabled="choosing || running || duplicatesBusy" @click="view = 'duplicates'">
+          重复文件
+        </button>
+      </nav>
+      <h1>{{ view === "archive" ? "照片与视频归档" : "重复文件" }}</h1>
+      <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
 
-    <form @submit.prevent="startArchive">
+    <form v-if="view === 'archive'" @submit.prevent="startArchive">
       <div class="folder">
         <label for="source">源目录</label>
         <div class="folder-row">
@@ -152,7 +154,7 @@ async function startArchive() {
       <p v-if="error" class="error" role="alert">{{ error }}</p>
     </form>
 
-    <section v-if="result" aria-labelledby="archive-result" role="status">
+    <section v-if="view === 'archive' && result" aria-labelledby="archive-result" role="status">
       <h2 id="archive-result">
         {{ result.failed || result.scanErrors || result.reportError ? "归档结束，有错误" : "归档完成" }}
       </h2>
@@ -168,6 +170,7 @@ async function startArchive() {
       <p v-if="result.reportPath" class="report">复制说明：<span>{{ result.reportPath }}</span></p>
       <p v-if="result.reportError" class="error">无法写入复制说明。{{ result.reportError }}</p>
     </section>
+    <DuplicatesPanel v-show="view === 'duplicates'" @busy-change="duplicatesBusy = $event" />
   </main>
 </template>
 
@@ -196,6 +199,19 @@ header {
   margin: 0 0 0.5rem;
   color: #366560;
   font-weight: 700;
+}
+
+.view-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.view-nav button[aria-pressed="true"]:not(:disabled) {
+  border-color: #176252;
+  background: #176252;
+  color: #fff;
 }
 
 h1 {

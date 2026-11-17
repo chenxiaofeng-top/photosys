@@ -2378,14 +2378,20 @@ name = "photosys"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "gio",
+ "libc",
  "nom-exif",
+ "objc2",
+ "objc2-foundation",
  "regex",
  "serde",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
  "walkdir",
+ "windows",
  "zip",
 ]
 
