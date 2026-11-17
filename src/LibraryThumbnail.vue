@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { queueLibraryThumbnail } from "./libraryThumbnailQueue";
 
-const props = defineProps<{ scanId: number; fileId: number }>();
+const props = defineProps<{ scanId: number; fileId: number; video: boolean }>();
 const target = ref<HTMLElement>();
 const image = ref("");
 const error = ref("");
@@ -48,12 +48,14 @@ async function load() {
   <span ref="target" class="thumbnail">
     <img v-if="image" :src="image" alt="" />
     <span v-else-if="error" class="preview-error" :title="error">预览失败</span>
-    <span v-else>照片</span>
+    <span v-else>{{ video ? "▶ 视频" : "照片" }}</span>
+    <span v-if="video && image" class="video-label" aria-hidden="true">▶ 视频</span>
   </span>
 </template>
 
 <style scoped>
 .thumbnail {
+  position: relative;
   display: grid;
   width: 100%;
   height: 100%;
@@ -69,5 +71,16 @@ img {
 
 .preview-error {
   color: #9c2626;
+}
+
+.video-label {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 0.25rem;
+  background: #162922;
+  color: #fff;
+  font-size: 0.75rem;
 }
 </style>

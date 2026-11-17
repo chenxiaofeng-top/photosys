@@ -353,13 +353,14 @@ fn run_scan(
             };
             let hit = cached.is_some();
             let features = match cached {
-                Some(features) => features,
-                None => imaging::features(&mut file, candidate.stamp.size, &mut parser, &hasher)?,
+                Some(features) => Ok(features),
+                None => imaging::features(&mut file, &candidate, &mut parser, &hasher, cancelled),
             };
             root.verify_read(&file, &candidate)
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>((candidate, features, hit))
+            Ok::<_, String>((candidate, features?, hit))
         })();
+        checkpoint(cancelled)?;
         match photo {
             Ok((file, features, hit)) => {
                 if hit {
@@ -581,7 +582,7 @@ pub(crate) fn preview(root: &Root, photo: &Candidate, detail: bool) -> Result<St
     let _preview = PREVIEW.lock().map_err(|_| STATE_ERROR)?;
     let stale = |_| "照片已变化或已移除，请重新扫描。";
     let mut file = root.open_matching(photo).map_err(stale)?;
-    let image = imaging::preview(&mut file, photo.stamp.size, detail);
+    let image = imaging::preview(&mut file, &photo.relative, photo.stamp.size, detail);
     root.verify_read(&file, photo).map_err(stale)?;
     image
 }

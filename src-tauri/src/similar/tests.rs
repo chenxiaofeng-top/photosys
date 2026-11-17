@@ -94,7 +94,7 @@ fn scans_variants_applies_exif_and_reuses_cache() {
     image
         .save_with_format(child.join("different.tiff"), ImageFormat::Tiff)
         .unwrap();
-    fs::write(child.join("phone.HEIC"), "unsupported").unwrap();
+    fs::write(child.join("raw.DNG"), "unsupported").unwrap();
     fs::write(photos.join("broken.jpg"), [0xff, 0xd8, 0xff]).unwrap();
 
     let (scan, first) = scan_directory(&photos, &database);
@@ -148,6 +148,77 @@ fn scans_variants_applies_exif_and_reuses_cache() {
         .query_row("SELECT COUNT(*) FROM photo_features", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 4);
+}
+
+#[test]
+fn matches_heic_with_jpeg_and_reuses_features() {
+    let directory = tempdir().unwrap();
+    let photos = directory.path().join("photos");
+    fs::create_dir(&photos).unwrap();
+    let database = directory.path().join("index.sqlite3");
+    let heic = photos.join("portrait.HEIC");
+    fs::write(
+        &heic,
+        include_bytes!("../../tests/fixtures/portrait-grid.heic"),
+    )
+    .unwrap();
+    fs::write(
+        photos.join("portrait.jpg"),
+        include_bytes!("../../tests/fixtures/portrait-reference.jpg"),
+    )
+    .unwrap();
+    fs::write(photos.join("broken.heif"), b"invalid image").unwrap();
+
+    let (scan, summary) = scan_directory(&photos, &database);
+    assert_eq!(
+        (
+            summary.checked,
+            summary.reused,
+            summary.unsupported,
+            summary.skipped
+        ),
+        (2, 0, 0, 1)
+    );
+    assert_eq!(scan.issues[0].path, "broken.heif");
+    assert!(scan.issues[0].reason.contains("HEIC/HEIF"));
+    let groups = scan.groups(Some(MatchKind::Variant), 0);
+    assert_eq!(groups.total, 1);
+    let members = scan.members(groups.items[0].id, 0).unwrap();
+    assert_eq!(members.total, 2);
+    for member in &members.items {
+        let photo = &member.photo;
+        assert_eq!((photo.width, photo.height), (1024, 2048));
+        if photo.name == "portrait.HEIC" {
+            assert_eq!(
+                photo.captured_at.as_deref(),
+                Some("2025-06-03T14:30:20+08:00")
+            );
+        }
+        assert!(
+            preview(&scan.root, &scan.photos[photo.id].file, true)
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+    }
+
+    let (_, second) = scan_directory(&photos, &database);
+    assert_eq!((second.checked, second.reused, second.groups), (2, 2, 1));
+    let candidate = &scan
+        .photos
+        .iter()
+        .find(|photo| photo.file.relative == Path::new("portrait.HEIC"))
+        .unwrap()
+        .file;
+    fs::write(heic, b"replacement").unwrap();
+    assert_eq!(
+        preview(&scan.root, candidate, false).unwrap_err(),
+        "照片已变化或已移除，请重新扫描。"
+    );
+    let (_, replaced) = scan_directory(&photos, &database);
+    assert_eq!(
+        (replaced.checked, replaced.reused, replaced.skipped),
+        (1, 1, 2)
+    );
 }
 
 fn features(hash: u64, color: u8, captured: Option<(i64, bool)>) -> Features {

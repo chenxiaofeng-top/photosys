@@ -52,7 +52,7 @@ jobs:
           sudo apt-get "${apt_options[@]}" update -o APT::Update::Error-Mode=any
           sudo apt-get "${apt_options[@]}" install -y build-essential ca-certificates curl wget file pkg-config \
             libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf xdg-utils
+            librsvg2-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good nasm patchelf xdg-utils
 
       - name: Set up Rust stable
         run: |
@@ -61,7 +61,29 @@ jobs:
 
       - name: Install macOS Rust targets
         if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          brew install pkgconf nasm
+
+      - name: Prepare Windows codec toolchain
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: curl diffutils make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build bundled FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: bash scripts/build-media-codec.sh
+
+      - name: Build bundled FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: bash scripts/build-media-codec.sh universal-apple-darwin
+
+      - name: Build bundled FFmpeg on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/build-media-codec.sh
 
       - run: npm ci
 
@@ -71,12 +93,40 @@ jobs:
       - name: Build desktop packages
         run: npm run tauri build -- ${{ matrix.tauri_args }} -- --locked
 
+      - name: Verify FFmpeg in Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          bundle="$PWD/src-tauri/target/release/bundle"
+          scratch="$(mktemp -d)"
+          cd "$scratch"
+          dpkg-deb -x "$bundle"/deb/*.deb deb
+          deb/usr/bin/photosys-ffmpeg -version
+          "$bundle"/appimage/*.AppImage --appimage-extract >/dev/null
+          squashfs-root/usr/bin/photosys-ffmpeg -version
+          test -f squashfs-root/usr/lib/gstreamer-1.0/libgstvpx.so
+
       - name: Verify universal macOS executable
         if: runner.os == 'macOS'
         run: |
           app="src-tauri/target/universal-apple-darwin/release/bundle/macos/PhotoSys.app"
           executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")
           lipo "$app/Contents/MacOS/$executable" -verify_arch arm64 x86_64
+          lipo "$app/Contents/MacOS/photosys-ffmpeg" -verify_arch arm64 x86_64
+          "$app/Contents/MacOS/photosys-ffmpeg" -version
+
+      - name: Verify FFmpeg in the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if (-not $installer) { throw "PhotoSys installer is missing" }
+          $unpacked = Join-Path $env:RUNNER_TEMP photosys-installer
+          & "$env:ProgramFiles/7-Zip/7z.exe" x $installer.FullName "-o$unpacked" -y
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract the PhotoSys installer" }
+          $codec = Get-ChildItem $unpacked -Recurse -Filter photosys-ffmpeg.exe | Select-Object -First 1
+          if (-not $codec) { throw "Bundled FFmpeg is missing" }
+          & $codec.FullName -version
+          if ($LASTEXITCODE -ne 0) { throw "Bundled FFmpeg failed to start" }
 
       - name: Check expected packages
         shell: pwsh
@@ -93,5 +143,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.paths }}
+          path: |
+            ${{ matrix.paths }}
+            src-tauri/binaries/media-codec-sources.tar.gz
           if-no-files-found: error

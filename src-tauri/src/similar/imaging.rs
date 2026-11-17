@@ -1,6 +1,7 @@
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{FixedOffset, TimeZone, Timelike};
@@ -12,16 +13,18 @@ use image_hasher::{HashAlg, Hasher, HasherConfig};
 use nom_exif::{EntryValue, ExifTag, MediaParser, MediaSource};
 
 use super::matching::{CaptureTime, Features};
+use crate::{duplicates::Candidate, media_codec};
 
 pub(super) const MAX_PIXELS: u64 = 64_000_000;
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(crate) fn supported(path: &Path) -> bool {
-    matches!(
-        ImageFormat::from_path(path),
-        Ok(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff)
-    )
+    media_codec::is_heif(path)
+        || matches!(
+            ImageFormat::from_path(path),
+            Ok(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff)
+        )
 }
 
 pub(super) fn recognizes_format(path: &Path) -> bool {
@@ -36,10 +39,36 @@ pub(super) fn hasher() -> Hasher<[u8; 8]> {
         .to_hasher()
 }
 
-fn scaled(file: &mut File, size: u64, edge: u32) -> Result<(RgbImage, u32, u32), String> {
+fn scaled(
+    file: &mut File,
+    path: &Path,
+    size: u64,
+    edge: u32,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(RgbImage, u32, u32), String> {
     if size > MAX_FILE_BYTES {
         return Err("文件超过 128 MiB，已跳过。".into());
     }
+    if !media_codec::is_heif(path) {
+        return scale_image(file, edge);
+    }
+    // Stage the checked handle so FFmpeg never reopens the album path.
+    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let input = directory.path().join("input");
+    {
+        let mut staged = File::create(&input).map_err(|error| error.to_string())?;
+        let copied = io::copy(&mut file.take(size + 1), &mut staged)
+            .map_err(|error| format!("无法读取 HEIC/HEIF 照片。{error}"))?;
+        if copied != size {
+            return Err("读取 HEIC/HEIF 照片时文件大小已变化。".into());
+        }
+    }
+    let (mut jpeg, _) =
+        media_codec::heif_jpeg(&input, &directory.path().join("preview.jpg"), cancelled)?;
+    scale_image(&mut jpeg, edge)
+}
+
+fn scale_image(file: &mut File, edge: u32) -> Result<(RgbImage, u32, u32), String> {
     let mut reader = ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
@@ -159,11 +188,13 @@ fn original_time(file: &mut File, size: u64, parser: &mut MediaParser) -> Option
 
 pub(super) fn features(
     file: &mut File,
-    size: u64,
+    candidate: &Candidate,
     parser: &mut MediaParser,
     hasher: &Hasher<[u8; 8]>,
+    cancelled: &AtomicBool,
 ) -> Result<Features, String> {
-    let (image, width, height) = scaled(file, size, 256)?;
+    let size = candidate.stamp.size;
+    let (image, width, height) = scaled(file, &candidate.relative, size, 256, Some(cancelled))?;
     let hash = hasher.hash_image(&image);
     let rgb = image::imageops::resize(&image, 16, 16, FilterType::Triangle);
     Ok(Features {
@@ -179,8 +210,13 @@ pub(super) fn features(
     })
 }
 
-pub(crate) fn preview(file: &mut File, size: u64, detail: bool) -> Result<String, String> {
-    let (image, _, _) = scaled(file, size, if detail { 1600 } else { 240 })?;
+pub(crate) fn preview(
+    file: &mut File,
+    path: &Path,
+    size: u64,
+    detail: bool,
+) -> Result<String, String> {
+    let (image, _, _) = scaled(file, path, size, if detail { 1600 } else { 240 }, None)?;
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, if detail { 90 } else { 80 })
         .encode_image(&image)

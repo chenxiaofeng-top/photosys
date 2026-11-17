@@ -71,7 +71,7 @@ fn sorts_dates_and_filters_mixed_media_with_on_demand_preview() {
         (video.kind, video.captured_on.as_deref()),
         (Kind::Video, Some("2025-06-01"))
     );
-    assert!(!video.preview_available);
+    assert!(video.preview_available);
     assert_eq!(photo.captured_on.as_deref(), Some("2024-02-29"));
     assert!(photo.preview_available);
     assert!(

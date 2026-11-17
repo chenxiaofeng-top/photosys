@@ -8,7 +8,7 @@ PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用�
 
 如果 Linux 环境无法挂载 AppImage，可在相册目录运行 `APPIMAGE_EXTRACT_AND_RUN=1 ./PhotoSys.AppImage`。
 
-媒体库按拍摄日期从新到旧排列，支持按类型、日期范围、日期未知和收藏筛选。可以在应用内预览 JPG/JPEG、PNG、WebP 和 TIFF，或者通过系统默认应用打开照片或播放视频。从媒体库切换到归档、查重或相似照片时，会带入当前目录。
+媒体库按拍摄日期从新到旧排列，支持按类型、日期范围、日期未知和收藏筛选。可以在应用内预览 JPG/JPEG、PNG、WebP、TIFF、HEIC/HEIF 和 `.livp` 封面。支持解码的 MOV、MP4、M4V、3GP、MKV 和 WebM 视频会显示首帧缩略图，点击可查看大图。照片和视频都可以用系统默认应用打开。在 `.livp` 详情中点击「播放实况」，可在应用内播放包内的 MOV 或 MP4。从媒体库切换到归档、查重或相似照片时，会带入当前目录。
 
 手动选择目录时，PhotoSys 会读取其中已有的 `.photosys/library.sqlite`，或在数据库缺失时创建并初始化它。初始化失败时可查看错误并重选目录。已有有效数据库的只读目录可以浏览，初始化和保存收藏需要写入权限。
 
@@ -22,7 +22,7 @@ PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用�
 
 ## 查找相似照片
 
-打开「相似照片」，选择目录后开始扫描。应用递归查找 JPG/JPEG、PNG、WebP 和 TIFF，可按「同图变体」或「疑似连拍」筛选结果。展开相似组后，可任选两张照片并排查看预览和文件信息。照片仅供查看。
+打开「相似照片」，选择目录后开始扫描。应用递归查找 JPG/JPEG、PNG、WebP、TIFF 和 HEIC/HEIF，可按「同图变体」或「疑似连拍」筛选结果。展开相似组后，可任选两张照片并排查看预览和文件信息。照片仅供查看。
 
 同图变体包括压缩、缩放、格式转换和轻微调色后的版本。疑似连拍还会检查 EXIF 拍摄时间，要求相差不超过 5 秒。复扫会使用本地 SQLite 索引复用未变化照片的图像特征。暂未支持的照片格式和读图失败会列在「问题明细」中。
 
@@ -38,7 +38,8 @@ PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用�
 sudo apt-get update
 sudo apt-get install -y build-essential ca-certificates curl wget file pkg-config \
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev \
-  librsvg2-dev patchelf xdg-utils
+  librsvg2-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  nasm patchelf xdg-utils
 ```
 
 **macOS** 运行 `xcode-select --install` 安装命令行开发工具。若要构建供 Apple Silicon 和 Intel 共用的安装包，安装两个 Rust 目标。
@@ -51,7 +52,14 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ## 运行和打包
 
-在项目根目录执行以下命令。`tauri dev` 启动 Vite 和桌面窗口，关闭开发进程后可以执行打包。
+首次构建、开发或运行 Rust 测试前，在项目根目录执行 `bash scripts/build-media-codec.sh`，生成随包提供的 FFmpeg。脚本会校验固定版本的源码并复用构建产物。macOS 先安装 `brew install pkgconf nasm`。Windows 在 MSYS2 的 UCRT64 终端安装下列工具，并在该终端运行脚本。
+
+```sh
+pacman -S --needed curl diffutils make mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+```
+
+准备好 FFmpeg 后，在项目根目录执行以下命令。`tauri dev` 启动 Vite 和桌面窗口，关闭开发进程后可以执行打包。
 
 ```sh
 npm ci
@@ -66,7 +74,7 @@ npm run build
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-在 macOS 上用 `npm run tauri build -- --target universal-apple-darwin -- --locked` 构建通用包。本机打包产物位于 `src-tauri/target/release/bundle/`，指定 `--target` 后位于 `src-tauri/target/<target>/release/bundle/`。
+在 macOS 上先运行 `bash scripts/build-media-codec.sh universal-apple-darwin`，再用 `npm run tauri build -- --target universal-apple-darwin -- --locked` 构建通用包。本机打包产物位于 `src-tauri/target/release/bundle/`，指定 `--target` 后位于 `src-tauri/target/<target>/release/bundle/`。
 
 ## GitHub Actions
 
@@ -79,3 +87,5 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 | `PhotoSys-macos-universal` | macOS 15 arm64 | 通用 `.dmg`，包含 `arm64` 和 `x86_64`，采用 ad-hoc 签名 |
 
 安装后打开 PhotoSys，用临时目录试复制几张照片，检查归档子目录和复制说明，再用相同目录运行一次并核对重复跳过数量。Windows 和 macOS 的内部测试包可能触发 SmartScreen 或 Gatekeeper 提示。
+
+各构建产物附带 `media-codec-sources.tar.gz`，其中包含媒体解码器的对应源码和构建脚本。安装包中包含许可文本。详见 [媒体解码器许可](scripts/MEDIA-CODEC-NOTICES.md)。

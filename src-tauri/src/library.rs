@@ -1,4 +1,5 @@
 mod favorites;
+mod live;
 mod platform;
 mod previews;
 
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDate;
 use nom_exif::MediaParser;
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Manager};
 use tempfile::NamedTempFile;
 use tokio::sync::Semaphore;
@@ -34,6 +35,7 @@ static THUMBNAIL_CONCURRENCY: LazyLock<usize> =
 static THUMBNAIL_SLOTS: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(*THUMBNAIL_CONCURRENCY));
 static DETAIL_SLOTS: Semaphore = Semaphore::const_new(1);
+static LIVE_VIDEO_SLOTS: Semaphore = Semaphore::const_new(1);
 
 fn thumbnail_concurrency(threads: usize) -> usize {
     (threads / 2).clamp(1, MAX_THUMBNAIL_CONCURRENCY)
@@ -111,6 +113,7 @@ pub(crate) struct ItemView {
     kind: Kind,
     captured_on: Option<String>,
     preview_available: bool,
+    is_live_photo: bool,
     favorite: bool,
 }
 
@@ -119,6 +122,7 @@ struct Item {
     kind: Kind,
     captured_on: Option<NaiveDate>,
     preview_available: bool,
+    is_live_photo: bool,
 }
 
 impl Item {
@@ -137,7 +141,9 @@ impl Item {
         } else {
             Kind::Photo
         };
-        let preview_available = kind == Kind::Photo && crate::similar::supports_preview(&relative);
+        let is_live_photo = media == Media::LivePhoto;
+        let preview_available =
+            kind == Kind::Video || is_live_photo || crate::similar::supports_preview(&relative);
         Ok(Self {
             file: Candidate {
                 id: 0,
@@ -147,6 +153,7 @@ impl Item {
             kind,
             captured_on,
             preview_available,
+            is_live_photo,
         })
     }
 
@@ -161,6 +168,7 @@ impl Item {
             kind: self.kind,
             captured_on: self.captured_on.map(|date| date.to_string()),
             preview_available: self.preview_available,
+            is_live_photo: self.is_live_photo,
             favorite,
         }
     }
@@ -584,6 +592,19 @@ pub(crate) async fn library_preview(
     })
     .await
     .map_err(|error| format!("无法加载媒体预览。{error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn library_live_video(scan_id: u64, file_id: usize) -> Result<Response, String> {
+    let permit = LIVE_VIDEO_SLOTS.acquire().await.map_err(|_| STATE_ERROR)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let bytes = scan(scan_id)?.live_video(file_id)?;
+        scan(scan_id)?;
+        Ok(Response::new(bytes))
+    })
+    .await
+    .map_err(|error| format!("无法加载实况视频。{error}"))?
 }
 
 #[tauri::command]

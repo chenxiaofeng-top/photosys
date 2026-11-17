@@ -15,6 +15,8 @@ pub enum Media {
     LivePhoto,
 }
 
+pub(crate) const LIVE_MEMBER_LIMIT: u64 = 128 * 1024 * 1024;
+
 impl Media {
     pub fn from_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -61,7 +63,11 @@ pub fn from_filename(path: &Path) -> Option<NaiveDate> {
 }
 
 pub fn from_metadata(parser: &mut MediaParser, path: &Path, media: Media) -> Option<NaiveDate> {
-    from_open_file(parser, File::open(path).ok()?, media)
+    let file = File::open(path).ok()?;
+    match media {
+        Media::LivePhoto => live_photo_date(parser, file, None),
+        _ => parse_file(parser, file, media),
+    }
 }
 
 pub(crate) fn from_open_file(
@@ -70,7 +76,7 @@ pub(crate) fn from_open_file(
     media: Media,
 ) -> Option<NaiveDate> {
     match media {
-        Media::LivePhoto => live_photo_date(parser, file),
+        Media::LivePhoto => live_photo_date(parser, file, Some(LIVE_MEMBER_LIMIT)),
         _ => parse_file(parser, file, media),
     }
 }
@@ -123,7 +129,11 @@ fn valid_year(date: NaiveDate) -> bool {
     (1..=9999).contains(&date.year())
 }
 
-fn live_photo_date(parser: &mut MediaParser, file: File) -> Option<NaiveDate> {
+fn live_photo_date(
+    parser: &mut MediaParser,
+    file: File,
+    member_limit: Option<u64>,
+) -> Option<NaiveDate> {
     let mut archive = ZipArchive::new(file).ok()?;
     for media in [Media::Photo, Media::Video] {
         for index in 0..archive.len() {
@@ -133,9 +143,18 @@ fn live_photo_date(parser: &mut MediaParser, file: File) -> Option<NaiveDate> {
             if !member.is_file() || Media::from_path(Path::new(member.name())) != Some(media) {
                 continue;
             }
+            let expected = member.size();
+            if member_limit.is_some_and(|limit| expected > limit) {
+                continue;
+            }
             // MOV metadata can be at the end. Spool one entry at a time for seekable parsing.
             let mut file = tempfile::tempfile().ok()?;
-            if io::copy(&mut member, &mut file).is_ok()
+            let copied = match member_limit {
+                Some(limit) => io::copy(&mut member.take(limit + 1), &mut file)
+                    .is_ok_and(|size| size == expected),
+                None => io::copy(&mut member, &mut file).is_ok(),
+            };
+            if copied
                 && file.rewind().is_ok()
                 && let Some(date) = parse_file(parser, file, media)
             {

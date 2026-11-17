@@ -1,3 +1,9 @@
 {
-  "bundle": { "targets": ["deb", "appimage"] }
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "linux": {
+      "appimage": { "bundleMediaFramework": true },
+      "deb": { "depends": ["gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good"] }
+    }
+  }
 }

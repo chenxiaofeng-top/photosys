@@ -1,6 +1,7 @@
 mod archive;
 mod duplicates;
 mod library;
+mod media_codec;
 mod media_date;
 mod similar;
 
@@ -117,6 +118,7 @@ pub fn run() {
             library::library_items,
             library::library_issues,
             library::library_preview,
+            library::library_live_video,
             library::set_library_favorite,
             library::open_library_item,
             archive_media,

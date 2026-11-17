@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
@@ -15,6 +15,7 @@ interface Item {
   kind: Kind;
   capturedOn: string | null;
   previewAvailable: boolean;
+  isLivePhoto: boolean;
   favorite: boolean;
 }
 
@@ -115,6 +116,10 @@ const detailImage = ref("");
 const previewError = ref("");
 const detailError = ref("");
 const opening = ref(false);
+const liveVideo = ref<HTMLVideoElement>();
+const liveVideoUrl = ref("");
+const liveVideoLoading = ref(false);
+const liveVideoError = ref("");
 let detailRequest = 0;
 
 onMounted(async () => {
@@ -209,6 +214,7 @@ async function showDetails(item: Item, event: MouseEvent) {
   const scanId = summary.value?.scanId;
   if (scanId === undefined || busy.value) return;
   const request = ++detailRequest;
+  clearLiveVideo();
   const thumbnail = (event.currentTarget as HTMLButtonElement).querySelector("img");
   detail.value = item;
   detailImage.value = thumbnail?.complete && thumbnail.naturalWidth ? thumbnail.currentSrc : "";
@@ -240,6 +246,59 @@ function clearDetail() {
   detailRequest++;
   detail.value = undefined;
   detailImage.value = "";
+  clearLiveVideo();
+}
+
+function closeDetails() {
+  dialog.value?.close();
+  clearDetail();
+}
+
+function clearLiveVideo() {
+  liveVideo.value?.pause();
+  if (liveVideoUrl.value) URL.revokeObjectURL(liveVideoUrl.value);
+  liveVideoUrl.value = "";
+  liveVideoError.value = "";
+  liveVideoLoading.value = false;
+}
+
+onBeforeUnmount(() => {
+  detailRequest++;
+  clearLiveVideo();
+});
+
+function failLiveVideo(message: string) {
+  clearLiveVideo();
+  liveVideoError.value = message;
+}
+
+function handleLiveVideoError(event: Event) {
+  if (liveVideoUrl.value && event.currentTarget === liveVideo.value) {
+    failLiveVideo("当前播放器无法读取实况视频。");
+  }
+}
+
+async function playLivePhoto() {
+  const item = detail.value;
+  const scanId = summary.value?.scanId;
+  if (!item?.isLivePhoto || scanId === undefined || liveVideoLoading.value || liveVideoUrl.value) return;
+  const request = detailRequest;
+  const isCurrent = () => request === detailRequest && dialog.value?.open && summary.value?.scanId === scanId;
+  liveVideoError.value = "";
+  liveVideoLoading.value = true;
+  try {
+    const bytes = await invoke<ArrayBuffer>("library_live_video", { scanId, fileId: item.id });
+    if (!isCurrent()) return;
+    liveVideoUrl.value = URL.createObjectURL(new Blob([bytes], { type: "video/webm" }));
+    await nextTick();
+    if (isCurrent()) await liveVideo.value?.play();
+  } catch (cause) {
+    if (isCurrent() && !(cause instanceof DOMException && cause.name === "NotAllowedError")) {
+      failLiveVideo(`无法播放实况视频。${String(cause)}`);
+    }
+  } finally {
+    if (isCurrent()) liveVideoLoading.value = false;
+  }
 }
 
 async function openItem() {
@@ -321,7 +380,8 @@ async function openItem() {
         <li v-for="item in results.items" :key="`${summary.scanId}:${item.id}`" class="card">
           <button type="button" class="media-preview secondary" :disabled="busy"
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
-            <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId" :file-id="item.id" />
+            <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId"
+              :file-id="item.id" :video="item.kind === 'video'" />
             <span v-else>{{ item.kind === "video" ? "▶ 视频" : "照片" }}</span>
           </button>
           <div class="card-details">
@@ -358,16 +418,25 @@ async function openItem() {
       </details>
     </template>
 
-    <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title" @close="clearDetail">
+    <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title"
+      @cancel.prevent="closeDetails" @close="clearDetail">
       <header class="detail-header">
         <h2 id="library-preview-title">{{ detail.name }}</h2>
-        <button type="button" class="secondary" @click="dialog?.close()">关闭</button>
+        <button type="button" class="secondary" @click="closeDetails">关闭</button>
       </header>
-      <img v-if="detailImage" class="detail-image" :src="detailImage" :alt="detail.name" />
+      <video v-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
+        :aria-label="detail.name" controls playsinline
+        @error="handleLiveVideoError" />
+      <img v-else-if="detailImage" class="detail-image" :src="detailImage" :alt="detail.name" />
       <p v-else-if="detail.previewAvailable && !previewError" class="status" role="status">正在加载预览…</p>
       <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
       <p class="detail-path">{{ detail.relativePath }}</p>
       <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
+      <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="liveVideoLoading"
+        @click="playLivePhoto">
+        {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
+      </button>
+      <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
       <button type="button" :disabled="opening" @click="openItem">
         {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
       </button>
