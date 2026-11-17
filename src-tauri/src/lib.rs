@@ -111,6 +111,7 @@ async fn trash_duplicates(scan_id: u64, file_ids: Vec<usize>) -> Result<TrashRes
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             choose_folder,
             library::scan_startup_library,
@@ -120,7 +121,10 @@ pub fn run() {
             library::library_preview,
             library::library_live_video,
             library::set_library_favorite,
+            library::set_library_rotation,
             library::open_library_item,
+            library::reveal_library_item,
+            library::copy_library_item_path,
             archive_media,
             scan_duplicates,
             trash_duplicates,

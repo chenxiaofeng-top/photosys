@@ -3,7 +3,7 @@ mod live;
 mod platform;
 mod previews;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -55,11 +55,50 @@ pub(crate) enum Kind {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Filter {
+    #[serde(default)]
+    query: String,
     kind: Option<Kind>,
     from: Option<String>,
     to: Option<String>,
     unknown_date: bool,
     favorites_only: bool,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Sort {
+    #[default]
+    DateDesc,
+    DateAsc,
+    NameAsc,
+    NameDesc,
+    SizeDesc,
+    SizeAsc,
+}
+
+impl Sort {
+    fn compare(self, a: &Item, b: &Item) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let order = match self {
+            Self::DateDesc | Self::DateAsc => match (a.captured_on, b.captured_on) {
+                (Some(a), Some(b)) => {
+                    if matches!(self, Self::DateAsc) {
+                        a.cmp(&b)
+                    } else {
+                        b.cmp(&a)
+                    }
+                }
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            },
+            Self::NameAsc => a.name_key.cmp(&b.name_key),
+            Self::NameDesc => b.name_key.cmp(&a.name_key),
+            Self::SizeDesc => b.file.stamp.size.cmp(&a.file.stamp.size),
+            Self::SizeAsc => a.file.stamp.size.cmp(&b.file.stamp.size),
+        };
+        order.then_with(|| a.file.relative.cmp(&b.file.relative))
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -115,10 +154,13 @@ pub(crate) struct ItemView {
     preview_available: bool,
     is_live_photo: bool,
     favorite: bool,
+    rotation: u16,
 }
 
 struct Item {
     file: Candidate,
+    search_path: String,
+    name_key: String,
     kind: Kind,
     captured_on: Option<NaiveDate>,
     preview_available: bool,
@@ -145,6 +187,9 @@ impl Item {
         let preview_available =
             kind == Kind::Video || is_live_photo || crate::similar::supports_preview(&relative);
         Ok(Self {
+            search_path: display_path(&relative).to_lowercase(),
+            name_key: display_path(Path::new(relative.file_name().expect("media file name")))
+                .to_lowercase(),
             file: Candidate {
                 id: 0,
                 relative,
@@ -157,7 +202,7 @@ impl Item {
         })
     }
 
-    fn view(&self, favorite: bool) -> ItemView {
+    fn view(&self, favorite: bool, rotation: u16) -> ItemView {
         ItemView {
             id: self.file.id,
             name: display_path(Path::new(
@@ -170,6 +215,7 @@ impl Item {
             preview_available: self.preview_available,
             is_live_photo: self.is_live_photo,
             favorite,
+            rotation,
         }
     }
 }
@@ -185,6 +231,14 @@ struct Scan {
 impl Scan {
     fn item(&self, id: usize) -> Result<&Item, String> {
         self.items.get(id).ok_or_else(|| STALE_SCAN.into())
+    }
+
+    fn item_path(&self, id: usize) -> Result<PathBuf, String> {
+        let item = self.item(id)?;
+        self.root
+            .open_matching(&item.file)
+            .map_err(|_| STALE_SCAN)?;
+        Ok(self.root.path.join(&item.file.relative))
     }
 
     fn read(id: u64, root: Root, mut progress: impl FnMut(Progress)) -> Self {
@@ -281,47 +335,104 @@ impl<T> Page<T> {
 struct Session {
     scan: Arc<Scan>,
     favorites: HashSet<usize>,
+    rotations: HashMap<usize, u16>,
 }
 
 impl Session {
-    fn from_scan(scan: Scan, keys: HashSet<Vec<u8>>) -> Self {
+    fn from_scan(scan: Scan, keys: HashSet<Vec<u8>>, rotations: HashMap<Vec<u8>, u16>) -> Self {
         let favorites = scan
             .items
             .iter()
             .filter(|item| keys.contains(&favorites::path_key(&item.file.relative)))
             .map(|item| item.file.id)
             .collect();
+        let rotations = scan
+            .items
+            .iter()
+            .filter(|item| item.kind == Kind::Photo && item.preview_available)
+            .filter_map(|item| {
+                rotations
+                    .get(&favorites::path_key(&item.file.relative))
+                    .filter(|rotation| matches!(rotation, 90 | 180 | 270))
+                    .map(|rotation| (item.file.id, *rotation))
+            })
+            .collect();
         Self {
             scan: Arc::new(scan),
             favorites,
+            rotations,
         }
     }
 
-    fn items(&self, filter: Filter, requested: usize) -> Result<Page<ItemView>, String> {
+    fn set_rotation(&mut self, scan_id: u64, file_id: usize, rotation: u16) -> Result<u16, String> {
+        if self.scan.id != scan_id {
+            return Err(STALE_SCAN.into());
+        }
+        if !matches!(rotation, 0 | 90 | 180 | 270) {
+            return Err("旋转角度必须为 0、90、180 或 270 度。".into());
+        }
+        let item = self.scan.item(file_id)?;
+        if item.kind != Kind::Photo || !item.preview_available {
+            return Err("仅支持旋转可预览的照片。".into());
+        }
+        self.scan
+            .root
+            .open_matching(&item.file)
+            .map_err(|_| STALE_SCAN)?;
+        favorites::write_rotation(&self.scan.root, &item.file.relative, rotation)
+            .map_err(|error| format!("无法保存旋转方向。{error}"))?;
+        if rotation == 0 {
+            self.rotations.remove(&file_id);
+        } else {
+            self.rotations.insert(file_id, rotation);
+        }
+        Ok(rotation)
+    }
+
+    fn items(
+        &self,
+        filter: Filter,
+        requested: usize,
+        sort: Sort,
+    ) -> Result<Page<ItemView>, String> {
         let from = parse_date(filter.from.as_deref())?;
         let to = parse_date(filter.to.as_deref())?;
         if matches!((from, to), (Some(from), Some(to)) if from > to) {
             return Err("开始日期应早于或等于结束日期。".into());
         }
-        let matching = self.scan.items.iter().filter(|item| {
-            filter.kind.is_none_or(|kind| item.kind == kind)
-                && (!filter.favorites_only || self.favorites.contains(&item.file.id))
-                && if filter.unknown_date {
-                    item.captured_on.is_none()
-                } else {
-                    from.is_none_or(|from| item.captured_on >= Some(from))
-                        && to.is_none_or(|to| item.captured_on.is_some_and(|date| date <= to))
-                }
-        });
-        let total = matching.clone().count();
+        let query = filter.query.trim().to_lowercase();
+        let mut matching: Vec<_> = self
+            .scan
+            .items
+            .iter()
+            .filter(|item| {
+                item.search_path.contains(&query)
+                    && filter.kind.is_none_or(|kind| item.kind == kind)
+                    && (!filter.favorites_only || self.favorites.contains(&item.file.id))
+                    && if filter.unknown_date {
+                        item.captured_on.is_none()
+                    } else {
+                        from.is_none_or(|from| item.captured_on >= Some(from))
+                            && to.is_none_or(|to| item.captured_on.is_some_and(|date| date <= to))
+                    }
+            })
+            .collect();
+        matching.sort_unstable_by(|a, b| sort.compare(a, b));
+        let total = matching.len();
         let (page, offset) = Page::<ItemView>::bounds(requested, total);
         Ok(Page {
             page,
             total,
             items: matching
+                .into_iter()
                 .skip(offset)
                 .take(PAGE_SIZE)
-                .map(|item| item.view(self.favorites.contains(&item.file.id)))
+                .map(|item| {
+                    item.view(
+                        self.favorites.contains(&item.file.id),
+                        self.rotations.get(&item.file.id).copied().unwrap_or(0),
+                    )
+                })
                 .collect(),
         })
     }
@@ -455,9 +566,12 @@ fn open_library(
     keys: HashSet<Vec<u8>>,
     progress: impl FnMut(Progress),
 ) -> Result<Summary, String> {
+    let rotations =
+        favorites::read_rotations(&root).map_err(|error| format!("无法读取旋转方向。{error}"))?;
     let scanned = Session::from_scan(
         Scan::read(SCAN_ID.fetch_add(1, Ordering::Relaxed), root, progress),
         keys,
+        rotations,
     );
     scanned
         .scan
@@ -552,8 +666,9 @@ pub(crate) fn library_items(
     scan_id: u64,
     filter: Filter,
     page: usize,
+    sort: Option<Sort>,
 ) -> Result<Page<ItemView>, String> {
-    current(&*session()?, scan_id)?.items(filter, page)
+    current(&*session()?, scan_id)?.items(filter, page, sort.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -608,6 +723,23 @@ pub(crate) async fn library_live_video(scan_id: u64, file_id: usize) -> Result<R
 }
 
 #[tauri::command]
+pub(crate) async fn set_library_rotation(
+    scan_id: u64,
+    file_id: usize,
+    rotation: u16,
+) -> Result<u16, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::file_task()?;
+        session()?
+            .as_mut()
+            .ok_or(STALE_SCAN)?
+            .set_rotation(scan_id, file_id, rotation)
+    })
+    .await
+    .map_err(|error| format!("旋转任务异常结束。{error}"))?
+}
+
+#[tauri::command]
 pub(crate) async fn set_library_favorite(
     scan_id: u64,
     file_id: usize,
@@ -642,15 +774,75 @@ pub(crate) async fn set_library_favorite(
 pub(crate) async fn open_library_item(scan_id: u64, file_id: usize) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let scan = scan(scan_id)?;
-        let item = scan.item(file_id)?;
-        scan.root
-            .open_matching(&item.file)
-            .map_err(|_| STALE_SCAN)?;
-        platform::open_default(&scan.root.path.join(&item.file.relative))
+        platform::open_default(&scan.item_path(file_id)?)
             .map_err(|error| format!("无法用系统默认应用打开。{error}"))
     })
     .await
     .map_err(|error| format!("无法打开文件。{error}"))?
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RevealResult {
+    Revealed,
+    OpenedParent,
+}
+
+fn reveal_path(
+    path: &Path,
+    reveal: impl FnOnce(&Path) -> Result<(), String>,
+    open: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<RevealResult, String> {
+    match reveal(path) {
+        Ok(()) => Ok(RevealResult::Revealed),
+        Err(reveal_error) => {
+            let parent = path.parent().ok_or("无法确定文件所在目录。")?;
+            open(parent).map_err(|error| {
+                format!("无法定位文件。{reveal_error}；无法打开所在目录。{error}")
+            })?;
+            Ok(RevealResult::OpenedParent)
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn reveal_library_item(
+    scan_id: u64,
+    file_id: usize,
+) -> Result<RevealResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = scan(scan_id)?.item_path(file_id)?;
+        reveal_path(&path, platform::reveal, |parent| {
+            tauri_plugin_opener::open_path(parent, None::<&str>).map_err(|error| error.to_string())
+        })
+    })
+    .await
+    .map_err(|error| format!("无法定位文件。{error}"))?
+}
+
+fn clipboard_path(path: &Path) -> Result<String, String> {
+    #[cfg(windows)]
+    let path = crate::duplicates::shell_path(path)?;
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "此文件路径无法准确转换为文本，未复制。".into())
+}
+
+#[tauri::command]
+pub(crate) async fn copy_library_item_path(
+    app: AppHandle,
+    scan_id: u64,
+    file_id: usize,
+) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = scan(scan_id)?.item_path(file_id)?;
+        app.clipboard()
+            .write_text(clipboard_path(&path)?)
+            .map_err(|error| format!("无法复制完整路径。{error}"))
+    })
+    .await
+    .map_err(|error| format!("无法复制完整路径。{error}"))?
 }
 
 #[cfg(test)]

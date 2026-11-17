@@ -211,7 +211,7 @@ mod tests {
         );
         let scan = Scan::read(1, Root::new(directory.path()).unwrap(), |_| {});
         assert_eq!(scan.items.len(), 1);
-        let item = scan.item(0).unwrap().view(false);
+        let item = scan.item(0).unwrap().view(false, 0);
         assert_eq!(item.kind, Kind::Photo);
         assert_eq!(item.captured_on.as_deref(), Some("2026-02-03"));
         assert!(item.is_live_photo && item.preview_available);

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,4 +114,65 @@ pub(super) fn write(root: &Root, relative: &Path, favorite: bool) -> Result<(), 
         .execute(sql, params![path_key(relative)])
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+pub(super) fn read_rotations(root: &Root) -> Result<HashMap<Vec<u8>, u16>, String> {
+    let directory = data_directory(root)?.ok_or("媒体库数据目录已被移除。")?;
+    let path = database(&directory)?.ok_or("媒体库数据库已被移除。")?;
+    let read = || -> rusqlite::Result<HashMap<Vec<u8>, u16>> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rotations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(HashMap::new());
+        }
+        let mut rows = connection.prepare("SELECT path, rotation FROM rotations")?;
+        rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    };
+    read().map_err(|error| error.to_string())
+}
+
+pub(super) fn write_rotation(root: &Root, relative: &Path, rotation: u16) -> Result<(), String> {
+    if !matches!(rotation, 0 | 90 | 180 | 270) {
+        return Err("旋转角度必须为 0、90、180 或 270 度。".into());
+    }
+    let directory = data_directory(root)?.ok_or("媒体库数据目录已被移除。")?;
+    let path = database(&directory)?.ok_or("媒体库数据库已被移除。")?;
+    let write = || -> rusqlite::Result<()> {
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS rotations (
+                path BLOB PRIMARY KEY,
+                rotation INTEGER NOT NULL CHECK (rotation IN (90, 180, 270))
+            ) WITHOUT ROWID",
+            [],
+        )?;
+        if rotation == 0 {
+            transaction.execute(
+                "DELETE FROM rotations WHERE path = ?1",
+                params![path_key(relative)],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO rotations (path, rotation) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET rotation = excluded.rotation",
+                params![path_key(relative), rotation],
+            )?;
+        }
+        transaction.commit()
+    };
+    write().map_err(|error| error.to_string())
 }

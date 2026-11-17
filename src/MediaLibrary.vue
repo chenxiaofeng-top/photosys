@@ -2,10 +2,13 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
+import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
 type Kind = "photo" | "video";
+type Sort = "dateDesc" | "dateAsc" | "nameAsc" | "nameDesc" | "sizeDesc" | "sizeAsc";
+type FileAction = "open" | "reveal" | "copy";
 
 interface Item {
   id: number;
@@ -17,6 +20,7 @@ interface Item {
   previewAvailable: boolean;
   isLivePhoto: boolean;
   favorite: boolean;
+  rotation: Rotation;
 }
 
 interface Page<T> {
@@ -62,7 +66,37 @@ const dateMode = ref<"all" | "range" | "unknown">("all");
 const from = ref("");
 const to = ref("");
 const favoritesOnly = ref(false);
+const searchInput = ref("");
+const query = ref("");
+const sort = ref<Sort>("dateDesc");
+const composing = ref(false);
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+const searchPending = computed(() => composing.value || searchInput.value.trim() !== query.value);
+
+function scheduleSearch() {
+  clearTimeout(searchTimer);
+  if (!composing.value) searchTimer = setTimeout(() => { query.value = searchInput.value.trim(); }, 250);
+}
+
+function startComposition() {
+  composing.value = true;
+  clearTimeout(searchTimer);
+}
+
+function endComposition() {
+  composing.value = false;
+  scheduleSearch();
+}
+
+function clearSearch() {
+  clearTimeout(searchTimer);
+  searchInput.value = "";
+  query.value = "";
+}
+
+watch(searchInput, scheduleSearch);
 const filter = computed(() => ({
+  query: query.value,
   kind: kind.value === "all" ? null : kind.value,
   from: dateMode.value === "range" ? from.value || null : null,
   to: dateMode.value === "range" ? to.value || null : null,
@@ -73,24 +107,38 @@ const filter = computed(() => ({
 const requestedPage = ref(0);
 const revision = ref(0);
 const results = shallowRef<Page<Item>>();
+// A page request may have started before a rotation was saved (for example when
+// closing a detail on another page). Keep its eventual response up to date.
+const savedRotations = new Map<number, Rotation>();
+watch(summary, () => savedRotations.clear(), { flush: "sync" });
+function withSavedRotations(page: Page<Item>): Page<Item> {
+  return {
+    ...page,
+    items: page.items.map((item) => savedRotations.has(item.id)
+      ? { ...item, rotation: savedRotations.get(item.id)! } : item),
+  };
+}
 const itemsLoading = ref(false);
-watch(filter, () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, requestedPage, revision], async ([scan, currentFilter, page], _, onCleanup) => {
+watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
+watch([summary, filter, sort, requestedPage, revision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
   let receiving = true;
   onCleanup(() => { receiving = false; });
   itemsLoading.value = true;
   itemsError.value = "";
   try {
-    const result = await invoke<Page<Item>>("library_items", { scanId: scan.scanId, filter: currentFilter, page });
-    if (receiving) results.value = result;
+    const result = await invoke<Page<Item>>("library_items", { scanId: scan.scanId, filter: currentFilter, sort: currentSort, page });
+    if (receiving) results.value = withSavedRotations(result);
   } catch (cause) {
     if (receiving) {
       results.value = undefined;
       itemsError.value = String(cause);
     }
   } finally {
-    if (receiving) itemsLoading.value = false;
+    if (receiving) {
+      itemsLoading.value = false;
+      void restoreCardFocus();
+    }
   }
 });
 
@@ -114,13 +162,53 @@ const detail = shallowRef<Item>();
 const dialog = ref<HTMLDialogElement>();
 const detailImage = ref("");
 const previewError = ref("");
+const previewReady = ref(false);
+const rotationSaving = ref(false);
+const rotationError = ref("");
 const detailError = ref("");
-const opening = ref(false);
+const fileAction = ref<FileAction>();
+const detailStatus = ref("");
+const detailPage = shallowRef<Page<Item>>();
+const detailPosition = ref(0);
+const detailNavigating = ref(false);
+const grid = ref<HTMLUListElement>();
+let pendingFocus: { scanId: number; fileId: number; page: number } | undefined;
 const liveVideo = ref<HTMLVideoElement>();
 const liveVideoUrl = ref("");
 const liveVideoLoading = ref(false);
 const liveVideoError = ref("");
 let detailRequest = 0;
+const canRotate = computed(() => detail.value?.kind === "photo" && detail.value.previewAvailable &&
+  previewReady.value && !previewError.value && !detailNavigating.value && !rotationSaving.value &&
+  !liveVideoLoading.value && !liveVideoUrl.value);
+
+async function rotateDetail(delta: -90 | 90) {
+  const item = detail.value;
+  const scanId = summary.value?.scanId;
+  if (!canRotate.value || !item || scanId === undefined || busy.value) return;
+  const rotation = ((item.rotation + delta + 360) % 360) as Rotation;
+  rotationSaving.value = true;
+  task.value = "saving";
+  rotationError.value = "";
+  try {
+    const saved = await invoke<Rotation>("set_library_rotation", { scanId, fileId: item.id, rotation });
+    if (summary.value?.scanId !== scanId) return;
+    savedRotations.set(item.id, saved);
+    const updatePage = (page: Page<Item> | undefined) => page ? {
+      ...page,
+      items: page.items.map((current) => current.id === item.id ? { ...current, rotation: saved } : current),
+    } : undefined;
+    results.value = updatePage(results.value);
+    detailPage.value = updatePage(detailPage.value);
+    if (detail.value?.id === item.id) detail.value = { ...detail.value, rotation: saved };
+  } catch (cause) {
+    if (summary.value?.scanId === scanId) rotationError.value = String(cause);
+  } finally {
+    rotationSaving.value = false;
+    task.value = undefined;
+    void restoreCardFocus();
+  }
+}
 
 onMounted(async () => {
   try {
@@ -161,6 +249,8 @@ function showScan(selected: string, scanned: Summary) {
     from.value = "";
     to.value = "";
     favoritesOnly.value = false;
+    clearSearch();
+    sort.value = "dateDesc";
   }
   directory.value = selected;
   emit("directoryChange", selected);
@@ -177,6 +267,7 @@ async function scanDirectory(selected: string, mode: "select" | "refresh") {
   task.value = "scanning";
   scanError.value = "";
   favoriteError.value = "";
+  rotationError.value = "";
   found.value = 0;
   try {
     const scanned = await invoke<Summary>("scan_library", { directory: selected, mode, progress: scanProgress() });
@@ -210,20 +301,37 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-async function showDetails(item: Item, event: MouseEvent) {
+watch([summary, filter, sort, revision], () => {
+  pendingFocus = undefined;
+  dialog.value?.close();
+  resetDetail();
+}, { flush: "sync" });
+
+function showDetails(item: Item, event: MouseEvent) {
+  const page = results.value;
+  if (!summary.value || !page || busy.value || itemsLoading.value || searchPending.value) return;
+  detailPage.value = page;
+  detailPosition.value = page.page * pageSize + page.items.findIndex((current) => current.id === item.id);
+  const thumbnail = (event.currentTarget as HTMLButtonElement).querySelector("img");
+  void loadDetail(item, thumbnail?.complete && thumbnail.naturalWidth ? thumbnail.currentSrc : "");
+}
+
+async function loadDetail(item: Item, thumbnail = "") {
   const scanId = summary.value?.scanId;
-  if (scanId === undefined || busy.value) return;
+  if (scanId === undefined) return;
   const request = ++detailRequest;
   clearLiveVideo();
-  const thumbnail = (event.currentTarget as HTMLButtonElement).querySelector("img");
   detail.value = item;
-  detailImage.value = thumbnail?.complete && thumbnail.naturalWidth ? thumbnail.currentSrc : "";
+  rotationError.value = "";
+  detailImage.value = thumbnail;
+  previewReady.value = false;
   previewError.value = "";
   detailError.value = "";
-  opening.value = false;
+  detailStatus.value = "";
+  fileAction.value = undefined;
   await nextTick();
   if (request !== detailRequest) return;
-  dialog.value?.showModal();
+  if (!dialog.value?.open) dialog.value?.showModal();
   if (!item.previewAvailable) return;
   const isCurrent = () => request === detailRequest && dialog.value?.open;
   try {
@@ -232,7 +340,10 @@ async function showDetails(item: Item, event: MouseEvent) {
     const image = new Image();
     image.src = source;
     await image.decode();
-    if (isCurrent()) detailImage.value = source;
+    if (isCurrent()) {
+      detailImage.value = source;
+      previewReady.value = true;
+    }
   } catch (cause) {
     if (isCurrent()) {
       detailImage.value = "";
@@ -241,17 +352,96 @@ async function showDetails(item: Item, event: MouseEvent) {
   }
 }
 
-function clearDetail() {
-  if (dialog.value?.open) return;
+async function moveDetail(delta: -1 | 1) {
+  const scanId = summary.value?.scanId;
+  const page = detailPage.value;
+  const target = detailPosition.value + delta;
+  if (scanId === undefined || !dialog.value?.open || !page || detailNavigating.value || rotationSaving.value || target < 0 || target >= page.total) return;
+  const targetPage = Math.floor(target / pageSize);
+  let nextPage = page;
+  if (targetPage !== page.page) {
+    const request = ++detailRequest;
+    clearLiveVideo();
+    fileAction.value = undefined;
+    detailNavigating.value = true;
+    detailError.value = "";
+    detailStatus.value = "";
+    try {
+      nextPage = await invoke<Page<Item>>("library_items", {
+        scanId, filter: filter.value, sort: sort.value, page: targetPage,
+      });
+      if (request !== detailRequest || !dialog.value?.open) return;
+      nextPage = withSavedRotations(nextPage);
+    } catch (cause) {
+      if (request === detailRequest && dialog.value?.open) {
+        detailNavigating.value = false;
+        detailError.value = `无法切换媒体。${String(cause)}`;
+        // Restart the current preview if it was still loading when navigation began.
+        if (!detailImage.value && detail.value) {
+          const error = detailError.value;
+          void loadDetail(detail.value);
+          detailError.value = error;
+        }
+      }
+      return;
+    }
+    detailNavigating.value = false;
+  }
+  const item = nextPage.items[target % pageSize];
+  if (!item) return;
+  detailPage.value = nextPage;
+  detailPosition.value = target;
+  void loadDetail(item);
+}
+
+function handleDetailKey(event: KeyboardEvent) {
+  const target = event.target;
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
+      (target instanceof Element && target.closest("input, textarea, select, video, [contenteditable]"))) return;
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault();
+    void moveDetail(event.key === "ArrowLeft" ? -1 : 1);
+  }
+}
+
+function resetDetail() {
   detailRequest++;
   detail.value = undefined;
+  detailPage.value = undefined;
   detailImage.value = "";
+  previewReady.value = false;
+  detailNavigating.value = false;
+  fileAction.value = undefined;
   clearLiveVideo();
+}
+
+function finishDetails() {
+  if (dialog.value?.open || !detail.value) return;
+  const scanId = summary.value?.scanId;
+  if (scanId !== undefined && detailPage.value) {
+    pendingFocus = { scanId, fileId: detail.value.id, page: detailPage.value.page };
+    requestedPage.value = detailPage.value.page;
+  }
+  resetDetail();
+  void restoreCardFocus();
 }
 
 function closeDetails() {
   dialog.value?.close();
-  clearDetail();
+  finishDetails();
+}
+
+async function restoreCardFocus() {
+  const target = pendingFocus;
+  if (!target || detail.value || busy.value || itemsLoading.value || target.scanId !== summary.value?.scanId || results.value?.page !== target.page) return;
+  await nextTick();
+  if (pendingFocus !== target || detail.value || busy.value || itemsLoading.value || results.value?.page !== target.page) return;
+  const card = grid.value?.querySelector<HTMLButtonElement>(`[data-file-id="${target.fileId}"]`);
+  if (card) {
+    card.focus({ preventScroll: true });
+    card.scrollIntoView({ block: "nearest" });
+    pendingFocus = undefined;
+  }
 }
 
 function clearLiveVideo() {
@@ -263,6 +453,7 @@ function clearLiveVideo() {
 }
 
 onBeforeUnmount(() => {
+  clearTimeout(searchTimer);
   detailRequest++;
   clearLiveVideo();
 });
@@ -281,7 +472,7 @@ function handleLiveVideoError(event: Event) {
 async function playLivePhoto() {
   const item = detail.value;
   const scanId = summary.value?.scanId;
-  if (!item?.isLivePhoto || scanId === undefined || liveVideoLoading.value || liveVideoUrl.value) return;
+  if (!item?.isLivePhoto || scanId === undefined || detailNavigating.value || rotationSaving.value || liveVideoLoading.value || liveVideoUrl.value) return;
   const request = detailRequest;
   const isCurrent = () => request === detailRequest && dialog.value?.open && summary.value?.scanId === scanId;
   liveVideoError.value = "";
@@ -301,19 +492,27 @@ async function playLivePhoto() {
   }
 }
 
-async function openItem() {
+async function performFileAction(action: FileAction) {
   const item = detail.value;
   const scanId = summary.value?.scanId;
-  if (!item || scanId === undefined || opening.value) return;
+  if (!item || scanId === undefined || fileAction.value || detailNavigating.value) return;
   const request = detailRequest;
-  opening.value = true;
+  fileAction.value = action;
   detailError.value = "";
+  detailStatus.value = "";
+  const commands: Record<FileAction, string> = {
+    open: "open_library_item", reveal: "reveal_library_item", copy: "copy_library_item_path",
+  };
   try {
-    await invoke("open_library_item", { scanId, fileId: item.id });
+    const result = await invoke<"revealed" | "openedParent" | void>(commands[action], { scanId, fileId: item.id });
+    if (request !== detailRequest || !dialog.value?.open) return;
+    if (action === "copy") detailStatus.value = "已复制完整路径";
+    if (action === "reveal") detailStatus.value = result === "openedParent"
+      ? "已打开所在文件夹，无法选中文件。" : "已在文件管理器中显示。";
   } catch (cause) {
-    if (request === detailRequest) detailError.value = String(cause);
+    if (request === detailRequest && dialog.value?.open) detailError.value = String(cause);
   } finally {
-    if (request === detailRequest) opening.value = false;
+    if (request === detailRequest) fileAction.value = undefined;
   }
 }
 </script>
@@ -344,6 +543,21 @@ async function openItem() {
 
     <template v-if="summary">
       <div class="filters">
+        <label class="search-filter">搜索
+          <input v-model="searchInput" type="search" placeholder="文件名或相对路径" aria-label="搜索文件名或相对路径"
+            @compositionstart="startComposition" @compositionend="endComposition" />
+        </label>
+        <button v-if="searchInput" type="button" class="secondary" @click="clearSearch">清空搜索</button>
+        <label>排序
+          <select v-model="sort">
+            <option value="dateDesc">拍摄日期：从新到旧</option>
+            <option value="dateAsc">拍摄日期：从旧到新</option>
+            <option value="nameAsc">名称：升序</option>
+            <option value="nameDesc">名称：降序</option>
+            <option value="sizeDesc">文件大小：从大到小</option>
+            <option value="sizeAsc">文件大小：从小到大</option>
+          </select>
+        </label>
         <label>类型
           <select v-model="kind">
             <option value="all">全部类型</option>
@@ -365,6 +579,7 @@ async function openItem() {
 
       <p v-if="summary.preferenceWarning" class="error" role="alert">{{ summary.preferenceWarning }}</p>
       <p v-if="favoriteError" class="error" role="alert">{{ favoriteError }}</p>
+      <p v-if="rotationError && !detail" class="error" role="alert">{{ rotationError }}</p>
       <p v-if="itemsError" class="error" role="alert">无法读取媒体列表。{{ itemsError }}</p>
       <p v-else class="result-status status" role="status">
         <template v-if="itemsLoading">正在加载媒体…</template>
@@ -376,12 +591,12 @@ async function openItem() {
         <h2>{{ summary.total ? "没有符合筛选条件的媒体文件" : "此目录没有可识别的照片或视频" }}</h2>
       </div>
 
-      <ul v-if="results?.items.length" class="media-grid">
+      <ul v-if="results?.items.length" ref="grid" class="media-grid">
         <li v-for="item in results.items" :key="`${summary.scanId}:${item.id}`" class="card">
-          <button type="button" class="media-preview secondary" :disabled="busy"
+          <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
             <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId"
-              :file-id="item.id" :video="item.kind === 'video'" />
+              :file-id="item.id" :video="item.kind === 'video'" :rotation="item.rotation" />
             <span v-else>{{ item.kind === "video" ? "▶ 视频" : "照片" }}</span>
           </button>
           <div class="card-details">
@@ -390,7 +605,7 @@ async function openItem() {
               <span>{{ item.capturedOn ?? "日期未知" }}</span>
               <button type="button" class="favorite secondary" :aria-label="`收藏 ${item.name}`"
                 :title="item.favorite ? '取消收藏' : '收藏'" :aria-pressed="item.favorite"
-                :disabled="busy" @click="toggleFavorite(item)">{{ item.favorite ? "★" : "☆" }}</button>
+                :disabled="busy || itemsLoading || searchPending" @click="toggleFavorite(item)">{{ item.favorite ? "★" : "☆" }}</button>
             </div>
           </div>
         </li>
@@ -419,27 +634,45 @@ async function openItem() {
     </template>
 
     <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title"
-      @cancel.prevent="closeDetails" @close="clearDetail">
+      @cancel.prevent="closeDetails" @close="finishDetails" @keydown="handleDetailKey">
       <header class="detail-header">
         <h2 id="library-preview-title">{{ detail.name }}</h2>
         <button type="button" class="secondary" @click="closeDetails">关闭</button>
       </header>
-      <video v-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
+      <nav class="detail-navigation" aria-label="连续浏览">
+        <button type="button" class="secondary" :disabled="detailNavigating || rotationSaving || detailPosition === 0" @click="moveDetail(-1)">上一项</button>
+        <span role="status">第 {{ detailPosition + 1 }} / {{ detailPage?.total ?? 0 }} 项</span>
+        <button type="button" class="secondary" :disabled="detailNavigating || rotationSaving || detailPosition + 1 >= (detailPage?.total ?? 0)" @click="moveDetail(1)">下一项</button>
+      </nav>
+      <p v-if="detailNavigating" class="status" role="status">正在切换媒体…</p>
+      <video v-else-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
         :aria-label="detail.name" controls playsinline
         @error="handleLiveVideoError" />
-      <img v-else-if="detailImage" class="detail-image" :src="detailImage" :alt="detail.name" />
+      <RotatableImage v-else-if="detailImage" :src="detailImage" :alt="detail.name" :rotation="detail.rotation" detail
+        @error="previewReady = false; previewError = '无法显示图片预览。'" />
       <p v-else-if="detail.previewAvailable && !previewError" class="status" role="status">正在加载预览…</p>
       <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
+      <div v-if="detail.kind === 'photo' && detail.previewAvailable && !liveVideoUrl" class="rotation-actions">
+        <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(-90)">向左旋转 90°</button>
+        <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(90)">向右旋转 90°</button>
+        <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
+      </div>
+      <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
       <p class="detail-path">{{ detail.relativePath }}</p>
       <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
-      <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="liveVideoLoading"
+      <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
         @click="playLivePhoto">
         {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
       </button>
       <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
-      <button type="button" :disabled="opening" @click="openItem">
-        {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
-      </button>
+      <div class="detail-actions">
+        <button type="button" :disabled="!!fileAction || detailNavigating" @click="performFileAction('open')">
+          {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
+        </button>
+        <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('reveal')">在文件管理器中显示</button>
+        <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('copy')">复制完整路径</button>
+      </div>
+      <p v-if="detailStatus" class="status" role="status">{{ detailStatus }}</p>
       <p v-if="detailError" class="error" role="alert">{{ detailError }}</p>
     </dialog>
   </div>
@@ -490,7 +723,7 @@ async function openItem() {
 }
 
 .directory-field input,
-.filters :is(select, input[type="date"]) {
+.filters :is(select, input[type="date"], input[type="search"]) {
   box-sizing: border-box;
   min-height: 2.5rem;
   padding: 0.375rem 0.625rem;
@@ -554,7 +787,7 @@ async function openItem() {
   font-size: 0.875rem;
 }
 
-.filters select:focus-visible {
+.filters :is(select, input):focus-visible {
   outline: 2px solid #126353;
   outline-offset: 2px;
 }
@@ -654,6 +887,9 @@ button.favorite:hover:not(:disabled) {
 }
 
 .pagination,
+.detail-navigation,
+.rotation-actions,
+.detail-actions,
 .detail-header {
   display: flex;
   flex-wrap: wrap;
@@ -688,6 +924,16 @@ dialog {
 dialog::backdrop {
   background: rgb(18 36 32 / 60%);
 }
+
+.detail-navigation {
+  justify-content: center;
+  margin-bottom: 1rem;
+}
+
+.detail-navigation span { font-variant-numeric: tabular-nums; }
+.detail-actions { margin-top: 1rem; }
+.rotation-actions { margin-top: 0.75rem; }
+.search-filter input { min-width: 0; width: 14rem; max-width: 100%; }
 
 .detail-header {
   justify-content: space-between;

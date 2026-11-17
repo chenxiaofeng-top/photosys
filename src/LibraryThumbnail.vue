@@ -2,8 +2,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { queueLibraryThumbnail } from "./libraryThumbnailQueue";
+import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 
-const props = defineProps<{ scanId: number; fileId: number; video: boolean }>();
+const props = defineProps<{ scanId: number; fileId: number; video: boolean; rotation: Rotation }>();
 const target = ref<HTMLElement>();
 const image = ref("");
 const error = ref("");
@@ -46,7 +47,7 @@ async function load() {
 
 <template>
   <span ref="target" class="thumbnail">
-    <img v-if="image" :src="image" alt="" />
+    <RotatableImage v-if="image" :src="image" alt="" :rotation="rotation" />
     <span v-else-if="error" class="preview-error" :title="error">预览失败</span>
     <span v-else>{{ video ? "▶ 视频" : "照片" }}</span>
     <span v-if="video && image" class="video-label" aria-hidden="true">▶ 视频</span>
@@ -60,13 +61,6 @@ async function load() {
   width: 100%;
   height: 100%;
   place-items: center;
-}
-
-img {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  object-fit: contain;
 }
 
 .preview-error {
