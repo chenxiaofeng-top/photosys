@@ -179,7 +179,7 @@ pub(super) fn features(
     })
 }
 
-pub(super) fn preview(file: &mut File, size: u64, detail: bool) -> Result<String, String> {
+pub(crate) fn preview(file: &mut File, size: u64, detail: bool) -> Result<String, String> {
     let (image, _, _) = scaled(file, size, if detail { 1600 } else { 240 })?;
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, if detail { 90 } else { 80 })

@@ -1,5 +1,6 @@
 mod favorites;
 mod platform;
+mod previews;
 
 use std::collections::HashSet;
 use std::fs;
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tempfile::NamedTempFile;
+use tokio::sync::Semaphore;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::duplicates::{Candidate, FileStamp, Root, display_path, is_link};
@@ -25,6 +27,8 @@ const STATE_ERROR: &str = "无法读取媒体库状态，请重启应用后重�
 const STALE_SCAN: &str = "媒体库已变化，请刷新。";
 static SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+static THUMBNAIL_SLOTS: Semaphore = Semaphore::const_new(2);
+static DETAIL_SLOTS: Semaphore = Semaphore::const_new(1);
 
 pub(crate) fn include_in_scan(entry: &DirEntry) -> bool {
     entry.depth() == 0 || entry.file_name() != favorites::DATA_DIR
@@ -157,6 +161,7 @@ struct Scan {
     root: Root,
     items: Vec<Item>,
     issues: Vec<Issue>,
+    previews: Mutex<previews::Cache>,
 }
 
 impl Scan {
@@ -236,6 +241,7 @@ impl Scan {
             root,
             items,
             issues,
+            previews: Mutex::default(),
         }
     }
 }
@@ -555,13 +561,15 @@ pub(crate) async fn library_preview(
     file_id: usize,
     detail: bool,
 ) -> Result<String, String> {
+    let slots = if detail {
+        &DETAIL_SLOTS
+    } else {
+        &THUMBNAIL_SLOTS
+    };
+    let permit = slots.acquire().await.map_err(|_| STATE_ERROR)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let scan = scan(scan_id)?;
-        let item = scan.item(file_id)?;
-        if !item.preview_available {
-            return Err("此文件可用系统默认应用打开。".into());
-        }
-        crate::similar::preview(&scan.root, &item.file, detail)
+        let _permit = permit;
+        scan(scan_id)?.preview(file_id, detail)
     })
     .await
     .map_err(|error| format!("无法加载媒体预览。{error}"))?

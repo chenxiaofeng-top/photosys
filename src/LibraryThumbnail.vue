@@ -1,21 +1,26 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { queueLibraryThumbnail } from "./libraryThumbnailQueue";
 
 const props = defineProps<{ scanId: number; fileId: number }>();
 const target = ref<HTMLElement>();
 const image = ref("");
 const error = ref("");
 let observer: IntersectionObserver | undefined;
+let cancelQueued: (() => void) | undefined;
 let mounted = false;
 
 onMounted(() => {
   mounted = true;
-  observer = new IntersectionObserver(([entry]) => {
-    if (!entry?.isIntersecting || !observer) return;
-    observer.disconnect();
-    observer = undefined;
-    void load();
+  observer = new IntersectionObserver((entries) => {
+    if (!observer) return;
+    if (entries[entries.length - 1]?.isIntersecting) {
+      cancelQueued ??= queueLibraryThumbnail(load);
+    } else {
+      cancelQueued?.();
+      cancelQueued = undefined;
+    }
   });
   if (target.value) observer.observe(target.value);
 });
@@ -24,9 +29,12 @@ onBeforeUnmount(() => {
   mounted = false;
   observer?.disconnect();
   observer = undefined;
+  cancelQueued?.();
 });
 
 async function load() {
+  observer?.disconnect();
+  observer = undefined;
   try {
     const preview = await invoke<string>("library_preview", { scanId: props.scanId, fileId: props.fileId, detail: false });
     if (mounted) image.value = preview;

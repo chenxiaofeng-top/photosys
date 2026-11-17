@@ -2,7 +2,7 @@ mod cache;
 mod imaging;
 mod matching;
 
-pub(crate) use imaging::supported as supports_preview;
+pub(crate) use imaging::{preview as encode_preview, supported as supports_preview};
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};

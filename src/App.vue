@@ -5,6 +5,7 @@ import DuplicatesPanel from "./DuplicatesPanel.vue";
 import MediaLibrary from "./MediaLibrary.vue";
 import SimilarPhotosPanel from "./SimilarPhotosPanel.vue";
 import { formatBytes } from "./formatBytes";
+import appIcon from "../src-tauri/icons/32x32.png";
 
 interface ArchiveSummary {
   found: number;
@@ -118,15 +119,20 @@ async function startArchive() {
 </script>
 
 <template>
-  <main :class="{ 'library-layout': view === 'library' }">
-    <header>
-      <p class="app-name">PhotoSys</p>
+  <header class="app-header">
+    <div class="app-header-content">
+      <p class="app-name"><img :src="appIcon" alt="" width="24" height="24" />PhotoSys</p>
       <nav class="view-nav" aria-label="功能">
-        <button v-for="(title, target) in viewTitles" :key="target" type="button" class="secondary"
+        <button v-for="(title, target) in viewTitles" :key="target" type="button"
           :aria-pressed="view === target" :disabled="fileTaskBusy" @click="navigate(target)">
           {{ title }}
         </button>
       </nav>
+    </div>
+  </header>
+
+  <main :class="{ 'library-layout': view === 'library' }">
+    <header v-if="view !== 'library'">
       <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
@@ -209,7 +215,9 @@ async function startArchive() {
 :root {
   font-family: Inter, system-ui, sans-serif;
   color: #152e30;
-  background: #eef4f1;
+  background: #f6f5f1;
+  --workspace-gutter: clamp(1rem, 2.5vw, 3rem);
+  --workspace-max-width: 120rem;
 }
 
 body {
@@ -223,31 +231,68 @@ main {
 }
 
 main.library-layout {
-  max-width: 72rem;
-  padding: clamp(1rem, 4vw, 2.5rem);
+  box-sizing: border-box;
+  max-width: var(--workspace-max-width);
+  padding: clamp(1.25rem, 2vw, 2rem) var(--workspace-gutter) 2.5rem;
 }
 
 header {
   margin-bottom: 1.5rem;
 }
 
+.app-header {
+  margin: 0;
+  border-bottom: 1px solid #dedfd8;
+  background: #fdfcf9;
+}
+
+.app-header-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: clamp(1rem, 3vw, 3rem);
+  row-gap: 0.25rem;
+  box-sizing: border-box;
+  max-width: var(--workspace-max-width);
+  min-height: 3.75rem;
+  margin: 0 auto;
+  padding: 0.5rem var(--workspace-gutter);
+}
+
 .app-name {
-  margin: 0 0 0.5rem;
-  color: #366560;
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  margin: 0;
+  color: #233732;
+  font-size: 1.125rem;
   font-weight: 700;
 }
 
 .view-nav {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
+  gap: 0.25rem;
 }
 
-.view-nav button[aria-pressed="true"]:not(:disabled) {
-  border-color: #176252;
-  background: #176252;
-  color: #fff;
+.view-nav button {
+  padding-inline: clamp(0.5rem, 1vw, 0.875rem);
+  background: transparent;
+  color: #4d5854;
+  font-size: 0.875rem;
+}
+
+.view-nav button:hover:not(:disabled) {
+  background: #eeeee8;
+}
+
+.view-nav button[aria-pressed="true"] {
+  background: #deede6;
+  color: #185746;
+}
+
+.view-nav button:disabled:not([aria-pressed="true"]) {
+  color: #6b746f;
 }
 
 h1 {

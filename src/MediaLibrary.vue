@@ -70,11 +70,13 @@ const filter = computed(() => ({
 const requestedPage = ref(0);
 const revision = ref(0);
 const results = shallowRef<Page<Item>>();
+const itemsLoading = ref(false);
 watch(filter, () => { requestedPage.value = 0; }, { flush: "sync" });
 watch([summary, filter, requestedPage, revision], async ([scan, currentFilter, page], _, onCleanup) => {
   if (!scan) return;
   let receiving = true;
   onCleanup(() => { receiving = false; });
+  itemsLoading.value = true;
   itemsError.value = "";
   try {
     const result = await invoke<Page<Item>>("library_items", { scanId: scan.scanId, filter: currentFilter, page });
@@ -84,6 +86,8 @@ watch([summary, filter, requestedPage, revision], async ([scan, currentFilter, p
       results.value = undefined;
       itemsError.value = String(cause);
     }
+  } finally {
+    if (receiving) itemsLoading.value = false;
   }
 });
 
@@ -105,9 +109,11 @@ watch([summary, issuesOpen, issuePage], async ([scan, open, page], _, onCleanup)
 
 const detail = shallowRef<Item>();
 const dialog = ref<HTMLDialogElement>();
-const fullImage = ref("");
+const detailImage = ref("");
+const previewError = ref("");
 const detailError = ref("");
 const opening = ref(false);
+let detailRequest = 0;
 
 onMounted(async () => {
   try {
@@ -196,50 +202,83 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-async function showDetails(item: Item) {
+async function showDetails(item: Item, event: MouseEvent) {
   const scanId = summary.value?.scanId;
   if (scanId === undefined || busy.value) return;
+  const request = ++detailRequest;
+  const thumbnail = (event.currentTarget as HTMLButtonElement).querySelector("img");
   detail.value = item;
-  fullImage.value = "";
+  detailImage.value = thumbnail?.complete && thumbnail.naturalWidth ? thumbnail.currentSrc : "";
+  previewError.value = "";
   detailError.value = "";
   opening.value = false;
   await nextTick();
+  if (request !== detailRequest) return;
   dialog.value?.showModal();
   if (!item.previewAvailable) return;
+  const isCurrent = () => request === detailRequest && dialog.value?.open;
   try {
-    const image = await invoke<string>("library_preview", { scanId, fileId: item.id, detail: true });
-    if (detail.value === item) fullImage.value = image;
+    const source = await invoke<string>("library_preview", { scanId, fileId: item.id, detail: true });
+    if (!isCurrent()) return;
+    const image = new Image();
+    image.src = source;
+    await image.decode();
+    if (isCurrent()) detailImage.value = source;
   } catch (cause) {
-    if (detail.value === item) detailError.value = `无法预览。${String(cause)}`;
+    if (isCurrent()) {
+      detailImage.value = "";
+      previewError.value = `无法预览。${String(cause)}`;
+    }
   }
+}
+
+function clearDetail() {
+  if (dialog.value?.open) return;
+  detailRequest++;
+  detail.value = undefined;
+  detailImage.value = "";
 }
 
 async function openItem() {
   const item = detail.value;
   const scanId = summary.value?.scanId;
   if (!item || scanId === undefined || opening.value) return;
+  const request = detailRequest;
   opening.value = true;
   detailError.value = "";
   try {
     await invoke("open_library_item", { scanId, fileId: item.id });
   } catch (cause) {
-    if (detail.value === item) detailError.value = String(cause);
+    if (request === detailRequest) detailError.value = String(cause);
   } finally {
-    if (detail.value === item) opening.value = false;
+    if (request === detailRequest) opening.value = false;
   }
 }
 </script>
 
 <template>
-  <section class="media-library" aria-label="媒体库">
-    <label for="library-directory">媒体库目录</label>
-    <div class="folder-row">
-      <input id="library-directory" :value="directory" placeholder="尚未选择目录" readonly />
-      <button type="button" class="secondary" :disabled="busy" @click="chooseDirectory">选择目录</button>
-      <button v-if="directory" type="button" class="secondary" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</button>
+  <div class="media-library">
+    <header class="library-header">
+      <h1>媒体库</h1>
+      <div v-if="directory" class="directory-toolbar">
+        <div class="directory-field">
+          <label for="library-directory">媒体库目录</label>
+          <input id="library-directory" :value="directory" :title="directory" readonly />
+        </div>
+        <button type="button" class="secondary" :disabled="busy" @click="chooseDirectory">更换目录</button>
+        <button type="button" class="secondary" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</button>
+      </div>
+    </header>
+
+    <p v-if="task === 'starting'" class="status" role="status">正在恢复媒体库…</p>
+    <p v-else-if="task === 'scanning'" class="status" role="status">正在扫描，已发现 {{ found }} 个媒体文件…</p>
+    <p v-if="scanError" class="error" role="alert">读取媒体库失败。{{ scanError }}</p>
+
+    <div v-if="!directory && task !== 'starting' && task !== 'scanning'" class="library-empty">
+      <h2>打开照片和视频</h2>
+      <p>选择包含照片或视频的本地目录。</p>
+      <button type="button" :disabled="busy" @click="chooseDirectory">选择目录</button>
     </div>
-    <p v-if="task === 'scanning'" class="status" role="status">正在扫描，已发现 {{ found }} 个媒体文件…</p>
-    <p v-if="scanError" class="error" role="alert">{{ scanError }}</p>
 
     <template v-if="summary">
       <div class="filters">
@@ -264,16 +303,21 @@ async function openItem() {
 
       <p v-if="summary.preferenceWarning" class="error" role="alert">{{ summary.preferenceWarning }}</p>
       <p v-if="favoriteError" class="error" role="alert">{{ favoriteError }}</p>
-      <p v-if="itemsError" class="error" role="alert">{{ itemsError }}</p>
-      <p v-else-if="results" class="status" role="status">
-        {{ results.total ? `显示 ${results.total} / ${summary.total} 个媒体文件`
-          : summary.total ? "没有符合筛选条件的媒体文件。" : "此目录没有可识别的照片或视频。" }}
+      <p v-if="itemsError" class="error" role="alert">无法读取媒体列表。{{ itemsError }}</p>
+      <p v-else class="result-status status" role="status">
+        <template v-if="itemsLoading">正在加载媒体…</template>
+        <template v-else-if="results?.total">
+          {{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}
+        </template>
       </p>
+      <div v-if="!itemsLoading && results?.total === 0" class="library-empty" role="status">
+        <h2>{{ summary.total ? "没有符合筛选条件的媒体文件" : "此目录没有可识别的照片或视频" }}</h2>
+      </div>
 
       <ul v-if="results?.items.length" class="media-grid">
         <li v-for="item in results.items" :key="`${summary.scanId}:${item.id}`" class="card">
           <button type="button" class="media-preview secondary" :disabled="busy"
-            :aria-label="`查看 ${item.name}`" @click="showDetails(item)">
+            :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
             <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId" :file-id="item.id" />
             <span v-else>{{ item.kind === "video" ? "▶ 视频" : "照片" }}</span>
           </button>
@@ -311,13 +355,14 @@ async function openItem() {
       </details>
     </template>
 
-    <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title" @close="detail = undefined">
+    <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title" @close="clearDetail">
       <header class="detail-header">
         <h2 id="library-preview-title">{{ detail.name }}</h2>
         <button type="button" class="secondary" @click="dialog?.close()">关闭</button>
       </header>
-      <img v-if="fullImage" class="detail-image" :src="fullImage" :alt="detail.name" />
-      <p v-else-if="detail.previewAvailable && !detailError" class="status" role="status">正在加载预览…</p>
+      <img v-if="detailImage" class="detail-image" :src="detailImage" :alt="detail.name" />
+      <p v-else-if="detail.previewAvailable && !previewError" class="status" role="status">正在加载预览…</p>
+      <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
       <p class="detail-path">{{ detail.relativePath }}</p>
       <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
       <button type="button" :disabled="opening" @click="openItem">
@@ -325,34 +370,116 @@ async function openItem() {
       </button>
       <p v-if="detailError" class="error" role="alert">{{ detailError }}</p>
     </dialog>
-  </section>
+  </div>
 </template>
 
 <style scoped>
-.filters {
+.media-library {
+  --library-surface: #fdfcf9;
+  --library-border: #dedfd8;
+  --library-control-border: #a9b5ad;
+  --library-muted: #53635d;
+  --library-preview: #eaece6;
+  color: #24352f;
+}
+
+.library-header {
   display: flex;
   flex-wrap: wrap;
   align-items: end;
-  gap: 0.75rem;
-  margin-top: 1.25rem;
+  justify-content: space-between;
+  gap: 0.875rem 2rem;
+  margin: 0;
 }
 
-.filters label {
-  display: grid;
-  gap: 0.375rem;
-  margin: 0;
+.library-header h1 {
+  font-size: clamp(1.75rem, 2.2vw, 2.5rem);
+  line-height: 1.2;
+}
+
+.directory-toolbar {
+  display: flex;
+  flex: 0 1 44rem;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.directory-field {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.directory-field label {
+  margin: 0 0 0.375rem;
+  color: var(--library-muted);
+  font-size: 0.8125rem;
+}
+
+.directory-field input,
+.filters :is(select, input[type="date"]) {
+  box-sizing: border-box;
+  min-height: 2.5rem;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--library-control-border);
+  border-radius: 0.5rem;
+  background: var(--library-surface);
+  color: inherit;
+  font: inherit;
+}
+
+.directory-field input {
+  width: 100%;
   font-size: 0.875rem;
 }
 
-.filters :is(select, input[type="date"]) {
-  padding: 0.5rem;
-  min-height: 2.5rem;
-  box-sizing: border-box;
-  border: 1px solid #829d95;
-  border-radius: 0.5rem;
-  background: #fcfefd;
-  color: inherit;
-  font: inherit;
+.directory-field input:not(:focus) {
+  text-overflow: ellipsis;
+}
+
+.media-library button.secondary:not(.media-preview, .favorite) {
+  border-color: var(--library-control-border);
+  background: var(--library-surface);
+}
+
+.media-library button.secondary:hover:not(.media-preview, .favorite, :disabled) {
+  background: #e7efe9;
+}
+
+.library-empty {
+  display: grid;
+  justify-items: center;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+  padding: clamp(2rem, 6vw, 5rem) 1rem;
+  border: 1px solid var(--library-border);
+  border-radius: 0.75rem;
+  background: var(--library-surface);
+  text-align: center;
+}
+
+.library-empty p {
+  margin: 0;
+  color: var(--library-muted);
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625rem 1.25rem;
+  margin-top: 1.25rem;
+  padding-block: 0.75rem;
+  border-block: 1px solid var(--library-border);
+}
+
+.filters label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  font-size: 0.875rem;
 }
 
 .filters select:focus-visible {
@@ -360,24 +487,34 @@ async function openItem() {
   outline-offset: 2px;
 }
 
-.filters .favorite-filter {
-  display: flex;
-  align-items: center;
+.favorite-filter {
   min-height: 2.5rem;
 }
 
 .favorite-filter input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
   accent-color: #176252;
 }
 
 .status {
-  color: #395d57;
+  color: var(--library-muted);
+}
+
+.result-status {
+  margin: 1rem 0 0.75rem;
+  font-size: 0.875rem;
+}
+
+.result-status:empty {
+  margin: 0;
 }
 
 .media-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(10rem, 100%), 1fr));
-  gap: 0.875rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(0.625rem, 1vw, 1rem);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -385,9 +522,9 @@ async function openItem() {
 
 .card {
   min-width: 0;
-  border: 1px solid #c9d9d4;
+  border: 1px solid var(--library-border);
   border-radius: 0.75rem;
-  background: #fcfefd;
+  background: var(--library-surface);
 }
 
 button.media-preview {
@@ -400,11 +537,13 @@ button.media-preview {
   overflow: hidden;
   border: 0;
   border-radius: 0.7rem 0.7rem 0 0;
-  background: #edf4f1;
+  background: var(--library-preview);
+  color: var(--library-muted);
+  font-size: 0.875rem;
 }
 
 .card-details {
-  padding: 0.625rem 0.75rem 0.375rem;
+  padding: 0.625rem 0.75rem 0.25rem;
 }
 
 .file-name {
@@ -412,6 +551,7 @@ button.media-preview {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  font-size: 0.875rem;
   font-weight: 650;
 }
 
@@ -420,8 +560,9 @@ button.media-preview {
   justify-content: space-between;
   align-items: center;
   gap: 0.25rem;
-  color: #395d57;
-  font-size: 0.875rem;
+  color: var(--library-muted);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
 }
 
 button.favorite {
@@ -434,6 +575,10 @@ button.favorite {
 
 button.favorite[aria-pressed="true"] {
   color: #865000;
+}
+
+button.favorite:hover:not(:disabled) {
+  background: #e7efe9;
 }
 
 .pagination,
@@ -464,6 +609,7 @@ dialog {
   padding: 1.25rem;
   border: 1px solid #829d95;
   border-radius: 0.875rem;
+  background: var(--library-surface);
   color: inherit;
 }
 
@@ -487,10 +633,26 @@ dialog::backdrop {
   width: 100%;
   max-height: 55vh;
   object-fit: contain;
-  background: #edf4f1;
+  background: var(--library-preview);
 }
 
 .detail-path {
   overflow-wrap: anywhere;
+}
+
+@media (min-width: 40rem) {
+  .media-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (min-width: 48rem) {
+  .media-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+@media (min-width: 72rem) {
+  .media-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+
+@media (min-width: 90rem) {
+  .media-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 }
 </style>

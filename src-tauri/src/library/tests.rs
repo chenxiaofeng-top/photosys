@@ -61,13 +61,11 @@ fn sorts_dates_and_filters_mixed_media_with_on_demand_preview() {
     assert_eq!(photo.captured_on.as_deref(), Some("2024-02-29"));
     assert!(photo.preview_available);
     assert!(
-        crate::similar::preview(
-            &session.scan.root,
-            &session.scan.item(photo.id).unwrap().file,
-            false
-        )
-        .unwrap()
-        .starts_with("data:image/jpeg;base64,")
+        session
+            .scan
+            .preview(photo.id, false)
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,")
     );
     assert_eq!(
         session
@@ -83,14 +81,7 @@ fn sorts_dates_and_filters_mixed_media_with_on_demand_preview() {
             .id,
         broken.id
     );
-    assert!(
-        crate::similar::preview(
-            &session.scan.root,
-            &session.scan.item(broken.id).unwrap().file,
-            false
-        )
-        .is_err()
-    );
+    assert!(session.scan.preview(broken.id, false).is_err());
     let page = session
         .items(
             Filter {
