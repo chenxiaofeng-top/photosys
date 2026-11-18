@@ -1,3 +1,4 @@
+pub(crate) mod ai_search;
 mod favorites;
 mod live;
 mod platform;
@@ -566,6 +567,7 @@ fn open_library(
     keys: HashSet<Vec<u8>>,
     progress: impl FnMut(Progress),
 ) -> Result<Summary, String> {
+    ai_search::cancel_all();
     let rotations =
         favorites::read_rotations(&root).map_err(|error| format!("无法读取旋转方向。{error}"))?;
     let scanned = Session::from_scan(

@@ -2,6 +2,7 @@ mod cache;
 mod imaging;
 mod matching;
 
+pub(crate) use imaging::scaled as decode_rgb;
 pub(crate) use imaging::{preview as encode_preview, supported as supports_preview};
 
 use std::ops::ControlFlow;

@@ -32,6 +32,26 @@ PhotoSys 是一个使用 Tauri 2、Vue 3、TypeScript 和 Rust 的桌面应用�
 
 同图变体包括压缩、缩放、格式转换和轻微调色后的版本。疑似连拍还会检查 EXIF 拍摄时间，要求相差不超过 5 秒。复扫会使用本地 SQLite 索引复用未变化照片的图像特征。暂未支持的照片格式和读图失败会列在「问题明细」中。
 
+## 本地 AI 内容搜索
+
+在媒体库打开「AI 搜索设置」，手动选择模型安装目录，然后点击「下载并安装模型」。模型使用 Chinese-CLIP ViT-B/16，下载量约 755 MB；目录下会生成 `chinese-clip-vit-b16-fp32-v1/`，多个相册可以共用。应用记住所选目录，换电脑或路径失效后需要重新选择。更换目录不会搬动或删除旧模型。
+
+默认通过第三方 HF-Mirror 镜像下载，失败后尝试 Hugging Face 原源，也可手动切换。下载支持取消、重试和断点续传；服务端不支持续传时重新下载对应文件。固定版本的三个模型文件全部通过大小、SHA-256 校验和本地推理自检后才启用。修复安装会保留旧目录为 `.photosys-model-backup-*`，确认新模型可用后可自行清理备份。
+
+模型就绪后，首次手动点击「建立索引」。之后打开或刷新相册时，自动分析新增、修改及旋转方向变化的照片。处理过程不锁定照片浏览；可点击「停止索引」，已保存部分会保留。失败项列在「AI 索引问题」，手动「更新索引 / 重试失败项」会重新尝试。只读相册可搜索已有有效索引，不能建立或更新索引。
+
+将「搜索方式」切换到「照片内容」，输入“海边日落”“雪地里的小狗”等描述，再按回车或点击「搜索照片」。中文输入法组词时不会提交查询。结果按内容相关度排列，最多 200 张，每页 24 张，可结合拍摄日期、日期未知及收藏筛选；输入中的日期不会自动转换为筛选条件。索引未完成时只搜索已保存部分，并显示覆盖情况。文件名模式保持原有搜索、筛选与排序行为。
+
+AI 索引保存在相册的 `.photosys/ai.sqlite`，使用相对路径，可随整个相册目录搬迁。索引不修改原照片、收藏或现有相似照片缓存。支持 JPG/JPEG、PNG、WebP、TIFF、HEIC/HEIF，以及 `.livp` 静态封面；沿用现有解码大小限制。首版不分析视频、不识别人名或图片文字。索引表示内容相似程度，不保证每张返回照片都符合描述。
+
+模型安装后，建立索引和搜索可以完全断网。AI 运行时随软件打包，已关闭运行时遥测；照片、文件路径和搜索描述均不上传，无需另装 Python、Ollama 或显卡驱动。模型与原始资料的来源、固定版本和许可见 [AI 模型说明](scripts/AI-MODEL-NOTICES.md)。
+
+无网络的电脑可使用「导入离线模型包」。在已安装模型的电脑上，用以下开发工具导出兼容 ZIP，再复制到目标电脑导入；ZIP 根目录包含两个 ONNX 编码器和词表，导入执行相同的校验与自检。
+
+```sh
+python3 scripts/package-ai-model.py /path/to/models/chinese-clip-vit-b16-fp32-v1 /path/to/photosys-model-v1.zip
+```
+
 ## 开发环境
 
 安装 Node.js 24 LTS 和 npm，再通过 [rustup](https://rustup.rs/) 安装 Rust stable。安装后重新打开终端，确认 `node --version`、`npm --version` 和 `rustc --version` 可用。
@@ -65,7 +85,7 @@ pacman -S --needed curl diffutils make mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
 ```
 
-准备好 FFmpeg 后，在项目根目录执行以下命令。`tauri dev` 启动 Vite 和桌面窗口，关闭开发进程后可以执行打包。
+准备好 FFmpeg 后，安装 Python 3.11 或更新版本，并执行 `python3 scripts/prepare-ai-runtime.py`，下载固定版本、校验 SHA-256 的官方 ONNX Runtime CPU 库与许可文件。Python 只供开发和构建使用，最终用户无需安装。在项目根目录执行以下命令。`tauri dev` 启动 Vite 和桌面窗口，关闭开发进程后可以执行打包。
 
 ```sh
 npm ci
@@ -80,7 +100,9 @@ npm run build
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-在 macOS 上先运行 `bash scripts/build-media-codec.sh universal-apple-darwin`，再用 `npm run tauri build -- --target universal-apple-darwin -- --locked` 构建通用包。本机打包产物位于 `src-tauri/target/release/bundle/`，指定 `--target` 后位于 `src-tauri/target/<target>/release/bundle/`。
+在 macOS 上先运行 `bash scripts/build-media-codec.sh universal-apple-darwin` 和 `python3 scripts/prepare-ai-runtime.py --universal`，再用 `npm run tauri build -- --target universal-apple-darwin -- --locked` 构建通用包。通用包分别提供 Apple Silicon 和 Intel 的 CPU 运行时。本机打包产物位于 `src-tauri/target/release/bundle/`，指定 `--target` 后位于 `src-tauri/target/<target>/release/bundle/`。
+
+AI 模型实测方法及当前验证范围见 [AI 搜索验证记录](scripts/AI-SEARCH-VALIDATION.md)。
 
 ## GitHub Actions
 

@@ -1,3 +1,4 @@
+mod ai;
 mod archive;
 mod duplicates;
 mod library;
@@ -114,6 +115,16 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            ai::ai_model_status,
+            ai::ai_set_model_directory,
+            ai::ai_install_model,
+            ai::ai_cancel_install,
+            ai::ai_choose_model_package,
+            library::ai_search::ai_index_status,
+            library::ai_search::ai_update_index,
+            library::ai_search::ai_cancel_index,
+            library::ai_search::ai_index_issues,
+            library::ai_search::ai_search,
             library::scan_startup_library,
             library::scan_library,
             library::library_items,

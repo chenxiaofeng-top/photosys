@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
+import AiSearchSettings from "./AiSearchSettings.vue";
+import type { IndexStatus } from "./aiSearch";
 import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
@@ -68,15 +70,30 @@ const to = ref("");
 const favoritesOnly = ref(false);
 const searchInput = ref("");
 const query = ref("");
+const searchMode = ref<"filename" | "content">("filename");
+const aiReady = ref(false);
+const aiIndex = ref<IndexStatus>();
+const aiPanel = ref<InstanceType<typeof AiSearchSettings>>();
+const aiRevision = ref(0);
 const sort = ref<Sort>("dateDesc");
 const composing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
-const searchPending = computed(() => composing.value || searchInput.value.trim() !== query.value);
+const searchPending = computed(() => searchMode.value === "filename" && (composing.value || searchInput.value.trim() !== query.value));
 
 function scheduleSearch() {
   clearTimeout(searchTimer);
-  if (!composing.value) searchTimer = setTimeout(() => { query.value = searchInput.value.trim(); }, 250);
+  if (!composing.value && searchMode.value === "filename") searchTimer = setTimeout(() => { query.value = searchInput.value.trim(); }, 250);
 }
+
+function submitContentSearch(event?: KeyboardEvent) {
+  if (composing.value || event?.isComposing || !aiReady.value) return;
+  query.value = searchInput.value.trim();
+  requestedPage.value = 0;
+  aiRevision.value++;
+}
+
+watch(searchMode, () => { clearSearch(); requestedPage.value = 0; });
+watch(aiReady, () => { if (searchMode.value === "content") aiRevision.value++; });
 
 function startComposition() {
   composing.value = true;
@@ -119,15 +136,22 @@ function withSavedRotations(page: Page<Item>): Page<Item> {
   };
 }
 const itemsLoading = ref(false);
+async function fetchPage(scanId: number, currentFilter: typeof filter.value, currentSort: Sort, page: number): Promise<Page<Item>> {
+  if (searchMode.value === "content") {
+    if (!currentFilter.query) return { page: 0, total: 0, items: [] };
+    return invoke<Page<Item>>("ai_search", { scanId, query: currentFilter.query, filter: currentFilter, page });
+  }
+  return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
+}
 watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, sort, requestedPage, revision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
   let receiving = true;
   onCleanup(() => { receiving = false; });
   itemsLoading.value = true;
   itemsError.value = "";
   try {
-    const result = await invoke<Page<Item>>("library_items", { scanId: scan.scanId, filter: currentFilter, sort: currentSort, page });
+    const result = await fetchPage(scan.scanId, currentFilter, currentSort, page);
     if (receiving) results.value = withSavedRotations(result);
   } catch (cause) {
     if (receiving) {
@@ -201,6 +225,7 @@ async function rotateDetail(delta: -90 | 90) {
     results.value = updatePage(results.value);
     detailPage.value = updatePage(detailPage.value);
     if (detail.value?.id === item.id) detail.value = { ...detail.value, rotation: saved };
+    void aiPanel.value?.refreshIndex();
   } catch (cause) {
     if (summary.value?.scanId === scanId) rotationError.value = String(cause);
   } finally {
@@ -253,6 +278,7 @@ function showScan(selected: string, scanned: Summary) {
     sort.value = "dateDesc";
   }
   directory.value = selected;
+  aiIndex.value = undefined;
   emit("directoryChange", selected);
   results.value = undefined;
   issues.value = undefined;
@@ -301,7 +327,7 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-watch([summary, filter, sort, revision], () => {
+watch([summary, filter, sort, revision, searchMode], () => {
   pendingFocus = undefined;
   dialog.value?.close();
   resetDetail();
@@ -367,9 +393,7 @@ async function moveDetail(delta: -1 | 1) {
     detailError.value = "";
     detailStatus.value = "";
     try {
-      nextPage = await invoke<Page<Item>>("library_items", {
-        scanId, filter: filter.value, sort: sort.value, page: targetPage,
-      });
+      nextPage = await fetchPage(scanId, filter.value, sort.value, targetPage);
       if (request !== detailRequest || !dialog.value?.open) return;
       nextPage = withSavedRotations(nextPage);
     } catch (cause) {
@@ -531,6 +555,9 @@ async function performFileAction(action: FileAction) {
       </div>
     </header>
 
+    <AiSearchSettings ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
+      @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" />
+
     <p v-if="task === 'starting'" class="status" role="status">正在恢复媒体库…</p>
     <p v-else-if="task === 'scanning'" class="status" role="status">正在扫描，已发现 {{ found }} 个媒体文件…</p>
     <p v-if="scanError" class="error" role="alert">读取媒体库失败。{{ scanError }}</p>
@@ -543,12 +570,22 @@ async function performFileAction(action: FileAction) {
 
     <template v-if="summary">
       <div class="filters">
+        <label>搜索方式
+          <select v-model="searchMode">
+            <option value="filename">文件名</option>
+            <option value="content">照片内容</option>
+          </select>
+        </label>
         <label class="search-filter">搜索
-          <input v-model="searchInput" type="search" placeholder="文件名或相对路径" aria-label="搜索文件名或相对路径"
+          <input v-model="searchInput" type="search" :placeholder="searchMode === 'content' ? '描述照片，例如：海边日落' : '文件名或相对路径'"
+            :aria-label="searchMode === 'content' ? '描述照片内容' : '搜索文件名或相对路径'"
+            @keydown.enter="searchMode === 'content' && submitContentSearch($event)"
             @compositionstart="startComposition" @compositionend="endComposition" />
         </label>
+        <button v-if="searchMode === 'content'" type="button" :disabled="busy || !aiReady || !searchInput.trim() || composing" @click="submitContentSearch()">搜索照片</button>
         <button v-if="searchInput" type="button" class="secondary" @click="clearSearch">清空搜索</button>
-        <label>排序
+        <span v-if="searchMode === 'content'">按内容相关度排序 · 最多 200 张</span>
+        <label v-else>排序
           <select v-model="sort">
             <option value="dateDesc">拍摄日期：从新到旧</option>
             <option value="dateAsc">拍摄日期：从旧到新</option>
@@ -558,7 +595,7 @@ async function performFileAction(action: FileAction) {
             <option value="sizeAsc">文件大小：从小到大</option>
           </select>
         </label>
-        <label>类型
+        <label v-if="searchMode === 'filename'">类型
           <select v-model="kind">
             <option value="all">全部类型</option>
             <option value="photo">照片</option>
@@ -577,6 +614,12 @@ async function performFileAction(action: FileAction) {
         <label class="favorite-filter"><input v-model="favoritesOnly" type="checkbox" /> 仅收藏</label>
       </div>
 
+      <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
+      <p v-else-if="searchMode === 'content' && !aiIndex?.enabled" role="status">请先点击“建立索引”，再描述照片内容进行搜索。</p>
+      <p v-if="searchMode === 'content' && aiIndex?.enabled && (aiIndex.pending || aiIndex.running || aiIndex.failed)" role="status">
+        当前搜索覆盖 {{ aiIndex.indexed }} 张照片，{{ aiIndex.pending }} 张待处理<span v-if="aiIndex.failed">，{{ aiIndex.failed }} 张处理失败</span>。
+      </p>
+
       <p v-if="summary.preferenceWarning" class="error" role="alert">{{ summary.preferenceWarning }}</p>
       <p v-if="favoriteError" class="error" role="alert">{{ favoriteError }}</p>
       <p v-if="rotationError && !detail" class="error" role="alert">{{ rotationError }}</p>
@@ -588,7 +631,7 @@ async function performFileAction(action: FileAction) {
         </template>
       </p>
       <div v-if="!itemsLoading && results?.total === 0" class="library-empty" role="status">
-        <h2>{{ summary.total ? "没有符合筛选条件的媒体文件" : "此目录没有可识别的照片或视频" }}</h2>
+        <h2>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击搜索' : summary.total ? "没有符合筛选条件的媒体文件" : "此目录没有可识别的照片或视频" }}</h2>
       </div>
 
       <ul v-if="results?.items.length" ref="grid" class="media-grid">

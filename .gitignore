@@ -11,6 +11,7 @@ node_modules
 dist
 dist-ssr
 *.local
+__pycache__/
 
 # Editor directories and files
 .vscode/*
@@ -22,4 +23,6 @@ dist-ssr
 *.ntvs*
 *.njsproj
 *.sln
+src-tauri/binaries/onnxruntime/x86_64/
+src-tauri/binaries/onnxruntime/aarch64/
 *.sw?

@@ -12,7 +12,7 @@ use crate::duplicates::{Root, is_link};
 pub(super) const DATA_DIR: &str = ".photosys";
 const SCHEMA: &str = "CREATE TABLE favorites (path BLOB PRIMARY KEY) WITHOUT ROWID";
 
-fn data_directory(root: &Root) -> Result<Option<PathBuf>, String> {
+pub(super) fn data_directory(root: &Root) -> Result<Option<PathBuf>, String> {
     root.verify_directory().map_err(|error| error.to_string())?;
     let directory = root.path.join(DATA_DIR);
     match fs::symlink_metadata(&directory) {

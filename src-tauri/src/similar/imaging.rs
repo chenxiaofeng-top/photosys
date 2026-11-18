@@ -39,7 +39,7 @@ pub(super) fn hasher() -> Hasher<[u8; 8]> {
         .to_hasher()
 }
 
-fn scaled(
+pub(crate) fn scaled(
     file: &mut File,
     path: &Path,
     size: u64,

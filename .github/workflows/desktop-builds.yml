@@ -40,6 +40,20 @@ jobs:
           node-version: '24'
           cache: npm
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Prepare bundled AI CPU runtime
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python scripts/prepare-ai-runtime.py --universal
+          else
+            python scripts/prepare-ai-runtime.py
+          fi
+          python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         timeout-minutes: 8
@@ -91,6 +105,8 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Build desktop packages
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
         run: npm run tauri build -- ${{ matrix.tauri_args }} -- --locked
 
       - name: Verify FFmpeg in Linux packages
@@ -104,6 +120,8 @@ jobs:
           "$bundle"/appimage/*.AppImage --appimage-extract >/dev/null
           squashfs-root/usr/bin/photosys-ffmpeg -version
           test -f squashfs-root/usr/lib/gstreamer-1.0/libgstvpx.so
+          python "$GITHUB_WORKSPACE/scripts/check-ai-runtime.py" deb
+          python "$GITHUB_WORKSPACE/scripts/check-ai-runtime.py" squashfs-root
 
       - name: Verify universal macOS executable
         if: runner.os == 'macOS'
@@ -113,6 +131,9 @@ jobs:
           lipo "$app/Contents/MacOS/$executable" -verify_arch arm64 x86_64
           lipo "$app/Contents/MacOS/photosys-ffmpeg" -verify_arch arm64 x86_64
           "$app/Contents/MacOS/photosys-ffmpeg" -version
+          lipo "$app/Contents/Resources/onnxruntime/aarch64/libonnxruntime.dylib" -verify_arch arm64
+          lipo "$app/Contents/Resources/onnxruntime/x86_64/libonnxruntime.dylib" -verify_arch x86_64
+          python scripts/check-ai-runtime.py "$app/Contents/Resources/onnxruntime"
 
       - name: Verify FFmpeg in the Windows installer
         if: runner.os == 'Windows'
@@ -127,6 +148,8 @@ jobs:
           if (-not $codec) { throw "Bundled FFmpeg is missing" }
           & $codec.FullName -version
           if ($LASTEXITCODE -ne 0) { throw "Bundled FFmpeg failed to start" }
+          python scripts/check-ai-runtime.py $unpacked
+          if ($LASTEXITCODE -ne 0) { throw "Bundled AI runtime failed to load" }
 
       - name: Check expected packages
         shell: pwsh
@@ -147,3 +170,14 @@ jobs:
             ${{ matrix.paths }}
             src-tauri/binaries/media-codec-sources.tar.gz
           if-no-files-found: error
+
+  macos-intel-runtime:
+    name: AI runtime on Intel macOS
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python scripts/prepare-ai-runtime.py
+      - run: python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime

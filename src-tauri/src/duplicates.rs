@@ -130,6 +130,15 @@ impl FileStamp {
         }
         key
     }
+
+    /// Portable index stamp: relative paths plus length/mtime survive copying an album.
+    pub(crate) fn portable_key(&self) -> Vec<u8> {
+        let modified = DateTime::<Utc>::from(self.modified);
+        let mut key = self.size.to_le_bytes().to_vec();
+        key.extend_from_slice(&modified.timestamp().to_le_bytes());
+        key.extend_from_slice(&modified.timestamp_subsec_nanos().to_le_bytes());
+        key
+    }
 }
 
 impl Candidate {

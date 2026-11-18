@@ -27,6 +27,7 @@
     "active": true,
     "externalBin": ["binaries/photosys-ffmpeg"],
     "resources": {
+      "binaries/onnxruntime/": "onnxruntime/",
       "binaries/media-codec-licenses/": "media-codec-licenses/"
     },
     "icon": [
