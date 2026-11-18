@@ -229,6 +229,7 @@ npm run tauri build -- --target universal-apple-darwin -- --locked
 | 现象或失败步骤 | 处理方法 |
 | --- | --- |
 | 看不到 Run workflow | 检查 Actions 是否启用、账号是否有写权限、工作流是否已合入默认分支。 |
+| 任务未启动，提示 recent account payments / spending limit | 打开仓库所属账号或组织的 Settings → Billing & plans，检查付款状态、Actions 使用额度和支出限制。账户限制解除后再重跑；重复触发工作流不能解决计费限制。 |
 | Check release tag and application versions | 核对标签和五个版本文件；错误中会列出不一致项。尚未发布时可以在正确提交上使用新的版本标签，不要移动已发布标签。 |
 | 下载失败、超时、HTTP 404 | 看清具体 URL 和步骤。暂时性网络故障可重跑；404 需要核对固定源地址，持续失败不能靠跳过依赖解决。CPU 运行时使用官方 NuGet 固定版本包并校验 SHA-256。 |
 | SHA-256 mismatch | 不要删除校验或随意改哈希。先确认上游来源和实际文件；本地可删掉对应缓存文件后重新下载。运行时缓存为 `src-tauri/target/ai-runtime/`，解码器缓存为 `src-tauri/target/media-codec/sources/`。 |
