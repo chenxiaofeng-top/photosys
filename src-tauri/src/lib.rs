@@ -2,6 +2,7 @@ mod ai;
 mod archive;
 mod duplicates;
 mod library;
+mod maps;
 mod media_codec;
 mod media_date;
 mod similar;
@@ -119,6 +120,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            library::locations::library_map_points,
+            library::locations::location_regions,
+            maps::offline_map_state,
+            maps::offline_map_choose_directory,
+            maps::offline_map_import,
+            maps::offline_map_download,
+            maps::offline_map_cancel,
+            maps::offline_map_delete,
+            maps::offline_map_read,
             ai::catalog::ai_model_catalog,
             ai::ai_activate_model,
             ai::ai_model_change_impact,

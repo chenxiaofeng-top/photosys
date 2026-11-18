@@ -79,6 +79,15 @@ jobs:
           fi
           python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
 
+      - name: Prepare bundled offline map tool
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python scripts/prepare-offline-maps.py --universal
+          else
+            python scripts/prepare-offline-maps.py
+          fi
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         timeout-minutes: 8

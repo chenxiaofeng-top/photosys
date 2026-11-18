@@ -19,16 +19,20 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self'; img-src 'self' data:; media-src 'self' blob:",
-      "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self'; font-src 'self' data:",
+      "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self'; font-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/photosys-ffmpeg"],
+    "externalBin": [
+      "binaries/photosys-ffmpeg",
+      "binaries/photosys-pmtiles"
+    ],
     "resources": {
       "binaries/onnxruntime/": "onnxruntime/",
-      "binaries/media-codec-licenses/": "media-codec-licenses/"
+      "binaries/media-codec-licenses/": "media-codec-licenses/",
+      "resources/": "resources/"
     },
     "icon": [
       "icons/32x32.png",

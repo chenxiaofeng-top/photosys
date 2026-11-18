@@ -250,3 +250,17 @@ npm run tauri build -- --target universal-apple-darwin -- --locked
 - [GitHub：下载构建产物](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)
 - [Tauri：macOS 签名](https://v2.tauri.app/distribute/sign/macos/)
 - [AI 搜索验证记录](../scripts/AI-SEARCH-VALIDATION.md)、[模型选择验证记录](../scripts/MODEL-OPTIONS-VALIDATION.md)
+
+## 离线地图资源与验证
+
+构建前运行 `python scripts/prepare-offline-maps.py`；macOS 通用构建使用 `python scripts/prepare-offline-maps.py --universal`。脚本按 SHA-256 校验 PMTiles 1.31.2 工具和已提交的地图资源。工具通过 Tauri `externalBin` 打包，中文字体、概览底图、样式所需字形和图标随前端打包，行政区索引嵌入应用；地图包由用户安装后共享保存，不内置全国街道数据。
+
+离线验证：导入一个 Protomaps v4 PMTiles 区域包，在有 GPS 的照片详情中点击「在地图中查看」，检查街道和中文标注，断开网络后缩放、点选及框选。确认未知位置筛选、组合日期/收藏筛选、跨页浏览和地图数量一致。取消下载或导入损坏包后，原有包仍应可用。重启后可重新下载上次未完成区域。
+
+对真实地图包运行 Rust 离线验证（地图文件先自行下载，测试本身不联网）：
+
+```sh
+PHOTOSYS_MAP_ARCHIVE=/absolute/path/region.pmtiles cargo test --locked --manifest-path src-tauri/Cargo.toml real_archive_validates_and_survives_reopening_offline -- --ignored
+```
+
+详细来源与行政区快照限制见 [离线地图许可说明](../scripts/OFFLINE-MAPS-NOTICES.md)。

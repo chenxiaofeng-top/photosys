@@ -6,7 +6,7 @@ use tempfile::tempdir;
 
 use super::*;
 
-fn session_for(path: &Path) -> Session {
+pub(super) fn session_for(path: &Path) -> Session {
     let root = Root::new(path).unwrap();
     let keys = favorites::read(&root).unwrap();
     let rotations = if keys.is_some() {
@@ -75,20 +75,28 @@ fn rotation_survives_reopening_and_library_moves_without_changing_media_or_favor
 }
 
 #[test]
-fn reading_old_database_does_not_migrate_until_rotation_is_saved() {
+fn reading_old_database_does_not_add_rotation_schema_until_rotation_is_saved() {
     let directory = tempdir().unwrap();
     let root = Root::new(directory.path()).unwrap();
     fs::write(directory.path().join("photo.png"), []).unwrap();
     favorites::initialize(&root).unwrap();
     let database = directory.path().join(".photosys/library.sqlite");
-    let bytes = fs::read(&database).unwrap();
     assert!(favorites::read_rotations(&root).unwrap().is_empty());
     let mut session = session_for(directory.path());
     assert_eq!(
         session.items(all(), 0, Sort::default()).unwrap().items[0].rotation,
         0
     );
-    assert_eq!(fs::read(&database).unwrap(), bytes);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let rotation_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='rotations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rotation_tables, 0);
+    drop(connection);
     session.set_rotation(1, 0, 90).unwrap();
     assert_eq!(
         favorites::read_rotations(&root).unwrap()[&favorites::path_key(Path::new("photo.png"))],
@@ -211,7 +219,7 @@ fn read_only_old_library_browses_when_rotation_cannot_be_saved() {
     assert!(favorites::read_rotations(&root).unwrap().is_empty());
 }
 
-fn all() -> Filter {
+pub(super) fn all() -> Filter {
     Filter {
         query: String::new(),
         kind: None,
@@ -219,6 +227,8 @@ fn all() -> Filter {
         to: None,
         unknown_date: false,
         favorites_only: false,
+        location_mode: Default::default(),
+        location_selection: None,
     }
 }
 

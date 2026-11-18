@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.23"
 chrono = "0.4"
 fs2 = "0.4"
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 image_hasher = { version = "3.1", default-features = false }
 nom-exif = "3.8"

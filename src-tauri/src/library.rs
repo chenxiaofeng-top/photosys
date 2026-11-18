@@ -1,7 +1,8 @@
 pub(crate) mod ai_search;
-pub(crate) mod people;
 mod favorites;
 mod live;
+pub(crate) mod locations;
+pub(crate) mod people;
 mod platform;
 mod previews;
 
@@ -56,7 +57,7 @@ pub(crate) enum Kind {
     Video,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Filter {
     #[serde(default)]
@@ -66,6 +67,10 @@ pub(crate) struct Filter {
     to: Option<String>,
     unknown_date: bool,
     favorites_only: bool,
+    #[serde(default)]
+    location_mode: locations::LocationMode,
+    #[serde(default)]
+    location_selection: Option<locations::Selection>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -155,6 +160,7 @@ pub(crate) struct ItemView {
     size: u64,
     kind: Kind,
     captured_on: Option<String>,
+    location: Option<locations::Location>,
     preview_available: bool,
     is_live_photo: bool,
     favorite: bool,
@@ -167,6 +173,7 @@ struct Item {
     name_key: String,
     kind: Kind,
     captured_on: Option<NaiveDate>,
+    location: Option<locations::Location>,
     preview_available: bool,
     is_live_photo: bool,
 }
@@ -177,10 +184,23 @@ impl Item {
         relative: PathBuf,
         media: Media,
         parser: &mut MediaParser,
+        cache: &mut Option<locations::Cache>,
     ) -> std::io::Result<Self> {
         let file = root.open_file(&relative)?;
         let stamp = FileStamp::read(&file)?;
-        let captured_on = media_date::from_open_file(parser, file, media)
+        let (metadata, location) = cache
+            .as_ref()
+            .and_then(|c| c.read(&relative, &stamp))
+            .unwrap_or_else(|| {
+                let metadata = media_date::read_metadata(parser, file, media);
+                let location = metadata.coordinates.map(locations::Location::resolve);
+                if let Some(cache) = cache.as_mut() {
+                    cache.write(&relative, &stamp, &metadata, &location);
+                }
+                (metadata, location)
+            });
+        let captured_on = metadata
+            .date
             .or_else(|| media_date::from_filename(&relative));
         let kind = if media == Media::Video {
             Kind::Video
@@ -201,6 +221,7 @@ impl Item {
             },
             kind,
             captured_on,
+            location,
             preview_available,
             is_live_photo,
         })
@@ -216,6 +237,7 @@ impl Item {
             size: self.file.stamp.size,
             kind: self.kind,
             captured_on: self.captured_on.map(|date| date.to_string()),
+            location: self.location.clone(),
             preview_available: self.preview_available,
             is_live_photo: self.is_live_photo,
             favorite,
@@ -249,6 +271,7 @@ impl Scan {
         let mut items = Vec::new();
         let mut issues = Vec::new();
         let mut parser = MediaParser::new();
+        let mut location_cache = locations::Cache::open(&root);
         let mut found = 0;
         let mut last_update = Instant::now();
         progress(Progress { found });
@@ -291,7 +314,13 @@ impl Scan {
                 continue;
             };
             found += 1;
-            match Item::read(&root, relative.to_path_buf(), media, &mut parser) {
+            match Item::read(
+                &root,
+                relative.to_path_buf(),
+                media,
+                &mut parser,
+                &mut location_cache,
+            ) {
                 Ok(item) => items.push(item),
                 Err(error) => issues.push(Issue {
                     path: display_path(relative),
@@ -393,24 +422,21 @@ impl Session {
         Ok(rotation)
     }
 
-    fn items(
-        &self,
-        filter: Filter,
-        requested: usize,
-        sort: Sort,
-    ) -> Result<Page<ItemView>, String> {
+    fn matching_items(&self, filter: &Filter) -> Result<Vec<&Item>, String> {
+        filter.validate_location()?;
         let from = parse_date(filter.from.as_deref())?;
         let to = parse_date(filter.to.as_deref())?;
         if matches!((from, to), (Some(from), Some(to)) if from > to) {
             return Err("开始日期应早于或等于结束日期。".into());
         }
         let query = filter.query.trim().to_lowercase();
-        let mut matching: Vec<_> = self
+        let matching: Vec<_> = self
             .scan
             .items
             .iter()
             .filter(|item| {
-                item.search_path.contains(&query)
+                filter.matches_location(item)
+                    && item.search_path.contains(&query)
                     && filter.kind.is_none_or(|kind| item.kind == kind)
                     && (!filter.favorites_only || self.favorites.contains(&item.file.id))
                     && if filter.unknown_date {
@@ -421,6 +447,16 @@ impl Session {
                     }
             })
             .collect();
+        Ok(matching)
+    }
+
+    fn items(
+        &self,
+        filter: Filter,
+        requested: usize,
+        sort: Sort,
+    ) -> Result<Page<ItemView>, String> {
+        let mut matching = self.matching_items(&filter)?;
         matching.sort_unstable_by(|a, b| sort.compare(a, b));
         let total = matching.len();
         let (page, offset) = Page::<ItemView>::bounds(requested, total);
@@ -860,7 +896,15 @@ pub(crate) async fn library_item(scan_id: u64, file_id: usize) -> Result<ItemVie
         let s = session()?;
         let s = current(&s, scan_id)?;
         let item = s.scan.item(file_id)?;
-        s.scan.root.open_matching(&item.file).map_err(|_| STALE_SCAN)?;
-        Ok(item.view(s.favorites.contains(&file_id), s.rotations.get(&file_id).copied().unwrap_or(0)))
-    }).await.map_err(crate::ai::error)?
+        s.scan
+            .root
+            .open_matching(&item.file)
+            .map_err(|_| STALE_SCAN)?;
+        Ok(item.view(
+            s.favorites.contains(&file_id),
+            s.rotations.get(&file_id).copied().unwrap_or(0),
+        ))
+    })
+    .await
+    .map_err(crate::ai::error)?
 }

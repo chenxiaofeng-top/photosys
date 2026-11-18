@@ -462,3 +462,11 @@ pub(crate) async fn people_photo_people(
         .await
         .map_err(error)?
 }
+
+pub(super) fn map_photo_ids(
+    scan_id: u64,
+    person_id: i64,
+    filter: &super::Filter,
+) -> Result<Vec<usize>, String> {
+    query::photo_ids(scan_id, person_id, filter)
+}

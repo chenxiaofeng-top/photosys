@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { ElButton, ElCheckbox, ElIcon, ElInput, ElOption, ElSelect } from "element-plus";
 import { FolderOpened, Refresh, Search, Star, StarFilled, Picture, Warning, Loading } from "@element-plus/icons-vue";
 import "element-plus/es/components/button/style/css";
@@ -14,6 +14,8 @@ import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import PeoplePanel from "./PeoplePanel.vue";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
+const LocationMap = defineAsyncComponent(() => import("./LocationMap.vue"));
+import { shortLocation, type Location, type Coordinates, type LocationMode, type Selection } from "./locations";
 import type { Person, PeopleStatus, Month } from "./people";
 import type { IndexStatus } from "./aiSearch";
 import { formatBytes } from "./formatBytes";
@@ -30,6 +32,7 @@ interface Item {
   size: number;
   kind: Kind;
   capturedOn: string | null;
+  location: Location | null;
   previewAvailable: boolean;
   isLivePhoto: boolean;
   favorite: boolean;
@@ -80,6 +83,21 @@ const dateMode = ref<"all" | "range" | "unknown">("all");
 const from = ref("");
 const to = ref("");
 const favoritesOnly = ref(false);
+const locationMode = ref<LocationMode>("all");
+const locationSelection = shallowRef<Selection | null>(null);
+const mapFocus = shallowRef<Coordinates | null>(null);
+const locationLabel = computed(() => locationSelection.value?.type === "point" ? "已选择拍摄点位" : locationSelection.value ? "已选择地图范围" : "");
+function selectLocation(selection: Selection | null) {
+  locationSelection.value = selection;
+  if (selection) locationMode.value = "known";
+}
+watch(locationMode, mode => { if (mode !== "known") locationSelection.value = null; });
+async function locateDetail() {
+  const location = detail.value?.location;
+  if (!location) return;
+  closeDetails(); await nextTick();
+  mapFocus.value = { latitude: location.latitude, longitude: location.longitude };
+}
 const searchInput = ref("");
 const query = ref("");
 const searchMode = ref<"filename" | "content">("filename");
@@ -164,6 +182,8 @@ const filter = computed(() => ({
   to: dateMode.value === "range" ? to.value || null : null,
   unknownDate: dateMode.value === "unknown",
   favoritesOnly: favoritesOnly.value,
+  locationMode: locationMode.value,
+  locationSelection: locationSelection.value,
 }));
 
 const requestedPage = ref(0);
@@ -215,13 +235,13 @@ watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, (
   }
 });
 
-watch([summary, selectedPerson, favoritesOnly, sort, peopleRevision, () => props.peopleMode], async (_, __, cleanup) => {
+watch([summary, selectedPerson, favoritesOnly, locationMode, locationSelection, sort, peopleRevision, () => props.peopleMode], async (_, __, cleanup) => {
   let current = true; cleanup(() => { current = false; });
   const scanId = summary.value?.scanId; const personId = selectedPerson.value?.id;
   months.value = []; timelineError.value = "";
   if (!props.peopleMode || scanId === undefined || personId === undefined) return;
   try {
-    const value = await invoke<Month[]>("people_months", { scanId, personId, filter: { query: "", kind: "photo", from: null, to: null, unknownDate: false, favoritesOnly: favoritesOnly.value }, sort: sort.value });
+    const value = await invoke<Month[]>("people_months", { scanId, personId, filter: { query: "", kind: "photo", from: null, to: null, unknownDate: false, favoritesOnly: favoritesOnly.value, locationMode: locationMode.value, locationSelection: locationSelection.value }, sort: sort.value });
     if (current) months.value = value;
   } catch (cause) { if (current) timelineError.value = String(cause); }
 });
@@ -339,6 +359,7 @@ function showScan(selected: string, scanned: Summary) {
     from.value = "";
     to.value = "";
     favoritesOnly.value = false;
+    locationMode.value = "all"; locationSelection.value = null; mapFocus.value = null;
     clearSearch();
     sort.value = "dateDesc";
   }
@@ -709,6 +730,13 @@ async function performFileAction(action: FileAction) {
             <label>起始日期<input v-model="from" type="date" /></label>
             <label>结束日期<input v-model="to" type="date" /></label>
           </div>
+          <div class="filter-field">
+            <span>拍摄位置</span>
+            <ElSelect v-model="locationMode" class="location-select" aria-label="拍摄位置">
+              <ElOption label="全部位置" value="all" /><ElOption label="有位置" value="known" /><ElOption label="位置未知" value="unknown" />
+            </ElSelect>
+          </div>
+          <span v-if="locationLabel" class="location-selection">{{ locationLabel }} <button type="button" class="secondary" @click="locationSelection = null">清除</button></span>
           <ElCheckbox v-model="favoritesOnly" class="favorite-filter">仅收藏</ElCheckbox>
           <div v-if="searchMode === 'filename'" class="filter-field sort-field">
             <span id="sort-label">排序</span>
@@ -721,6 +749,9 @@ async function performFileAction(action: FileAction) {
           <span v-else class="relevance-note">按内容相关度排序 · 最多 200 张</span>
         </div>
       </div>
+
+      <LocationMap :scan-id="summary.scanId" :filter="filter" :person-id="peopleMode ? selectedPerson?.id ?? null : null"
+        :content-query="!peopleMode && searchMode === 'content' ? query : null" :revision="revision + peopleRevision + aiRevision" :focus="mapFocus" @select="selectLocation" />
 
       <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
       <p v-else-if="searchMode === 'content' && !aiIndex?.enabled" role="status">请先点击“建立索引”，再描述照片内容进行搜索。</p>
@@ -750,9 +781,9 @@ async function performFileAction(action: FileAction) {
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0" class="library-empty" role="status">
         <ElIcon class="empty-icon" aria-hidden="true"><component :is="searchMode === 'content' && !query ? Search : Picture" /></ElIcon>
         <h2>{{ searchMode === 'content' && !query ? '用一句话，找回那个瞬间' : summary.total ? '没有找到匹配的照片或视频' : '这里还没有照片或视频' }}</h2>
-        <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
-        <ElButton v-if="summary.total && (query || kind !== 'all' || dateMode !== 'all' || favoritesOnly)"
-          @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false">清除搜索与筛选</ElButton>
+        <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期、位置和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
+        <ElButton v-if="summary.total && (query || kind !== 'all' || dateMode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
+          @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
         <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
@@ -768,6 +799,7 @@ async function performFileAction(action: FileAction) {
           </button>
           <div class="card-details">
             <p class="file-name" :title="item.relativePath">{{ item.name }}</p>
+            <p class="card-location" :title="item.location?.address ?? shortLocation(item.location)">{{ shortLocation(item.location) }}</p>
             <div class="card-info">
               <span>{{ item.capturedOn ?? "日期未知" }}</span>
               <button type="button" class="favorite secondary" :aria-label="`${item.favorite ? '取消收藏' : '收藏'} ${item.name}`"
@@ -832,6 +864,13 @@ async function performFileAction(action: FileAction) {
         <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
           @changed="detailPeopleChanged" />
       </details>
+      <div class="detail-location">
+        <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
+        <template v-if="detail.location">
+          <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
+          <button type="button" class="secondary" @click="locateDetail">在地图中查看</button>
+        </template>
+      </div>
       <p class="detail-path">{{ detail.relativePath }}</p>
       <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
       <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
@@ -886,6 +925,10 @@ async function performFileAction(action: FileAction) {
 .search-input { flex: 1; min-width: 0; }
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #edf0eb; }
 .filter-field { display: flex; align-items: center; gap: 0.625rem; min-width: 0; }
+.location-select { width: 8.5rem; }
+.card-location { margin: .35rem 0; color: var(--library-muted); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-location { margin: .8rem 0; color: var(--library-muted); font-size: .875rem; }
+.location-selection { display: inline-flex; align-items: center; gap: .5rem; font-size: .875rem; }
 .filter-field > span { color: var(--library-muted); white-space: nowrap; font-size: 0.875rem; }
 .kind-select { width: 8rem; }
 .date-select { width: 8rem; }

@@ -293,7 +293,25 @@ pub(super) fn faces(
         Ok(Page { page, total, items })
     })
 }
-fn conditions(s: &Store, person_id: i64, filter: &Filter) -> Result<(), String> {
+fn conditions(
+    s: &Store,
+    scan: &library::Scan,
+    person_id: i64,
+    filter: &Filter,
+) -> Result<(), String> {
+    filter.validate_location()?;
+    s.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS location_match(file_id INTEGER PRIMARY KEY); DELETE FROM location_match;").map_err(error)?;
+    if filter.location_mode != library::locations::LocationMode::All
+        || filter.location_selection.is_some()
+    {
+        let mut insert = s
+            .connection
+            .prepare("INSERT INTO location_match VALUES(?1)")
+            .map_err(error)?;
+        for item in scan.items.iter().filter(|i| filter.matches_location(i)) {
+            insert.execute([item.file.id as i64]).map_err(error)?;
+        }
+    }
     let from = library::parse_date(filter.from.as_deref())?;
     let to = library::parse_date(filter.to.as_deref())?;
     if matches!((from,to),(Some(a),Some(b)) if a>b) {
@@ -312,7 +330,7 @@ fn conditions(s: &Store, person_id: i64, filter: &Filter) -> Result<(), String> 
     }
     Ok(())
 }
-const PHOTO_CONDITION: &str = "person_id=?1 AND ignored=0 AND (?2=0 OR favorite=1) AND ((?3=1 AND captured IS NULL) OR (?3=0 AND (?4 IS NULL OR captured>=?4) AND (?5 IS NULL OR captured<=?5)))";
+const PHOTO_CONDITION: &str = "person_id=?1 AND ignored=0 AND (?2=0 OR favorite=1) AND ((?3=1 AND captured IS NULL) OR (?3=0 AND (?4 IS NULL OR captured>=?4) AND (?5 IS NULL OR captured<=?5))) AND (?6=0 OR file_id IN (SELECT file_id FROM location_match))";
 pub(super) fn photos(
     scan_id: u64,
     person_id: i64,
@@ -334,13 +352,15 @@ pub(super) fn photos(
                 items: Vec::new(),
             });
         };
-        conditions(s, person_id, filter)?;
+        conditions(s, &scan, person_id, filter)?;
         let bind = params![
             person_id,
             filter.favorites_only,
             filter.unknown_date,
             filter.from,
-            filter.to
+            filter.to,
+            filter.location_mode != library::locations::LocationMode::All
+                || filter.location_selection.is_some()
         ];
         let total = s
             .connection
@@ -356,7 +376,7 @@ pub(super) fn photos(
         } else {
             "ASC"
         };
-        let mut q=s.connection.prepare(&format!("SELECT DISTINCT file_id,captured,path FROM visible_faces WHERE {PHOTO_CONDITION} ORDER BY captured IS NULL,captured {direction},path LIMIT 24 OFFSET ?6")).map_err(error)?;
+        let mut q=s.connection.prepare(&format!("SELECT DISTINCT file_id,captured,path FROM visible_faces WHERE {PHOTO_CONDITION} ORDER BY captured IS NULL,captured {direction},path LIMIT 24 OFFSET ?7")).map_err(error)?;
         let ids = q
             .query_map(
                 params![
@@ -365,6 +385,8 @@ pub(super) fn photos(
                     filter.unknown_date,
                     filter.from,
                     filter.to,
+                    filter.location_mode != library::locations::LocationMode::All
+                        || filter.location_selection.is_some(),
                     offset as i64
                 ],
                 |r| r.get::<_, i64>(0).map(|v| v as usize),
@@ -392,11 +414,12 @@ pub(super) fn months(
     filter: &Filter,
     sort: Sort,
 ) -> Result<Vec<Month>, String> {
+    let scan = library::scan(scan_id)?;
     with(scan_id, |store| {
         let Some(s) = store else {
             return Ok(Vec::new());
         };
-        conditions(s, person_id, filter)?;
+        conditions(s, &scan, person_id, filter)?;
         let direction = if matches!(sort, Sort::DateDesc) {
             "DESC"
         } else {
@@ -409,7 +432,9 @@ pub(super) fn months(
                 filter.favorites_only,
                 filter.unknown_date,
                 filter.from,
-                filter.to
+                filter.to,
+                filter.location_mode != library::locations::LocationMode::All
+                    || filter.location_selection.is_some()
             ],
             |r| {
                 Ok(Month {
@@ -484,5 +509,41 @@ pub(super) fn photo_people(scan_id: u64, file_id: usize) -> Result<Vec<Identity>
         .map_err(error)?
         .collect::<Result<_, _>>()
         .map_err(error)
+    })
+}
+
+pub(super) fn photo_ids(
+    scan_id: u64,
+    person_id: i64,
+    filter: &Filter,
+) -> Result<Vec<usize>, String> {
+    let scan = library::scan(scan_id)?;
+    with(scan_id, |store| {
+        let Some(s) = store else {
+            return Ok(Vec::new());
+        };
+        conditions(s, &scan, person_id, filter)?;
+        let mut query = s
+            .connection
+            .prepare(&format!(
+                "SELECT DISTINCT file_id FROM visible_faces WHERE {PHOTO_CONDITION}"
+            ))
+            .map_err(error)?;
+        query
+            .query_map(
+                params![
+                    person_id,
+                    filter.favorites_only,
+                    filter.unknown_date,
+                    filter.from,
+                    filter.to,
+                    filter.location_mode != library::locations::LocationMode::All
+                        || filter.location_selection.is_some()
+                ],
+                |r| r.get::<_, i64>(0).map(|id| id as usize),
+            )
+            .map_err(error)?
+            .collect::<Result<_, _>>()
+            .map_err(error)
     })
 }

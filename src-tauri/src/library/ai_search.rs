@@ -567,6 +567,29 @@ fn rank_for(
     page: usize,
     spec: &'static ai::catalog::ModelSpec,
 ) -> Result<Page<ItemView>, String> {
+    rank_for_limit(
+        scan,
+        embedding,
+        filter,
+        favorites,
+        rotations,
+        page,
+        spec,
+        super::PAGE_SIZE,
+    )
+}
+
+fn rank_for_limit(
+    scan: &Scan,
+    embedding: &[f32],
+    filter: &Filter,
+    favorites: &HashSet<usize>,
+    rotations: &HashMap<usize, u16>,
+    page: usize,
+    spec: &'static ai::catalog::ModelSpec,
+    page_size: usize,
+) -> Result<Page<ItemView>, String> {
+    filter.validate_location()?;
     let from = parse_date(filter.from.as_deref())?;
     let to = parse_date(filter.to.as_deref())?;
     if matches!((from, to), (Some(a), Some(b)) if a > b) {
@@ -579,7 +602,7 @@ fn rank_for(
         let candidates: HashMap<_, _> = scan
             .items
             .iter()
-            .filter(|i| eligible(i))
+            .filter(|i| eligible(i) && filter.matches_location(i))
             .filter(|i| !filter.favorites_only || favorites.contains(&i.file.id))
             .filter(|i| {
                 if filter.unknown_date {
@@ -621,7 +644,7 @@ fn rank_for(
     let items = ranked
         .into_iter()
         .skip(offset)
-        .take(super::PAGE_SIZE)
+        .take(page_size)
         .map(|(_, id)| {
             scan.items[id].view(
                 favorites.contains(&id),
@@ -717,6 +740,8 @@ mod tests {
             to: None,
             unknown_date: false,
             favorites_only: false,
+            location_mode: Default::default(),
+            location_selection: None,
         }
     }
 
@@ -997,7 +1022,11 @@ mod tests {
         }
         let root = crate::duplicates::Root::new(temp.path()).unwrap();
         favorites::initialize(&root).unwrap();
-        let scan = Scan::read(1, root, |_| {});
+        let mut scan = Scan::read(1, root, |_| {});
+        scan.items[209].location = Some(super::super::locations::Location {
+            coordinates: crate::media_date::Coordinates::new(20., 100.).unwrap(),
+            address: None,
+        });
         assert_eq!(scan.items.len(), 210);
         assert!(scan.items.iter().all(|i| i.captured_on.is_some()));
         let mut cache = Cache::open(&scan, true).unwrap().unwrap();
@@ -1023,6 +1052,31 @@ mod tests {
         assert_eq!(page.total, 200);
         assert_eq!(page.items.len(), 24);
         assert_eq!(page.items[0].id, 24);
+        let mut geographic = all();
+        geographic.location_mode = super::super::locations::LocationMode::Known;
+        let page = rank(
+            &scan,
+            &query,
+            &geographic,
+            &HashSet::new(),
+            &HashMap::new(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, 209); // Must filter before truncating the top 200.
+        let mapped = rank_for_limit(
+            &scan,
+            &query,
+            &all(),
+            &HashSet::new(),
+            &HashMap::new(),
+            0,
+            ai::catalog::active(ai::ModelKind::Search),
+            200,
+        )
+        .unwrap();
+        assert_eq!(mapped.items.len(), 200); // Map includes every page, not only the first 24.
         let mut filter = all();
         filter.favorites_only = true;
         let favorite = HashSet::from([209]);
@@ -1241,6 +1295,8 @@ mod model_selection_tests {
             to: None,
             unknown_date: false,
             favorites_only: false,
+            location_mode: Default::default(),
+            location_selection: None,
         };
         for spec in [low, high] {
             let page = rank_for(
@@ -1412,6 +1468,8 @@ mod real_selection_tests {
                 to: None,
                 unknown_date: false,
                 favorites_only: false,
+                location_mode: Default::default(),
+                location_selection: None,
             };
             assert_eq!(
                 rank(&scan, &query, &filter, &HashSet::new(), &HashMap::new(), 0)
@@ -1435,4 +1493,35 @@ mod real_selection_tests {
         );
         *session().unwrap() = None;
     }
+}
+
+pub(super) fn map_items(
+    app: &AppHandle,
+    scan_id: u64,
+    query: &str,
+    filter: &Filter,
+) -> Result<Vec<ItemView>, String> {
+    let scan = scan(scan_id)?;
+    let generation = MODEL_GENERATION.load(Ordering::Relaxed);
+    let (favorites, rotations) = {
+        let lock = session()?;
+        let s = current(&lock, scan_id)?;
+        (s.favorites.clone(), s.rotations.clone())
+    };
+    let embedding = ai::runtime(app)?.encode_text(query.trim())?;
+    let page = rank_for_limit(
+        &scan,
+        &embedding,
+        filter,
+        &favorites,
+        &rotations,
+        0,
+        ai::catalog::active(ai::ModelKind::Search),
+        200,
+    )?;
+    super::scan(scan_id)?;
+    if generation != MODEL_GENERATION.load(Ordering::Relaxed) {
+        return Err("模型已变化，请重新搜索。".into());
+    }
+    Ok(page.items)
 }

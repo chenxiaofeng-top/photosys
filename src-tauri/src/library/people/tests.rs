@@ -22,6 +22,8 @@ fn all() -> Filter {
         to: None,
         unknown_date: false,
         favorites_only: false,
+        location_mode: Default::default(),
+        location_selection: None,
     }
 }
 fn open(path: &Path) -> u64 {
@@ -570,6 +572,7 @@ fn benchmark_people_catalogs() {
                 search_path: relative.to_str().unwrap().into(),
                 name_key: relative.to_str().unwrap().into(),
                 kind: library::Kind::Photo,
+                location: None,
                 captured_on: if i % 100 == 0 {
                     None
                 } else {
@@ -1186,5 +1189,92 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
             .total,
         1
     );
+    *session().unwrap() = None;
+}
+
+#[test]
+fn person_photos_months_and_map_share_geographic_filters() {
+    let _guard = TEST_SESSION.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    for n in 0..30 {
+        RgbImage::new(4, 4)
+            .save(temp.path().join(format!("20240101-{n:03}.png")))
+            .unwrap();
+    }
+    let root = crate::duplicates::Root::new(temp.path()).unwrap();
+    favorites::initialize(&root).unwrap();
+    {
+        let mut cache = library::locations::Cache::open(&root).unwrap();
+        for n in 0..25 {
+            let name = format!("20240101-{n:03}.png");
+            let relative = Path::new(&name);
+            let stamp =
+                crate::duplicates::FileStamp::read(&root.open_file(relative).unwrap()).unwrap();
+            let coordinates =
+                crate::media_date::Coordinates::new(20., 100. + n as f64 / 100.).unwrap();
+            cache.write(
+                relative,
+                &stamp,
+                &crate::media_date::Metadata {
+                    date: None,
+                    coordinates: Some(coordinates),
+                },
+                &Some(library::locations::Location {
+                    coordinates,
+                    address: None,
+                }),
+            );
+        }
+    }
+    let scan_id = open(temp.path());
+    let ids = save(scan_id);
+    let scanned = scan(scan_id).unwrap();
+    let mut store = Store::open(&scanned, true).unwrap().unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: ids,
+            person_id: None,
+            name: Some("家人".into()),
+        })
+        .unwrap();
+    drop(store);
+    let person = query::people(scan_id, "家人", 0).unwrap().items[0].id;
+    let mut filter = all();
+    filter.location_mode = library::locations::LocationMode::Known;
+    assert_eq!(
+        query::photos(scan_id, person, &filter, Sort::DateAsc, 1)
+            .unwrap()
+            .total,
+        25
+    );
+    assert_eq!(
+        query::photos(scan_id, person, &filter, Sort::DateAsc, 1)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        query::photo_ids(scan_id, person, &filter).unwrap().len(),
+        25
+    );
+    assert_eq!(
+        query::months(scan_id, person, &filter, Sort::DateAsc).unwrap()[0].count,
+        25
+    );
+    filter.location_selection = Some(library::locations::Selection::Point {
+        latitude: 20.,
+        longitude: 100.,
+    });
+    assert_eq!(
+        query::photos(scan_id, person, &filter, Sort::DateAsc, 0)
+            .unwrap()
+            .total,
+        1
+    );
+    filter.location_selection = None;
+    filter.location_mode = library::locations::LocationMode::Unknown;
+    assert_eq!(query::photo_ids(scan_id, person, &filter).unwrap().len(), 5);
+    query::close_for_test();
     *session().unwrap() = None;
 }
