@@ -673,6 +673,42 @@ pub(crate) async fn ai_search(
 mod tests {
     use super::*;
 
+    #[test]
+    fn decodes_high_resolution_heic_for_indexing_and_preview() {
+        let album = tempfile::tempdir().unwrap();
+        fs::write(
+            album.path().join("photo.HEIC"),
+            include_bytes!("../../tests/fixtures/portrait-48mp-grid.heic"),
+        )
+        .unwrap();
+        let scan = Scan::read(
+            1,
+            crate::duplicates::Root::new(album.path()).unwrap(),
+            |_| {},
+        );
+        let item = &scan.items[0];
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            decode(&scan, item, &cancelled)
+                .unwrap_err()
+                .contains("已取消")
+        );
+
+        let image = decode(&scan, item, &AtomicBool::new(false)).unwrap();
+        assert_eq!(image.dimensions(), (6048, 8064));
+        // After clockwise rotation, the original top-left red tile is top-right.
+        let [r, _, b] = image.get_pixel(6048 - 512, 512).0;
+        assert!(r > b + 50);
+        let [r, _, b] = image.get_pixel(6048 - 512, 1536).0;
+        assert!(b > r + 50);
+        drop(image);
+
+        let preview = scan.preview(item.file.id, true).unwrap();
+        let (_, encoded) = preview.split_once(',').unwrap();
+        let preview = image::load_from_memory(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!((preview.width(), preview.height()), (1200, 1600));
+    }
+
     fn all() -> Filter {
         Filter {
             query: String::new(),
@@ -682,6 +718,147 @@ mod tests {
             unknown_date: false,
             favorites_only: false,
         }
+    }
+
+    #[test]
+    #[ignore = "requires PHOTOSYS_HEIC_ALBUM with failed HEIC records and PHOTOSYS_AI_MODEL_DIR"]
+    fn real_failed_heic_retry_preserves_successful_index() {
+        let source = std::path::PathBuf::from(
+            std::env::var_os("PHOTOSYS_HEIC_ALBUM").expect("PHOTOSYS_HEIC_ALBUM"),
+        );
+        // Read the original album only; all indexing writes go to a temporary copy.
+        let source_scan = Scan::read(0, crate::duplicates::Root::new(&source).unwrap(), |_| {});
+        let records = Cache::at(&source.join(".photosys/ai.sqlite"), false)
+            .unwrap()
+            .unwrap()
+            .records()
+            .unwrap();
+        let album = tempfile::tempdir().unwrap();
+        let mut failures = HashMap::new();
+        for item in &source_scan.items {
+            if !crate::media_codec::is_heif(&item.file.relative) {
+                continue;
+            }
+            let Some(record) = records
+                .get(&favorites::path_key(&item.file.relative))
+                .filter(|record| !record.indexed)
+            else {
+                continue;
+            };
+            let name = format!("failed-{}.HEIC", failures.len());
+            fs::copy(source.join(&item.file.relative), album.path().join(&name)).unwrap();
+            failures.insert(name, record.error.clone().unwrap());
+        }
+        assert!(!failures.is_empty(), "album has no failed HEIC records");
+
+        let runtime_name = if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
+        };
+        ai::inference::initialize_from(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries/onnxruntime")
+                .join(std::env::consts::ARCH)
+                .join(runtime_name),
+        )
+        .unwrap();
+        let model = std::path::PathBuf::from(
+            std::env::var_os("PHOTOSYS_AI_MODEL_DIR").expect("PHOTOSYS_AI_MODEL_DIR"),
+        );
+        let runtime = Arc::new(ai::inference::Runtime::load(&model).unwrap());
+        let successful_image = image::RgbImage::from_pixel(8, 8, image::Rgb([220, 40, 20]));
+        successful_image
+            .save(album.path().join("indexed.png"))
+            .unwrap();
+        let successful_vector = runtime.encode_image(successful_image, 0).unwrap();
+
+        let root = crate::duplicates::Root::new(album.path()).unwrap();
+        favorites::initialize(&root).unwrap();
+        let opened = super::super::open_directory(
+            album.path().to_str().unwrap(),
+            super::super::OpenMode::Refresh,
+            |_| {},
+        )
+        .unwrap();
+        let id = opened.scan_id;
+        let scan = super::super::scan(id).unwrap();
+        let mut cache = Cache::open(&scan, true).unwrap().unwrap();
+        let entries = scan
+            .items
+            .iter()
+            .map(|item| {
+                let name = item.file.relative.to_str().unwrap();
+                let result = if name == "indexed.png" {
+                    Ok(successful_vector.clone())
+                } else {
+                    Err(failures[name].clone())
+                };
+                (
+                    favorites::path_key(&item.file.relative),
+                    item.file.stamp.portable_key(),
+                    0,
+                    result,
+                )
+            })
+            .collect::<Vec<_>>();
+        cache.save(&entries).unwrap();
+        cache
+            .connection
+            .execute("INSERT INTO settings VALUES ('enabled',1)", [])
+            .unwrap();
+        ai::index_policy::approve(&cache.connection, runtime.spec).unwrap();
+        drop(cache);
+
+        let progress = Channel::new(|_| Ok(()));
+        let automatic = update(id, true, &progress, || Ok(runtime.clone())).unwrap();
+        assert_eq!(
+            (automatic.indexed, automatic.reused, automatic.failed),
+            (1, 1, failures.len())
+        );
+        let retried = update(id, false, &progress, || Ok(runtime.clone())).unwrap();
+        assert_eq!(
+            (
+                retried.indexed,
+                retried.reused,
+                retried.failed,
+                retried.pending
+            ),
+            (failures.len() + 1, 1, 0, 0)
+        );
+        let cache = Cache::open(&scan, false).unwrap().unwrap();
+        assert!(
+            cache
+                .records()
+                .unwrap()
+                .values()
+                .all(|r| r.indexed && r.error.is_none())
+        );
+        let saved: Vec<u8> = cache
+            .connection
+            .query_row(
+                "SELECT vector FROM embeddings WHERE path=?1",
+                [b"indexed.png".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            successful_vector
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        let repeated = update(id, false, &progress, || Ok(runtime.clone())).unwrap();
+        assert_eq!(repeated.reused, failures.len() + 1);
+        println!(
+            "retried {} failed HEIC photos; existing vector preserved; repeated update reused {}",
+            failures.len(),
+            repeated.reused
+        );
+        *session().unwrap() = None;
     }
 
     #[test]

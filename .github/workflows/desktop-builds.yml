@@ -3,14 +3,39 @@ name: Desktop builds
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      full_ai_validation:
+        description: Download all five AI models and run full native inference tests
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate packaging configuration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Test packaging helpers
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Check release tag and application versions
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check-release-version.py "$RELEASE_TAG"
+
   build:
+    needs: validate
     name: ${{ matrix.artifact }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -84,7 +109,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          install: curl diffutils make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+          install: curl diffutils make perl mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Build bundled FFmpeg on Linux
         if: runner.os == 'Linux'
@@ -102,10 +127,16 @@ jobs:
       - run: npm ci
 
       - name: Run Rust tests
+        env:
+          # Avoid macOS /var aliases in SQLite NOFOLLOW tests.
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Verify native local face inference and offline installation
+        if: github.event_name == 'workflow_dispatch' && inputs.full_ai_validation
         shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           python scripts/prepare-people-test.py "$RUNNER_TEMP/photosys-people-test"
           export PHOTOSYS_PEOPLE_MODEL_DIR="$RUNNER_TEMP/photosys-people-test"
@@ -113,7 +144,10 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml real_faces_install_incremental_cancel_and_restore -- --ignored --nocapture
 
       - name: Verify all five native model options and offline imports
+        if: github.event_name == 'workflow_dispatch' && inputs.full_ai_validation
         shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           python scripts/prepare-model-options-test.py "$RUNNER_TEMP/photosys-model-options"
           export PHOTOSYS_MODEL_OPTIONS_DIR="$RUNNER_TEMP/photosys-model-options"
@@ -182,21 +216,69 @@ jobs:
             }
           }
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload desktop packages
+        id: upload
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.paths }}
             src-tauri/binaries/media-codec-sources.tar.gz
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Summarize desktop packages
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          PACKAGE_PATHS: ${{ matrix.paths }}
+          FULL_AI_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.full_ai_validation }}
+        run: |
+          {
+            printf '### %s\n\n' "$ARTIFACT_NAME"
+            printf '[Download artifact](%s) (retained for 30 days)\n\n' "$ARTIFACT_URL"
+            printf 'Package patterns:\n```text\n%s\n```\n\n' "$PACKAGE_PATHS"
+            printf 'Includes media-codec-sources.tar.gz. Full AI validation: %s.\n' "$FULL_AI_VALIDATION"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   macos-intel-runtime:
+    needs: validate
     name: AI runtime on Intel macOS
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
       - run: python scripts/prepare-ai-runtime.py
       - run: python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, build, macos-intel-runtime]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: desktop-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: PhotoSys-*
+          path: release-artifacts
+      - name: Upload verified assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/publish-desktop-release.py "$RELEASE_TAG" release-artifacts release-assets

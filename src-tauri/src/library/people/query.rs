@@ -12,6 +12,11 @@ use std::{
     sync::Mutex,
 };
 static READER: Mutex<Option<Reader>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) fn close_for_test() {
+    *READER.lock().unwrap() = None;
+}
+
 struct Reader {
     scan_id: u64,
     store: Store,

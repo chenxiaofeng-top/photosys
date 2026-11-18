@@ -59,6 +59,25 @@ PHOTOSYS_AI_PACKAGE=/tmp/photosys-model.zip cargo test --locked --manifest-path 
 PHOTOSYS_AI_MODEL_DIR=/path/to/model cargo test --locked --manifest-path src-tauri/Cargo.toml real_download_resumes_pinned_vocabulary -- --ignored --nocapture
 ```
 
+## 高分辨率 HEIC 回归
+
+部分 48 MP HEIC 在转成临时 JPEG 时，会因 FFmpeg 默认的 optimal Huffman 表缓冲区超过 256 MiB 单次分配限制而失败。共用 HEIC 转换改用 `-huffman default`，保留原始尺寸、画质参数、旋转及现有资源限制。
+
+普通测试中的 `decodes_high_resolution_heic_for_indexing_and_preview` 使用合成 8064 × 6048 网格，验证 AI 解码后的尺寸与方向、详情预览及取消；测试样例不包含私人照片，可用 `python3 scripts/generate-heic-regression-fixture.py` 重新生成。
+
+真实相册回归从已有索引中读取失败的 HEIC，复制到临时相册，使用已安装的 Chinese-CLIP B/16 模型运行应用索引入口。测试验证自动更新保留失败记录、手动更新重试并清除错误、已有成功向量逐字节保持一致，以及再次更新全部复用。原相册与索引只读；默认测试不运行这一项，也不下载模型。单独运行：
+
+```sh
+PHOTOSYS_HEIC_ALBUM=/path/to/album \
+PHOTOSYS_AI_MODEL_DIR=/path/to/chinese-clip-vit-b16-fp32-v1 \
+cargo test --locked --manifest-path src-tauri/Cargo.toml \
+  real_failed_heic_retry_preserves_successful_index -- --ignored --nocapture --test-threads=1
+```
+
+本机实测：样例库 211 条 HEIC 索引中有 201 条成功、10 条失败；这 10 张照片在临时相册中全部完成解码与真实模型索引，原有成功向量保持不变，再次更新复用全部 11 条记录（10 张 HEIC 和 1 张成功对照图）。普通 Rust 回归为 86 项通过，15 项按设计忽略；上述真实 HEIC 测试另外单独运行通过。
+
+安装包含修复的应用后，手动点击「更新索引 / 重试失败项」，无需删除数据库或重建成功项。
+
 ## 平台与限制
 
 本机已验证 Linux 原生推理。三平台工作流已增加运行时下载、校验和安装包内加载检查；macOS 通用包检查两个架构，并为 Intel macOS 增加独立原生加载任务。Windows 和 macOS 的实际 CI 结果及原生交互仍需在相应系统运行后确认。

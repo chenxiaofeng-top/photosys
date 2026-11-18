@@ -332,6 +332,9 @@ fn photos_timeline_deduplicate_filter_paginate_move_and_reject_stale_results() {
     );
     drop(store);
     drop(scan);
+    // Moving an album requires closing the app, including the cached reader.
+    query::close_for_test();
+    *session().unwrap() = None;
     let moved = temp.path().join("moved");
     fs::rename(&root, &moved).unwrap();
     let fresh = open(&moved);

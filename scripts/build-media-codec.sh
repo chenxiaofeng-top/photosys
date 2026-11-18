@@ -11,7 +11,10 @@ cache="$(cd "$cache" && pwd)"
 sources="$cache/sources"
 mkdir -p "$sources"
 
-if command -v sha256sum >/dev/null; then
+if [[ "$(uname -s)" == Darwin ]]; then
+  # macOS's sha256sum does not accept the GNU stdin-check invocation below.
+  sha256=(shasum -a 256)
+elif command -v sha256sum >/dev/null; then
   sha256=(sha256sum)
 else
   sha256=(shasum -a 256)
@@ -49,9 +52,9 @@ esac
 build() (
   local target="$1" arch=x86_64 extension= vpx_target=generic-gnu
   local work="$cache/$target" prefix="$cache/$target/install"
-  local cc=gcc
+  local cc=gcc cxx=g++
   local cflags="-O2" ldflags=""
-  local autotools=() platform=() x86asm=()
+  local autotools=() platform=() x86asm=(--disable-x86asm)
   case "$target" in
     x86_64-unknown-linux-gnu)
       if command -v nasm >/dev/null; then vpx_target=x86_64-linux-gcc; fi
@@ -66,6 +69,7 @@ build() (
         export MACOSX_DEPLOYMENT_TARGET=10.15
       fi
       cc=clang
+      cxx=clang++
       cflags="$cflags -arch $apple_arch"
       ldflags="-arch $apple_arch"
       autotools=(--host="$target")
@@ -80,7 +84,9 @@ build() (
       ;;
     *) echo "Unsupported FFmpeg target $target" >&2; exit 1 ;;
   esac
-  if ! command -v nasm >/dev/null; then x86asm=(--disable-x86asm); fi
+  if [[ "$arch" == x86_64 ]] && command -v nasm >/dev/null; then
+    x86asm=(--enable-x86asm)
+  fi
 
   local signature
   signature="$( "${sha256[@]}" "$repo/scripts/build-media-codec.sh" | cut -d' ' -f1 )"
@@ -92,6 +98,10 @@ build() (
     tar -xf "$sources/$vpx_source" -C "$work/vpx" --strip-components=1
     tar -xf "$sources/$ogg_source" -C "$work/ogg" --strip-components=1
     tar -xf "$sources/$vorbis_source" -C "$work/vorbis" --strip-components=1
+    if [[ "$target" == *-apple-darwin ]]; then
+      # libvorbis 1.3.7 injects a flag removed from recent Apple linkers.
+      sed -i.bak 's/ -force_cpusubtype_ALL//g' "$work/vorbis/configure"
+    fi
     export PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
     (
       cd "$work/ogg"
@@ -109,7 +119,7 @@ build() (
     )
     (
       cd "$work/vpx"
-      CC="$cc" CFLAGS="$cflags" LDFLAGS="$ldflags" ./configure \
+      CC="$cc" CXX="$cxx" CFLAGS="$cflags" CXXFLAGS="$cflags" LDFLAGS="$ldflags" ./configure \
         --prefix="$prefix" --target="$vpx_target" --disable-examples --disable-tools \
         --disable-docs --disable-unit-tests --disable-vp9 --disable-vp8-decoder --disable-shared
       make -j "$jobs"

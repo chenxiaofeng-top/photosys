@@ -115,7 +115,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 首次构建、开发或运行 Rust 测试前，在项目根目录执行 `bash scripts/build-media-codec.sh`，生成随包提供的 FFmpeg。脚本会校验固定版本的源码并复用构建产物。macOS 先安装 `brew install pkgconf nasm`。Windows 在 MSYS2 的 UCRT64 终端安装下列工具，并在该终端运行脚本。
 
 ```sh
-pacman -S --needed curl diffutils make mingw-w64-ucrt-x86_64-gcc \
+pacman -S --needed curl diffutils make perl mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
 ```
 
@@ -140,7 +140,11 @@ AI 模型实测方法及当前验证范围见 [AI 搜索验证记录](scripts/AI
 
 ## GitHub Actions
 
-将项目推送到启用了 Actions 的 GitHub 仓库。推送到 `main`、打开或更新 PR 时，三个平台会并行运行测试并打包。工作流进入默认分支后，也可以在 **Actions → Desktop builds → Run workflow** 手动触发。在运行详情页的 **Artifacts** 下载对应安装包。
+完整操作步骤见 **[三平台打包与 Release 发布教程](docs/packaging.md)**，包含手动打包、下载安装、修改版本发新版、本地打包和失败重试。
+
+将项目推送到启用了 Actions 的 GitHub 仓库。推送到 `main`、打开或更新 PR 时，三个平台会并行运行常规测试并打包。工作流进入默认分支后，也可以在 **Actions → Desktop builds → Run workflow** 手动触发；`full_ai_validation` 默认关闭，勾选后额外下载五套模型并运行完整 AI 验证。在运行详情页的 **Artifacts** 或摘要链接下载对应产物，保留 30 天。
+
+推送与项目版本一致的 `v主版本.次版本.修订号` 标签（例如 `v0.1.1`）后，工作流会等待三平台构建及 Intel macOS 运行时检查全部成功，将四个安装包、媒体解码器源码归档和 `SHA256SUMS` 上传至草稿，再自动公开发布 GitHub Release。上传失败保留草稿，重跑会更新同一草稿；已公开版本不覆盖。手动运行、main 和 PR 构建只提供 Artifacts。
 
 | Artifact | 构建环境 | 文件 |
 | --- | --- | --- |
