@@ -11,7 +11,10 @@ cache="$(cd "$cache" && pwd)"
 sources="$cache/sources"
 mkdir -p "$sources"
 
-if command -v sha256sum >/dev/null; then
+if [[ "$(uname -s)" == Darwin ]]; then
+  # macOS's sha256sum does not accept the GNU stdin-check invocation below.
+  sha256=(shasum -a 256)
+elif command -v sha256sum >/dev/null; then
   sha256=(sha256sum)
 else
   sha256=(shasum -a 256)
@@ -51,7 +54,7 @@ build() (
   local work="$cache/$target" prefix="$cache/$target/install"
   local cc=gcc
   local cflags="-O2" ldflags=""
-  local autotools=() platform=() x86asm=()
+  local autotools=() platform=() x86asm=(--disable-x86asm)
   case "$target" in
     x86_64-unknown-linux-gnu)
       if command -v nasm >/dev/null; then vpx_target=x86_64-linux-gcc; fi
@@ -80,7 +83,9 @@ build() (
       ;;
     *) echo "Unsupported FFmpeg target $target" >&2; exit 1 ;;
   esac
-  if ! command -v nasm >/dev/null; then x86asm=(--disable-x86asm); fi
+  if [[ "$arch" == x86_64 ]] && command -v nasm >/dev/null; then
+    x86asm=(--enable-x86asm)
+  fi
 
   local signature
   signature="$( "${sha256[@]}" "$repo/scripts/build-media-codec.sh" | cut -d' ' -f1 )"
