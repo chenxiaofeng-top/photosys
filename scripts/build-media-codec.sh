@@ -52,7 +52,7 @@ esac
 build() (
   local target="$1" arch=x86_64 extension= vpx_target=generic-gnu
   local work="$cache/$target" prefix="$cache/$target/install"
-  local cc=gcc
+  local cc=gcc cxx=g++
   local cflags="-O2" ldflags=""
   local autotools=() platform=() x86asm=(--disable-x86asm)
   case "$target" in
@@ -69,6 +69,7 @@ build() (
         export MACOSX_DEPLOYMENT_TARGET=10.15
       fi
       cc=clang
+      cxx=clang++
       cflags="$cflags -arch $apple_arch"
       ldflags="-arch $apple_arch"
       autotools=(--host="$target")
@@ -118,7 +119,7 @@ build() (
     )
     (
       cd "$work/vpx"
-      CC="$cc" CFLAGS="$cflags" LDFLAGS="$ldflags" ./configure \
+      CC="$cc" CXX="$cxx" CFLAGS="$cflags" CXXFLAGS="$cflags" LDFLAGS="$ldflags" ./configure \
         --prefix="$prefix" --target="$vpx_target" --disable-examples --disable-tools \
         --disable-docs --disable-unit-tests --disable-vp9 --disable-vp8-decoder --disable-shared
       make -j "$jobs"

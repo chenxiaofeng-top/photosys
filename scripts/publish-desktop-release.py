@@ -47,9 +47,14 @@ def gh(*args):
 
 def get_release(repo, tag):
     try:
-        return json.loads(gh("api", f"repos/{repo}/releases/tags/{tag}"))
+        # The REST tag endpoint only finds published releases. gh also looks up
+        # pending draft tags through GraphQL, which is required for retries.
+        release = json.loads(gh("release", "view", tag, "--repo", repo,
+                                "--json", "isDraft,url,assets"))
+        return {"draft": release["isDraft"], "html_url": release["url"],
+                "assets": release["assets"]}
     except subprocess.CalledProcessError as error:
-        if "HTTP 404" in error.stderr:
+        if error.stderr.strip() == "release not found":
             return None
         raise
 
@@ -71,8 +76,11 @@ def publish(repo, tag, assets):
     actual = {asset["name"]: asset["size"] for asset in release["assets"]
               if asset.get("state") == "uploaded"}
     if actual != expected or len(release["assets"]) != len(expected):
-        raise ValueError("Uploaded release assets are incomplete or unexpected; keeping draft")
+        raise ValueError(f"Uploaded release assets do not match: expected {expected}, got {actual}; keeping draft")
     gh("release", "edit", tag, "--repo", repo, "--draft=false")
+    release = get_release(repo, tag)
+    if release is None or release["draft"]:
+        raise ValueError("Release is not public after publishing; check the release state on GitHub")
     return release["html_url"], True
 
 

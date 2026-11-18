@@ -179,7 +179,8 @@ class PublishTests(unittest.TestCase):
     def test_create_upload_verify_then_publish(self):
         assets = publisher.stage_assets(self.artifacts, self.output)
         release = self.release(assets)
-        with patch.object(publisher, "get_release", side_effect=[None, release]), patch.object(publisher, "gh") as gh:
+        with patch.object(publisher, "get_release", side_effect=[None, release, self.release(assets, draft=False)]), \
+                patch.object(publisher, "gh") as gh:
             url, published = publisher.publish("example/photosys", "v0.1.1", assets)
         self.assertTrue(published)
         self.assertEqual(url, release["html_url"])
@@ -192,7 +193,8 @@ class PublishTests(unittest.TestCase):
     def test_retry_updates_draft_without_creating_another(self):
         assets = publisher.stage_assets(self.artifacts, self.output)
         release = self.release(assets)
-        with patch.object(publisher, "get_release", side_effect=[release, release]), patch.object(publisher, "gh") as gh:
+        with patch.object(publisher, "get_release", side_effect=[release, release, self.release(assets, draft=False)]), \
+                patch.object(publisher, "gh") as gh:
             publisher.publish("example/photosys", "v0.1.1", assets)
         self.assertEqual([c.args[1] for c in gh.call_args_list], ["upload", "edit"])
         self.assertIn("--clobber", gh.call_args_list[0].args)
@@ -226,11 +228,20 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(published)
         gh.assert_not_called()
 
-    def test_only_404_is_treated_as_missing(self):
-        for message in ["gh: Not Found (HTTP 404)", "gh: Forbidden (HTTP 403)", "network error"]:
+    def test_draft_lookup_uses_cli_pending_tag_support(self):
+        release = {"isDraft": True, "url": "https://github.com/example/photosys/releases/tag/v0.1.1",
+                   "assets": []}
+        with patch.object(publisher, "gh", return_value=json.dumps(release)) as gh:
+            found = publisher.get_release("example/photosys", "v0.1.1")
+        self.assertTrue(found["draft"])
+        self.assertEqual(found["html_url"], release["url"])
+        self.assertEqual(gh.call_args.args[:3], ("release", "view", "v0.1.1"))
+
+    def test_only_missing_release_is_treated_as_missing(self):
+        for message in ["release not found\n", "gh: Forbidden (HTTP 403)", "network error"]:
             with self.subTest(message=message), patch.object(publisher, "gh", side_effect=
                     subprocess.CalledProcessError(1, ["gh"], stderr=message)):
-                if "404" in message:
+                if message.strip() == "release not found":
                     self.assertIsNone(publisher.get_release("example/photosys", "v0.1.1"))
                 else:
                     with self.assertRaises(subprocess.CalledProcessError):
