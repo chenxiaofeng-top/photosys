@@ -140,7 +140,11 @@ AI 模型实测方法及当前验证范围见 [AI 搜索验证记录](scripts/AI
 
 ## GitHub Actions
 
-将项目推送到启用了 Actions 的 GitHub 仓库。推送到 `main`、打开或更新 PR 时，三个平台会并行运行测试并打包。工作流进入默认分支后，也可以在 **Actions → Desktop builds → Run workflow** 手动触发。在运行详情页的 **Artifacts** 下载对应安装包。
+完整操作步骤见 **[三平台打包与 Release 发布教程](docs/packaging.md)**，包含手动打包、下载安装、修改版本发新版、本地打包和失败重试。
+
+将项目推送到启用了 Actions 的 GitHub 仓库。推送到 `main`、打开或更新 PR 时，三个平台会并行运行常规测试并打包。工作流进入默认分支后，也可以在 **Actions → Desktop builds → Run workflow** 手动触发；`full_ai_validation` 默认关闭，勾选后额外下载五套模型并运行完整 AI 验证。在运行详情页的 **Artifacts** 或摘要链接下载对应产物，保留 30 天。
+
+推送与项目版本一致的 `v主版本.次版本.修订号` 标签（例如 `v0.1.1`）后，工作流会等待三平台构建及 Intel macOS 运行时检查全部成功，将四个安装包、媒体解码器源码归档和 `SHA256SUMS` 上传至草稿，再自动公开发布 GitHub Release。上传失败保留草稿，重跑会更新同一草稿；已公开版本不覆盖。手动运行、main 和 PR 构建只提供 Artifacts。
 
 | Artifact | 构建环境 | 文件 |
 | --- | --- | --- |

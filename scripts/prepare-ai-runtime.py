@@ -6,57 +6,62 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-# ort uses C API 22. Intel macOS's last upstream native archive is 1.22.0.
+# The official NuGet CPU packages include native libraries; .NET is not required.
+# ort uses C API 22. Intel macOS's last upstream native package is 1.22.0.
 PACKAGES = {
-    ("Linux", "x86_64"): ("1.24.2", "linux-x64", "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"),
-    ("Windows", "x86_64"): ("1.24.2", "win-x64", "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0"),
-    ("Darwin", "aarch64"): ("1.24.2", "osx-arm64", "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde"),
-    ("Darwin", "x86_64"): ("1.22.0", "osx-x86_64", "e4ec94a7696de74fb1b12846569aa94e499958af6ffa186022cfde16c9d617f0"),
+    ("Linux", "x86_64"): ("1.24.2", "linux-x64"),
+    ("Windows", "x86_64"): ("1.24.2", "win-x64"),
+    ("Darwin", "aarch64"): ("1.24.2", "osx-arm64"),
+    ("Darwin", "x86_64"): ("1.22.0", "osx-x64"),
+}
+DIGESTS = {
+    "1.24.2": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
+    "1.22.0": "d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
 }
 
 
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def extract_runtime(archive, target):
+    prefix = f"runtimes/{target}/native/"
+    with zipfile.ZipFile(archive) as source:
+        files = {Path(name).name: source.read(name) for name in source.namelist()
+                 if name in {"LICENSE", "ThirdPartyNotices.txt"}
+                 or name.startswith(prefix) and "/" not in name[len(prefix):]
+                 and name.endswith((".dll", ".so", ".dylib"))}
+    required = "onnxruntime.dll" if target.startswith("win-") else "libonnxruntime.dylib" if target.startswith("osx-") else "libonnxruntime.so"
+    if not {required, "LICENSE", "ThirdPartyNotices.txt"} <= files.keys():
+        raise RuntimeError(f"Incomplete official runtime package for {target}: {archive}")
+    return files
+
+
 def prepare(system, arch):
-    version, target, expected = PACKAGES[(system, arch)]
-    suffix = "zip" if system == "Windows" else "tgz"
-    filename = f"onnxruntime-{target}-{version}.{suffix}"
+    version, target = PACKAGES[(system, arch)]
+    expected = DIGESTS[version]
+    filename = f"microsoft.ml.onnxruntime.{version}.nupkg"
     cache = ROOT / "src-tauri/target/ai-runtime"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / filename
-    if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
-        url = f"https://github.com/microsoft/onnxruntime/releases/download/v{version}/{filename}"
+    if not archive.exists() or digest(archive) != expected:
+        url = f"https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/{version}/{filename}"
         print(f"Downloading {filename}", flush=True)
         partial = archive.with_suffix(".partial")
-        with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as output:
+        with urllib.request.urlopen(url, timeout=120) as response, partial.open("wb") as output:
             shutil.copyfileobj(response, output)
-        if hashlib.sha256(partial.read_bytes()).hexdigest() != expected:
+        if digest(partial) != expected:
             raise RuntimeError(f"SHA-256 mismatch: {filename}")
         partial.replace(archive)
+    files = extract_runtime(archive, target)
     output = ROOT / "src-tauri/binaries/onnxruntime" / arch
     output.mkdir(parents=True, exist_ok=True)
-    if suffix == "zip":
-        with zipfile.ZipFile(archive) as source:
-            files = {Path(n).name: source.read(n) for n in source.namelist()
-                     if n.endswith(".dll") or Path(n).name in {"LICENSE", "ThirdPartyNotices.txt"}}
-    else:
-        with tarfile.open(archive) as source:
-            files = {}
-            for member in source.getmembers():
-                name = Path(member.name).name
-                if "/lib/" in member.name and "/" in member.name.split("/lib/")[1]:
-                    continue
-                if name in {"LICENSE", "ThirdPartyNotices.txt"} or name.startswith("libonnxruntime") and (".so" in name or name.endswith(".dylib")):
-                    stream = source.extractfile(member)
-                    if stream:
-                        files[name] = stream.read()
-    required = "onnxruntime.dll" if system == "Windows" else "libonnxruntime.dylib" if system == "Darwin" else "libonnxruntime.so"
-    if required not in files or "LICENSE" not in files or "ThirdPartyNotices.txt" not in files:
-        raise RuntimeError(f"Incomplete official runtime archive: {filename}")
     for name, content in files.items():
         with tempfile.NamedTemporaryFile(dir=output, delete=False) as temporary:
             temporary.write(content)
