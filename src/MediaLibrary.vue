@@ -12,6 +12,9 @@ import "element-plus/es/components/select/style/css";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
+import PeoplePanel from "./PeoplePanel.vue";
+import PeopleFaceEditor from "./PeopleFaceEditor.vue";
+import type { Person, PeopleStatus, Month } from "./people";
 import type { IndexStatus } from "./aiSearch";
 import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
@@ -57,6 +60,7 @@ interface OpenedLibrary {
   summary: Summary;
 }
 
+const props = defineProps<{ peopleMode?: boolean }>();
 const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string] }>();
 const pageSize = 24;
 const directory = ref("");
@@ -84,6 +88,39 @@ const aiIndex = ref<IndexStatus>();
 const aiPanel = ref<InstanceType<typeof AiSearchSettings>>();
 const aiRevision = ref(0);
 const sort = ref<Sort>("dateDesc");
+const selectedPerson = shallowRef<Person>();
+const peopleVisited = ref(false);
+const peopleRevision = ref(0);
+const peopleStatus = shallowRef<PeopleStatus>();
+const months = shallowRef<Month[]>([]);
+const timelineError = ref("");
+function personChanged() { peopleRevision.value++; revision.value++; }
+function selectPerson(person: Person | undefined) {
+  selectedPerson.value = person;
+  requestedPage.value = 0;
+  if (person) { dateMode.value = "all"; from.value = ""; to.value = ""; favoritesOnly.value = false; sort.value = "dateAsc"; }
+}
+function selectMonth(month: string | null) {
+  if (month === null) { dateMode.value = "unknown"; return; }
+  from.value = `${month}-01`;
+  const [year, number] = month.split("-").map(Number);
+  const end = new Date(Date.UTC(year!, number!, 0)).getUTCDate();
+  to.value = `${month}-${String(end).padStart(2, "0")}`;
+  dateMode.value = "range";
+}
+function monthTitle(date: string | null) { return date ? `${date.slice(0, 4)} 年 ${Number(date.slice(5, 7))} 月` : "日期未知"; }
+let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateMode: typeof dateMode.value; from: string; to: string; favoritesOnly: boolean; input: string; query: string } | undefined;
+watch(() => props.peopleMode, (people) => {
+  if (people) {
+    peopleVisited.value = true;
+    libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateMode: dateMode.value, from: from.value, to: to.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
+    searchMode.value = "filename"; clearSearch(); kind.value = "photo"; dateMode.value = "all"; favoritesOnly.value = false; sort.value = "dateAsc";
+  } else if (libraryPreferences) {
+    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateMode.value = p.dateMode; from.value = p.from; to.value = p.to; favoritesOnly.value = p.favoritesOnly;
+    nextTick(() => { searchInput.value = p.input; query.value = p.query; });
+    libraryPreferences = undefined;
+  }
+}, { immediate: true });
 const composing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 const searchPending = computed(() => searchMode.value === "filename" && (composing.value || searchInput.value.trim() !== query.value));
@@ -145,6 +182,10 @@ function withSavedRotations(page: Page<Item>): Page<Item> {
 }
 const itemsLoading = ref(false);
 async function fetchPage(scanId: number, currentFilter: typeof filter.value, currentSort: Sort, page: number): Promise<Page<Item>> {
+  if (props.peopleMode) {
+    if (!selectedPerson.value) return { page: 0, total: 0, items: [] };
+    return invoke<Page<Item>>("people_photos", { scanId, personId: selectedPerson.value.id, filter: currentFilter, sort: currentSort, page });
+  }
   if (searchMode.value === "content") {
     if (!currentFilter.query) return { page: 0, total: 0, items: [] };
     return invoke<Page<Item>>("ai_search", { scanId, query: currentFilter.query, filter: currentFilter, page });
@@ -152,7 +193,7 @@ async function fetchPage(scanId: number, currentFilter: typeof filter.value, cur
   return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
 }
 watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, () => props.peopleMode, selectedPerson], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
   let receiving = true;
   onCleanup(() => { receiving = false; });
@@ -174,6 +215,17 @@ watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision], 
   }
 });
 
+watch([summary, selectedPerson, favoritesOnly, sort, peopleRevision, () => props.peopleMode], async (_, __, cleanup) => {
+  let current = true; cleanup(() => { current = false; });
+  const scanId = summary.value?.scanId; const personId = selectedPerson.value?.id;
+  months.value = []; timelineError.value = "";
+  if (!props.peopleMode || scanId === undefined || personId === undefined) return;
+  try {
+    const value = await invoke<Month[]>("people_months", { scanId, personId, filter: { query: "", kind: "photo", from: null, to: null, unknownDate: false, favoritesOnly: favoritesOnly.value }, sort: sort.value });
+    if (current) months.value = value;
+  } catch (cause) { if (current) timelineError.value = String(cause); }
+});
+
 const issuesOpen = ref(false);
 const issuePage = ref(0);
 const issues = shallowRef<Page<Issue>>();
@@ -193,6 +245,8 @@ watch([summary, issuesOpen, issuePage], async ([scan, open, page], _, onCleanup)
 const detail = shallowRef<Item>();
 const dialog = ref<HTMLDialogElement>();
 const detailImage = ref("");
+const detailPeople = ref<string[]>([]);
+let peopleResultsDirty = false;
 const previewError = ref("");
 const previewReady = ref(false);
 const rotationSaving = ref(false);
@@ -277,6 +331,9 @@ function scanProgress() {
 function showScan(selected: string, scanned: Summary) {
   setLibraryThumbnailConcurrency(scanned.thumbnailConcurrency);
   if (selected !== directory.value) {
+    selectedPerson.value = undefined;
+    peopleStatus.value = undefined;
+    libraryPreferences = undefined;
     kind.value = "all";
     dateMode.value = "all";
     from.value = "";
@@ -294,6 +351,7 @@ function showScan(selected: string, scanned: Summary) {
   issuePage.value = 0;
   requestedPage.value = 0;
   summary.value = scanned;
+  peopleRevision.value++;
 }
 
 async function scanDirectory(selected: string, mode: "select" | "refresh") {
@@ -335,7 +393,7 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-watch([summary, filter, sort, revision, searchMode], () => {
+watch([summary, filter, sort, revision, searchMode, selectedPerson, () => props.peopleMode], () => {
   pendingFocus = undefined;
   dialog.value?.close();
   resetDetail();
@@ -349,6 +407,27 @@ function showDetails(item: Item, event: MouseEvent) {
   const thumbnail = (event.currentTarget as HTMLButtonElement).querySelector("img");
   void loadDetail(item, thumbnail?.complete && thumbnail.naturalWidth ? thumbnail.currentSrc : "");
 }
+
+async function showPersonPhoto(fileId: number) {
+  const scanId = summary.value?.scanId;
+  if (scanId === undefined || busy.value) return;
+  try {
+    const item = await invoke<Item>("library_item", { scanId, fileId });
+    if (summary.value?.scanId !== scanId) return;
+    detailPage.value = { page: 0, total: 1, items: [item] }; detailPosition.value = 0;
+    await loadDetail(item);
+  } catch (cause) { favoriteError.value = String(cause); }
+}
+function detailPeopleChanged() { peopleRevision.value++; peopleResultsDirty = true; }
+watch([detail, peopleRevision], async (_, __, cleanup) => {
+  let current = true; cleanup(() => { current = false; }); detailPeople.value = [];
+  const scanId = summary.value?.scanId; const item = detail.value;
+  if (scanId === undefined || !item || item.kind !== "photo") return;
+  try {
+    const value = await invoke<{ id: number; name: string }[]>("people_photo_people", { scanId, fileId: item.id });
+    if (current) detailPeople.value = value.map(p => p.name || `未命名人物 ${p.id}`);
+  } catch (cause) { if (current) detailError.value = `无法读取人物标注。${String(cause)}`; }
+});
 
 async function loadDetail(item: Item, thumbnail = "") {
   const scanId = summary.value?.scanId;
@@ -455,6 +534,7 @@ function finishDetails() {
     requestedPage.value = detailPage.value.page;
   }
   resetDetail();
+  if (peopleResultsDirty) { peopleResultsDirty = false; revision.value++; }
   void restoreCardFocus();
 }
 
@@ -553,7 +633,7 @@ async function performFileAction(action: FileAction) {
   <div class="media-library">
     <header class="library-header">
       <div class="library-heading">
-        <h1>媒体库</h1>
+        <h1>{{ peopleMode ? "人物与家庭时间线" : "媒体库" }}</h1>
         <p>把每一段回忆，好好珍藏。</p>
       </div>
       <div v-if="directory" class="directory-toolbar">
@@ -566,7 +646,7 @@ async function performFileAction(action: FileAction) {
       </div>
     </header>
 
-    <AiSearchSettings ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
+    <AiSearchSettings v-show="!peopleMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
       @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" />
 
     <div v-if="task === 'starting' || task === 'scanning'" class="scan-status" role="status">
@@ -587,9 +667,19 @@ async function performFileAction(action: FileAction) {
       <span class="empty-hint">照片保留在原目录，安心浏览</span>
     </div>
 
-    <template v-if="summary">
-      <div class="library-tools" role="search" aria-label="媒体搜索与筛选">
-        <div class="search-row">
+    <PeoplePanel v-if="summary && peopleVisited" v-show="peopleMode" :scan-id="summary.scanId" :library-busy="busy"
+      :selected="selectedPerson" :revision="peopleRevision" @select="selectPerson" @changed="personChanged" @preview="showPersonPhoto" @status="peopleStatus = $event" />
+
+    <template v-if="summary && (!peopleMode || selectedPerson)">
+      <p v-if="peopleMode" class="timeline-intro">按拍摄日期浏览成长记录，未知日期单独列出。</p>
+      <nav v-if="peopleMode && months?.length" class="timeline-months" aria-label="成长时间线年月导航">
+        <button type="button" class="secondary" :aria-pressed="dateMode === 'all'" @click="dateMode = 'all'">全部日期</button>
+        <button v-for="entry in months" :key="entry.month ?? 'unknown'" type="button" class="secondary"
+          :aria-pressed="entry.month ? dateMode === 'range' && from === `${entry.month}-01` : dateMode === 'unknown'" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
+      </nav>
+      <p v-if="timelineError" class="error" role="alert">{{ timelineError }}</p>
+      <div class="library-tools" :class="{ 'people-tools': peopleMode }" role="search" aria-label="媒体搜索与筛选">
+        <div v-if="!peopleMode" class="search-row">
           <ElSelect v-model="searchMode" class="mode-select" aria-label="搜索方式">
             <ElOption label="文件名" value="filename" />
             <ElOption label="照片内容" value="content" />
@@ -603,7 +693,7 @@ async function performFileAction(action: FileAction) {
             :disabled="busy || !aiReady || !searchInput.trim() || composing" @click="submitContentSearch()">搜索照片</ElButton>
         </div>
         <div class="filters">
-          <div v-if="searchMode === 'filename'" class="filter-field">
+          <div v-if="!peopleMode && searchMode === 'filename'" class="filter-field">
             <span id="kind-label">类型</span>
             <ElSelect v-model="kind" class="kind-select" aria-label="媒体类型">
               <ElOption label="全部类型" value="all" /><ElOption label="照片" value="photo" /><ElOption label="视频" value="video" />
@@ -624,8 +714,8 @@ async function performFileAction(action: FileAction) {
             <span id="sort-label">排序</span>
             <ElSelect v-model="sort" class="sort-select" aria-label="排序">
               <ElOption label="拍摄日期：从新到旧" value="dateDesc" /><ElOption label="拍摄日期：从旧到新" value="dateAsc" />
-              <ElOption label="名称：升序" value="nameAsc" /><ElOption label="名称：降序" value="nameDesc" />
-              <ElOption label="文件大小：从大到小" value="sizeDesc" /><ElOption label="文件大小：从小到大" value="sizeAsc" />
+              <ElOption v-if="!peopleMode" label="名称：升序" value="nameAsc" /><ElOption v-if="!peopleMode" label="名称：降序" value="nameDesc" />
+              <ElOption v-if="!peopleMode" label="文件大小：从大到小" value="sizeDesc" /><ElOption v-if="!peopleMode" label="文件大小：从小到大" value="sizeAsc" />
             </ElSelect>
           </div>
           <span v-else class="relevance-note">按内容相关度排序 · 最多 200 张</span>
@@ -648,7 +738,8 @@ async function performFileAction(action: FileAction) {
       <p v-else class="result-status status" role="status">
         <template v-if="itemsLoading">正在加载媒体…</template>
         <template v-else-if="results?.total">
-          {{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}
+          <template v-if="peopleMode">共 {{ results.total }} 张人物照片</template>
+          <template v-else>{{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}</template>
         </template>
       </p>
       <div v-if="itemsLoading && !results?.items.length" class="library-empty" role="status">
@@ -666,7 +757,9 @@ async function performFileAction(action: FileAction) {
       </div>
 
       <ul v-if="results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
-        <li v-for="item in results.items" :key="`${summary.scanId}:${item.id}`" class="card">
+        <template v-for="(item, index) in results.items" :key="`${summary.scanId}:${item.id}`">
+        <li v-if="peopleMode && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">{{ monthTitle(item.capturedOn) }}</li>
+        <li class="card">
           <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
             <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId"
@@ -683,6 +776,7 @@ async function performFileAction(action: FileAction) {
             </div>
           </div>
         </li>
+        </template>
       </ul>
       <nav v-if="results && results.total > pageSize" class="pagination" aria-label="媒体列表分页">
         <button type="button" class="secondary" :disabled="busy || results.page === 0"
@@ -732,6 +826,12 @@ async function performFileAction(action: FileAction) {
         <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
       </div>
       <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
+      <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
+      <details v-if="summary && detail.kind === 'photo'" class="detail-people">
+        <summary>照片中的人物 / 整理人脸</summary>
+        <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
+          @changed="detailPeopleChanged" />
+      </details>
       <p class="detail-path">{{ detail.relativePath }}</p>
       <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
       <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
@@ -753,6 +853,18 @@ async function performFileAction(action: FileAction) {
 </template>
 
 <style scoped>
+.timeline-months { display: flex; flex-wrap: wrap; gap: .5rem; max-height: 12rem; overflow-y: auto; margin: 1rem 0; }
+.timeline-months button { padding: .45rem .65rem; font-size: .85rem; }
+.timeline-months [aria-pressed="true"] { color: #fff; background: #176252; border-color: #176252; }
+.timeline-heading { grid-column: 1 / -1; padding-top: .75rem; list-style: none; color: #3f6252; font-size: 1.25rem; font-weight: 650; }
+.timeline-intro { color: #65736b; }
+.people-tools .filters { margin-top: 0; padding-top: 0; border-top: 0; }
+@media (max-width: 34rem) {
+  .people-tools .sort-field { flex: 1 1 100%; }
+  .people-tools .sort-select { flex: 1; min-width: 0; width: auto; }
+}
+.detail-people { margin-top: 1rem; padding: .75rem; border: 1px solid #dce5dc; border-radius: .5rem; }
+
 .media-library {
   --library-surface: #fff;
   --library-border: #e0e5df;

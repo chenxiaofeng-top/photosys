@@ -2,6 +2,12 @@
 pub(crate) mod download;
 pub(crate) mod inference;
 mod model;
+pub(crate) mod people_model;
+pub(crate) mod faces;
+mod packages;
+
+// CPU-heavy indexing jobs share one slot; browsing remains independent.
+pub(crate) static ANALYSIS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) use model::*;
 
@@ -12,4 +18,26 @@ pub(crate) const DIM: usize = 512;
 
 pub(crate) fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// Wait without blocking cancellation while another indexer uses the CPU.
+pub(crate) fn analysis_slot(cancel: &std::sync::atomic::AtomicBool) -> Result<Option<std::sync::MutexGuard<'static, ()>>, String> {
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { return Ok(None); }
+        match ANALYSIS.try_lock() {
+            Ok(slot) => return Ok(Some(slot)),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(e) => return Err(error(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    #[test]
+    fn queued_analysis_can_be_cancelled_without_loading_a_model() {
+        let slot=super::ANALYSIS.lock().unwrap();
+        let cancelled=std::sync::atomic::AtomicBool::new(true);
+        assert!(super::analysis_slot(&cancelled).unwrap().is_none());drop(slot);
+    }
 }

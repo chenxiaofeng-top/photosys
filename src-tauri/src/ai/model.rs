@@ -1,5 +1,6 @@
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+#[cfg(test)] use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -59,6 +60,10 @@ pub(crate) const ASSETS: &[Asset] = &[
     },
 ];
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ModelKind { #[default] Search, People }
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Source {
@@ -69,22 +74,22 @@ pub(crate) enum Source {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ModelStatus {
-    directory: Option<String>,
-    ready: bool,
-    total_bytes: u64,
-    resumable_bytes: u64,
-    message: Option<String>,
-    model_id: &'static str,
+    pub(crate) directory: Option<String>,
+    pub(crate) ready: bool,
+    pub(crate) total_bytes: u64,
+    pub(crate) resumable_bytes: u64,
+    pub(crate) message: Option<String>,
+    pub(crate) model_id: &'static str,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstallProgress {
-    phase: &'static str,
-    file: String,
-    downloaded: u64,
-    total: u64,
-    source: Source,
+    pub(super) phase: &'static str,
+    pub(super) file: String,
+    pub(super) downloaded: u64,
+    pub(super) total: u64,
+    pub(super) source: Source,
 }
 
 fn config(app: &AppHandle) -> Result<PathBuf, String> {
@@ -103,7 +108,7 @@ pub(crate) fn selected_directory(app: &AppHandle) -> Result<Option<PathBuf>, Str
     }
 }
 
-fn regular_directory(path: &Path) -> Result<(), String> {
+pub(super) fn regular_directory(path: &Path) -> Result<(), String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|e| format!("模型目录不可用，请重新选择。{e}"))?;
     if !metadata.is_dir() || crate::duplicates::is_link(&metadata) {
@@ -112,7 +117,7 @@ fn regular_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn regular_file(path: &Path) -> Result<std::fs::Metadata, String> {
+pub(super) fn regular_file(path: &Path) -> Result<std::fs::Metadata, String> {
     let metadata = fs::symlink_metadata(path).map_err(error)?;
     if !metadata.is_file() || crate::duplicates::is_link(&metadata) {
         return Err("模型文件必须是普通文件。".into());
@@ -128,13 +133,6 @@ fn staging_directory(base: &Path) -> PathBuf {
     base.join(format!(".{MODEL_ID}.partial"))
 }
 
-fn ensure_directory(path: &Path) -> Result<(), String> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => regular_directory(path),
-        Err(e) => Err(format!("无法创建模型安装目录，请检查写入权限。{e}")),
-    }
-}
 
 pub(crate) fn verify_assets(directory: &Path, cancel: &AtomicBool) -> Result<(), String> {
     regular_directory(directory)?;
@@ -214,7 +212,10 @@ fn status(app: &AppHandle, verify: bool) -> Result<ModelStatus, String> {
 }
 
 #[tauri::command]
-pub(crate) async fn ai_model_status(app: AppHandle) -> Result<ModelStatus, String> {
+pub(crate) async fn ai_model_status(app: AppHandle, kind: Option<ModelKind>) -> Result<ModelStatus, String> {
+    if matches!(kind, Some(ModelKind::People)) {
+        return tauri::async_runtime::spawn_blocking(move || super::people_model::status(&app)).await.map_err(error)?;
+    }
     tauri::async_runtime::spawn_blocking(move || match TASK.try_lock() {
         Ok(_task) => status(&app, true),
         Err(_) => status(&app, false),
@@ -227,7 +228,11 @@ pub(crate) async fn ai_model_status(app: AppHandle) -> Result<ModelStatus, Strin
 pub(crate) async fn ai_set_model_directory(
     app: AppHandle,
     directory: String,
+    kind: Option<ModelKind>,
 ) -> Result<ModelStatus, String> {
+    if matches!(kind, Some(ModelKind::People)) {
+        return tauri::async_runtime::spawn_blocking(move || super::people_model::set_directory(&app, &directory)).await.map_err(error)?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let _task = TASK
             .try_lock()
@@ -251,7 +256,8 @@ pub(crate) async fn ai_set_model_directory(
 }
 
 #[tauri::command]
-pub(crate) fn ai_cancel_install() {
+pub(crate) fn ai_cancel_install(kind: Option<ModelKind>) {
+    if matches!(kind, Some(ModelKind::People)) { super::people_model::cancel_install(); return; }
     CANCEL.store(true, Ordering::Relaxed);
 }
 
@@ -280,21 +286,6 @@ pub(crate) async fn ai_choose_model_package(
     .map_err(error)?
 }
 
-fn progress(
-    channel: &Channel<InstallProgress>,
-    phase: &'static str,
-    asset: &Asset,
-    downloaded: u64,
-    source: Source,
-) {
-    let _ = channel.send(InstallProgress {
-        phase,
-        file: asset.name.into(),
-        downloaded,
-        total: ASSETS.iter().map(|a| a.size).sum(),
-        source,
-    });
-}
 
 fn install(
     app: &AppHandle,
@@ -319,166 +310,16 @@ fn install_into(
     channel: &Channel<InstallProgress>,
     initialize: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    regular_directory(base)?;
-    let staging = staging_directory(base);
-    ensure_directory(&staging)?;
-    let total: u64 = ASSETS.iter().map(|a| a.size).sum();
-    let reusable: u64 = ASSETS
-        .iter()
-        .map(|a| regular_file(&staging.join(a.name)).map_or(0, |m| m.len().min(a.size)))
-        .sum();
-    if fs2::available_space(base).map_err(error)?
-        < total.saturating_sub(reusable) + 64 * 1024 * 1024
-    {
-        return Err("模型目录的可用空间不足，请释放空间后重试。".into());
-    }
-    let client = download::client()?;
-    let mut archive = package
-        .map(|path| {
-            regular_file(path)?;
-            zip::ZipArchive::new(File::open(path).map_err(error)?).map_err(error)
-        })
-        .transpose()?;
-    let mut completed = 0;
-    for asset in ASSETS {
-        download::check_cancel(&CANCEL)?;
-        let path = staging.join(asset.name);
-        if path.exists() {
-            regular_file(&path)?;
-        }
-        if regular_file(&path).is_ok_and(|m| m.len() == asset.size) {
-            progress(channel, "verifying", asset, completed + asset.size, source);
-            if download::digest(&path, &CANCEL)? == asset.sha {
-                completed += asset.size;
-                continue;
-            }
-            fs::remove_file(&path).map_err(error)?;
-        }
-        if let Some(archive) = archive.as_mut() {
-            let mut entry = archive
-                .by_name(asset.name)
-                .map_err(|_| format!("离线包缺少 {}，请导入完整模型包。", asset.name))?;
-            if !entry.is_file() || entry.size() != asset.size {
-                return Err(format!("离线包中的 {} 大小不正确。", asset.name));
-            }
-            let mut output = download::output(&path, false)?;
-            let mut buffer = [0; 128 * 1024];
-            let mut written = 0;
-            loop {
-                download::check_cancel(&CANCEL)?;
-                let count = entry.read(&mut buffer).map_err(error)?;
-                if count == 0 {
-                    break;
-                }
-                written += count as u64;
-                if written > asset.size {
-                    return Err("离线包文件超过预期大小。".into());
-                }
-                output.write_all(&buffer[..count]).map_err(error)?;
-                progress(channel, "importing", asset, completed + written, source);
-            }
-            output.sync_all().map_err(error)?;
-        } else {
-            let sources = match source {
-                Source::Mirror => [Source::Mirror, Source::Official],
-                Source::Official => [Source::Official, Source::Mirror],
-            };
-            let mut last_error = None;
-            for origin in sources {
-                let host = match origin {
-                    Source::Mirror => "https://hf-mirror.com",
-                    Source::Official => "https://huggingface.co",
-                };
-                let url = format!(
-                    "{host}/{}/resolve/{}/{}",
-                    asset.repository, asset.revision, asset.name
-                );
-                match download::transfer(&client, &url, &path, asset.size, &CANCEL, |bytes| {
-                    progress(channel, "downloading", asset, completed + bytes, origin)
-                }) {
-                    Ok(()) => {
-                        progress(channel, "verifying", asset, completed + asset.size, origin);
-                        if download::digest(&path, &CANCEL)? == asset.sha {
-                            last_error = None;
-                            break;
-                        }
-                        fs::remove_file(&path).map_err(error)?;
-                        last_error = Some(format!(
-                            "{} SHA-256 校验失败，请重试或切换下载源。",
-                            asset.name
-                        ));
-                    }
-                    Err(e) => {
-                        download::check_cancel(&CANCEL)?;
-                        last_error = Some(e);
-                    }
-                }
-            }
-            if let Some(e) = last_error {
-                return Err(e);
-            }
-        }
-        if archive.is_some() {
-            progress(channel, "verifying", asset, completed + asset.size, source);
-            if regular_file(&path)?.len() != asset.size
-                || download::digest(&path, &CANCEL)? != asset.sha
-            {
-                fs::remove_file(&path).map_err(error)?;
-                return Err(format!(
-                    "{} SHA-256 校验失败，请重试或切换下载源。",
-                    asset.name
-                ));
-            }
-        }
-        completed += asset.size;
-    }
-    download::check_cancel(&CANCEL)?;
-    progress(channel, "testing", &ASSETS[0], total, source);
-    initialize()?;
-    // Self-test both encoders before publishing the installation.
-    let checked_stamps = stamps(&staging)?;
-    let checked_runtime = Arc::new(Runtime::load(&staging)?);
-    if checked_stamps != stamps(&staging)? {
-        return Err("模型文件在校验后发生变化，请重新安装。".into());
-    }
-    download::check_cancel(&CANCEL)?;
-    let mut notices = tempfile::NamedTempFile::new_in(&staging).map_err(error)?;
-    notices
-        .write_all(include_str!("../../../scripts/AI-MODEL-NOTICES.md").as_bytes())
-        .map_err(error)?;
-    notices.persist(staging.join("README.txt")).map_err(error)?;
-    let destination = installed_directory(base);
-    let mut loaded = LOADED.lock().map_err(|_| "模型状态异常。")?;
-    *loaded = None;
-    if destination.exists() {
-        regular_directory(&destination)?;
-        // Preserve the previous directory, including unrelated user files, on repair.
-        let backup = tempfile::Builder::new()
-            .prefix(".photosys-model-backup-")
-            .tempdir_in(&base)
-            .map_err(error)?
-            .keep();
-        fs::remove_dir(&backup).map_err(error)?;
-        fs::rename(&destination, &backup).map_err(error)?;
-        if let Err(e) = fs::rename(&staging, &destination) {
-            fs::rename(&backup, &destination).map_err(|restore| {
-                format!(
-                    "安装未完成，原模型保存在 {}。{e}；{restore}",
-                    backup.display()
-                )
-            })?;
-            return Err(error(e));
-        }
-    } else {
-        fs::rename(&staging, &destination).map_err(error)?;
-    }
+    let (checked_stamps, checked_runtime) = super::packages::install(
+        base, MODEL_ID, ASSETS, &CANCEL, source, package, channel,
+        include_str!("../../../scripts/AI-MODEL-NOTICES.md"),
+        || { initialize()?; Runtime::load(&staging_directory(base)).map(Arc::new) },
+        || { *LOADED.lock().map_err(|_| "模型状态异常。")? = None; Ok(()) },
+    )?;
     MODEL_GENERATION.fetch_add(1, Ordering::Relaxed);
-    *loaded = Some(Loaded {
-        directory: destination,
-        stamps: checked_stamps,
-        runtime: checked_runtime,
+    *LOADED.lock().map_err(|_| "模型状态异常。")? = Some(Loaded {
+        directory: installed_directory(base), stamps: checked_stamps, runtime: checked_runtime,
     });
-    drop(loaded);
     Ok(())
 }
 
@@ -488,7 +329,11 @@ pub(crate) async fn ai_install_model(
     source: Source,
     package: Option<String>,
     progress: Channel<InstallProgress>,
+    kind: Option<ModelKind>,
 ) -> Result<ModelStatus, String> {
+    if matches!(kind, Some(ModelKind::People)) {
+        return tauri::async_runtime::spawn_blocking(move || super::people_model::install(&app, source, package.as_deref().map(Path::new), &progress)).await.map_err(error)?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         install(&app, source, package.as_deref().map(Path::new), &progress)
     })

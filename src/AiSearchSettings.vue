@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch, computed } from "vue";
 import { ElButton, ElIcon } from "element-plus";
 import { MagicStick, Setting } from "@element-plus/icons-vue";
 import "element-plus/es/components/button/style/css";
@@ -8,7 +8,10 @@ import "element-plus/es/components/icon/style/css";
 import { formatBytes } from "./formatBytes";
 import type { IndexStatus, ModelStatus } from "./aiSearch";
 
-const props = defineProps<{ scanId?: number; libraryBusy: boolean }>();
+const props = defineProps<{ scanId?: number; libraryBusy: boolean; modelKind?: "search" | "people" }>();
+const peopleModel = computed(() => props.modelKind === "people");
+const settingsId = computed(() => peopleModel.value ? "people-ai-settings" : "ai-settings-body");
+const directoryId = computed(() => peopleModel.value ? "people-model-directory" : "ai-model-directory");
 const emit = defineEmits<{ modelReady: [ready: boolean]; indexChange: [status: IndexStatus]; updated: [] }>();
 const model = ref<ModelStatus>();
 const index = ref<IndexStatus>();
@@ -36,7 +39,7 @@ function setIndex(value: IndexStatus) {
 
 async function loadModel() {
   modelTask.value = true;
-  try { setModel(await invoke<ModelStatus>("ai_model_status")); }
+  try { setModel(await invoke<ModelStatus>("ai_model_status", { kind: props.modelKind })); }
   catch (cause) { modelError.value = String(cause); }
   finally { modelTask.value = false; }
 }
@@ -48,7 +51,7 @@ async function chooseDirectory() {
     const directory = await invoke<string | null>("choose_folder", { title: "选择 AI 模型安装目录（多个相册可以共用）" });
     if (directory) {
       if (props.scanId !== undefined) await invoke("ai_cancel_index", { scanId: props.scanId });
-      setModel(await invoke<ModelStatus>("ai_set_model_directory", { directory }));
+      setModel(await invoke<ModelStatus>("ai_set_model_directory", { directory, kind: props.modelKind }));
     }
   } catch (cause) { modelError.value = String(cause); }
   finally { modelTask.value = false; }
@@ -64,7 +67,7 @@ async function install(offline: boolean) {
     if (offline && !packagePath) return;
     if (props.scanId !== undefined) await invoke("ai_cancel_index", { scanId: props.scanId });
     setModel(await invoke<ModelStatus>("ai_install_model", {
-      source: source.value, package: packagePath,
+      source: source.value, package: packagePath, kind: props.modelKind,
       progress: new Channel<Progress>((update) => { if (mounted && receiving) progress.value = update; }),
     }));
   } catch (cause) { modelError.value = String(cause); }
@@ -80,10 +83,11 @@ async function install(offline: boolean) {
 
 async function cancelInstall() {
   cancelling.value = true;
-  try { await invoke("ai_cancel_install"); } catch (cause) { modelError.value = String(cause); }
+  try { await invoke("ai_cancel_install", { kind: props.modelKind }); } catch (cause) { modelError.value = String(cause); }
 }
 
 async function refreshIndex(automatic = false) {
+  if (peopleModel.value) return;
   const scanId = props.scanId;
   if (scanId === undefined) return;
   const request = indexRequest;
@@ -118,6 +122,7 @@ async function updateIndex(automatic = false) {
 }
 
 async function cancelIndex() {
+  if (peopleModel.value) return;
   try { if (props.scanId !== undefined) await invoke("ai_cancel_index", { scanId: props.scanId }); }
   catch (cause) { indexError.value = String(cause); }
 }
@@ -150,7 +155,7 @@ defineExpose({ refreshIndex });
 </script>
 
 <template>
-  <section class="ai-settings" aria-label="AI 搜索设置">
+  <section class="ai-settings" :aria-label="peopleModel ? '人物模型设置' : 'AI 搜索设置'">
     <div class="ai-summary">
       <span class="ai-label"><ElIcon aria-hidden="true"><MagicStick /></ElIcon>本地 AI</span>
       <span class="model-status" :class="{ ready: model?.ready }" role="status">{{ modelTask ? '正在处理模型…' : model?.ready ? '本地模型已就绪' : '尚未安装可用模型' }}</span>
@@ -158,14 +163,14 @@ defineExpose({ refreshIndex });
       <ElButton v-if="indexTask" @click="cancelIndex">停止索引</ElButton>
       <ElButton v-else-if="scanId !== undefined && model?.ready"
         :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>
-      <ElButton class="settings-toggle" text :icon="Setting" :aria-expanded="open" aria-controls="ai-settings-body" @click="open = !open">AI 搜索设置</ElButton>
+      <ElButton class="settings-toggle" text :icon="Setting" :aria-expanded="open" :aria-controls="settingsId" @click="open = !open">{{ peopleModel ? '人物模型设置' : 'AI 搜索设置' }}</ElButton>
     </div>
-    <div v-show="open" id="ai-settings-body" class="ai-settings-body">
-      <p>用中文描述寻找照片。模型安装后可断网使用，照片和搜索内容只在本机处理。</p>
-      <p>模型：Chinese-CLIP ViT-B/16 · CPU · {{ formatBytes(model?.totalBytes ?? 755533779) }}</p>
+    <div v-show="open" :id="settingsId" class="ai-settings-body">
+      <p>{{ peopleModel ? "在本机检出人脸，按人物整理家庭照片。" : "用中文描述寻找照片。" }}模型安装后可断网使用，照片只在本机处理。</p>
+      <p>模型：{{ peopleModel ? 'YuNet + SFace' : 'Chinese-CLIP ViT-B/16' }} · CPU · {{ formatBytes(model?.totalBytes ?? (peopleModel ? 38928942 : 755533779)) }}</p>
       <div class="ai-directory">
-        <label for="ai-model-directory">模型安装目录</label>
-        <input id="ai-model-directory" :value="model?.directory ?? ''" placeholder="请手动指定目录" readonly />
+        <label :for="directoryId">模型安装目录</label>
+        <input :id="directoryId" :value="model?.directory ?? ''" placeholder="请手动指定目录" readonly />
         <button class="secondary" type="button" :disabled="modelTask || indexTask" @click="chooseDirectory">选择目录</button>
       </div>
       <p class="description">多个相册可以共用此目录；更换目录不会搬动或删除原有模型。</p>
@@ -182,7 +187,7 @@ defineExpose({ refreshIndex });
       </div>
       <p v-if="model?.resumableBytes && !progress">可继续下载：{{ formatBytes(model.resumableBytes) }}</p>
       <p v-if="index && !index.writable">当前相册不能写入 AI 索引，已有有效索引仍可搜索。</p>
-      <p>首次点击“建立索引”；之后打开或刷新相册时自动更新新增和变化的照片。可中途停止，下次继续。</p>
+      <p v-if="!peopleModel">首次点击“建立索引”；之后打开或刷新相册时自动更新新增和变化的照片。可中途停止，下次继续。</p>
       <p class="description">仅分析照片及实况封面。可导入与此版本匹配的 PhotoSys 离线模型包（ZIP）。</p>
     </div>
       <div v-if="progress" role="status">

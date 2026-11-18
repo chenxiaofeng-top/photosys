@@ -3,7 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
 import { ElConfigProvider, ElIcon } from "element-plus";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
-import { Picture, FolderOpened, CopyDocument, Connection } from "@element-plus/icons-vue";
+import { Picture, FolderOpened, CopyDocument, Connection, User } from "@element-plus/icons-vue";
 import "element-plus/es/components/icon/style/css";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
 import MediaLibrary from "./MediaLibrary.vue";
@@ -41,9 +41,9 @@ const result = ref<ArchiveSummary>();
 const progress = ref<ArchiveProgress>();
 const error = ref("");
 const viewTitles = {
-  library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片",
+  library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片", people: "人物",
 };
-const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection };
+const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection, people: User };
 type View = keyof typeof viewTitles;
 const view = ref<View>("library");
 const libraryDirectory = ref("");
@@ -59,7 +59,7 @@ const fileTaskBusy = computed(() =>
 function navigate(target: View) {
   if (fileTaskBusy.value) return;
   const directory = libraryDirectory.value;
-  if (view.value === "library" && directory) {
+  if ((view.value === "library" || view.value === "people") && directory) {
     if (target === "archive" && source.value !== directory) {
       source.value = directory;
       result.value = undefined;
@@ -137,13 +137,13 @@ async function startArchive() {
     </div>
   </header>
 
-  <main :class="{ 'library-layout': view === 'library' }">
-    <header v-if="view !== 'library'">
+  <main :class="{ 'library-layout': view === 'library' || view === 'people' }">
+    <header v-if="view !== 'library' && view !== 'people'">
       <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
     </header>
 
-    <MediaLibrary v-show="view === 'library'" @busy-change="libraryBusy = $event"
+    <MediaLibrary v-show="view === 'library' || view === 'people'" :people-mode="view === 'people'" @busy-change="libraryBusy = $event"
       @directory-change="libraryDirectory = $event" />
 
     <form v-if="view === 'archive'" @submit.prevent="startArchive">

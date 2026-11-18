@@ -37,6 +37,7 @@ tauri-plugin-opener = "2"
 tempfile = "3"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["sync"] }
+usearch = { version = "=2.26.6", default-features = false }
 walkdir = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 

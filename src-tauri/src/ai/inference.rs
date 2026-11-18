@@ -64,7 +64,7 @@ pub(crate) fn tokenizer(vocab: &Path) -> Result<Tokenizer, String> {
     Ok(tokenizer)
 }
 
-fn session(path: &Path) -> Result<Session, String> {
+pub(crate) fn session(path: &Path) -> Result<Session, String> {
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .saturating_div(2)

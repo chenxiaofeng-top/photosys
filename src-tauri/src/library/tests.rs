@@ -485,6 +485,7 @@ fn startup_prefers_portable_library_then_remembered_directory() {
 
 #[test]
 fn opens_empty_libraries_and_preserves_current_session_on_failure() {
+    let _session = TEST_SESSION.lock().unwrap();
     let empty = tempdir().unwrap();
     let directory = empty.path().to_str().unwrap();
     assert!(open_directory(directory, OpenMode::Refresh, |_| {}).is_err());

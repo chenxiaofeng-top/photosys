@@ -104,6 +104,14 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
+      - name: Verify native local face inference and offline installation
+        shell: bash
+        run: |
+          python scripts/prepare-people-test.py "$RUNNER_TEMP/photosys-people-test"
+          export PHOTOSYS_PEOPLE_MODEL_DIR="$RUNNER_TEMP/photosys-people-test"
+          export PHOTOSYS_PEOPLE_PACKAGE="$RUNNER_TEMP/photosys-people-test/photosys-people.zip"
+          cargo test --locked --manifest-path src-tauri/Cargo.toml real_faces_install_incremental_cancel_and_restore -- --ignored --nocapture
+
       - name: Build desktop packages
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'

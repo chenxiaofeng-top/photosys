@@ -257,7 +257,7 @@ pub(crate) async fn ai_index_status(scan_id: u64) -> Result<IndexStatus, String>
         .map_err(error)?
 }
 
-fn decode(scan: &Scan, item: &Item, cancel: &AtomicBool) -> Result<image::RgbImage, String> {
+pub(super) fn decode(scan: &Scan, item: &Item, cancel: &AtomicBool) -> Result<image::RgbImage, String> {
     let mut file = scan
         .root
         .open_matching(&item.file)
@@ -313,6 +313,7 @@ fn update(
     let mut state = initial;
     state.running = true;
     let _ = progress.send(state.clone());
+    let Some(_analysis) = ai::analysis_slot(&cancel)? else { return status(scan_id); };
     let runtime = load_model()?;
     let mut cache = Cache::open(&scan, true)?.ok_or("无法创建 AI 索引。")?;
     cache

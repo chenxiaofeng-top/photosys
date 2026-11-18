@@ -1,4 +1,5 @@
 pub(crate) mod ai_search;
+pub(crate) mod people;
 mod favorites;
 mod live;
 mod platform;
@@ -30,6 +31,8 @@ const MAX_THUMBNAIL_CONCURRENCY: usize = 3;
 const STATE_ERROR: &str = "无法读取媒体库状态，请重启应用后重试。";
 const STALE_SCAN: &str = "媒体库已变化，请刷新。";
 static SCAN_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static TEST_SESSION: Mutex<()> = Mutex::new(());
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static THUMBNAIL_CONCURRENCY: LazyLock<usize> =
     LazyLock::new(|| thumbnail_concurrency(thread::available_parallelism().map_or(1, usize::from)));
@@ -568,6 +571,7 @@ fn open_library(
     progress: impl FnMut(Progress),
 ) -> Result<Summary, String> {
     ai_search::cancel_all();
+    people::cancel_all();
     let rotations =
         favorites::read_rotations(&root).map_err(|error| format!("无法读取旋转方向。{error}"))?;
     let scanned = Session::from_scan(
@@ -849,3 +853,14 @@ pub(crate) async fn copy_library_item_path(
 
 #[cfg(test)]
 mod tests;
+
+#[tauri::command]
+pub(crate) async fn library_item(scan_id: u64, file_id: usize) -> Result<ItemView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let s = session()?;
+        let s = current(&s, scan_id)?;
+        let item = s.scan.item(file_id)?;
+        s.scan.root.open_matching(&item.file).map_err(|_| STALE_SCAN)?;
+        Ok(item.view(s.favorites.contains(&file_id), s.rotations.get(&file_id).copied().unwrap_or(0)))
+    }).await.map_err(crate::ai::error)?
+}

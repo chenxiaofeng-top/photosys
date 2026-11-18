@@ -1,0 +1,94 @@
+# 本地人物相册验证记录
+
+日期：2026-11-18。以下区分实现正确性、合成查询性能及尚待完成的真实相册验收。
+
+## 已完成的验证
+
+Linux x86_64，Intel Core i7-9750H，ONNX Runtime CPU 1.24.2，开发构建。普通测试不下载模型、不读取用户相册。
+
+- 固定版本 YuNet / SFace 已核验大小和 SHA-256；真实人物离线 ZIP 安装及双模型推理自检通过。
+- 使用 OpenCV 4.12.0 的两张公开样例，与上游 Python OpenCV 检测、5 点对齐和 SFace 输出对照。对齐图像平均绝对像素差分别为 0.0862、0.1882；固定关键点特征余弦相似度为 0.99995494、0.99967277；完整检测到特征流程为 0.99942112、0.99969447。此检查只证明实现一致性，不代表家庭相册归组准确率。
+- 真实模型流程验证：首次分析、无变化复扫复用、人工命名保留、旋转失效、旧标注待确认、取消后已完成结果保存、增量续跑、自动归组默认关闭。
+- 回归覆盖：编辑事务回滚、命名／移动／合并／忽略／恢复／撤销、重启后撤销、人工拒绝归属记录恢复、文件变化后不迁移旧身份、只读连接与数据库符号链接拒绝。
+- 查询覆盖：同一人物的多张人脸在照片列表中去重，日期范围、收藏、日期未知、年月统计、分页、旧会话拒绝、旋转即时失效、相册整体搬迁及删除文件。
+- 自动归组算法使用固定代表人脸的 HNSW 候选和精确比较，不把新归入的每张照片都作为传播锚点；回归覆盖避免相似关系连续传播及尊重人工忽略。人工合并后的多个有效已确认样本可作为代表。
+- 浏览器使用 Tauri IPC 模拟完成 19 项交互检查：人物与待整理、批量创建、人物照片、时间顺序、年月／日期未知／收藏筛选、改名、合并、撤销、照片详情与纠错、返回媒体库、运行时错误检查；另检查 1280、800 和 390 像素宽度布局。浏览器模拟不替代原生文件选择器及平台测试。
+- 原有 Chinese-CLIP 真实离线安装和增量索引／取消／中文搜索回归通过。
+
+## 查询性能
+
+合成媒体元数据，每张照片三个人脸，100 个人物。照片分页每页 24 项。此测试没有执行 10 万次照片解码或推理，缩略图为占位数据，不能作为首次真实分析或真实图库磁盘体积的测量。
+
+| 指标 | 1 万照片／3 万人脸 | 10 万照片／30 万人脸 |
+| --- | ---: | ---: |
+| SQLite 合成数据写入 | 277 ms | 3050 ms |
+| 创建本次媒体目录并读取首次人物照片页 | 47 ms | 496 ms |
+| 后续人物照片分页 | 2 ms | 33 ms |
+| 年月统计 | 1 ms | 17 ms |
+| 人物列表第一页 | 36 ms | 809 ms |
+| 增量状态核对 | 54 ms | 533 ms |
+
+单独运行真实人物离线安装及 3～10 张样例照片生命周期测试，原生测试进程峰值 RSS 为 147596 KiB（约 144 MiB），不包含 WebView；这不是大型真实相册的整体内存测量。真实 1 万／10 万照片相册的首次分析耗时、增量任务耗时和整体峰值内存尚未验收。
+
+```sh
+PHOTOSYS_PEOPLE_BENCHMARK_OUTPUT=/tmp/people-benchmark.json \
+  cargo test --locked --manifest-path src-tauri/Cargo.toml benchmark_people_catalogs -- --ignored --nocapture
+```
+
+## 原生模型与参考实现复现
+
+本机最终普通回归为 75 项通过，11 项显式实测／规模测试默认忽略；真实人物和原有内容搜索的相关测试已单独运行。普通回归：
+
+```sh
+npm run build
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+```
+
+HTTP 断点下载单元测试需要允许绑定本机回环端口；网络受限沙箱可能阻止它们。开发机当前未安装 clippy，未将其作为已通过检查。
+
+显式下载固定版本人物模型和上游样例，然后运行真实流程：
+
+```sh
+python3 scripts/prepare-people-test.py /tmp/photosys-people-model
+PHOTOSYS_PEOPLE_MODEL_DIR=/tmp/photosys-people-model \
+PHOTOSYS_PEOPLE_PACKAGE=/tmp/photosys-people-model/photosys-people.zip \
+  cargo test --locked --manifest-path src-tauri/Cargo.toml real_faces_install_incremental_cancel_and_restore -- --ignored --nocapture
+```
+
+与 OpenCV 对照（Python 仅供开发验证，用户运行应用不需要它）：
+
+```sh
+python3 -m pip install opencv-python-headless==4.12.0.88 pillow numpy
+python3 scripts/verify-people-reference.py /tmp/photosys-people-model /tmp/people-reference /tmp/photosys-people-model/lena.jpg
+PHOTOSYS_PEOPLE_REFERENCE=/tmp/people-reference \
+  cargo test --locked --manifest-path src-tauri/Cargo.toml real_model_face_reference -- --ignored --nocapture
+```
+
+三平台构建工作流已增加固定模型下载、离线导入、原生推理和人物索引生命周期检查。本机仅完成 Linux 实测；Windows、macOS 仍需等待对应 CI 的实际执行结果。Intel macOS 原有独立任务只验证运行时加载，尚未完成该架构的人脸原生流程验证。
+
+## 自动归组发布门槛
+
+仓库内 `people-grouping-policy.json` 为禁用状态。它随应用构建，不从网络读取。用户可以检出人脸、手动命名和纠错，但当前版本不会自动生成身份分组。未获得符合条件的独立标注数据，不能宣称 99% 自动归组正确率。
+
+评估工具运行相同 Rust 解码、检测、对齐、特征与分组实现。每个样本应明确标注单个人脸的身份和所属场景；多脸或质量不足的样本不被静默当作正确识别，而计入总样本和覆盖情况。校准集与验证集人物身份必须不重叠，重复图片字节会被拒绝。标签由人工负责，工具不能核实标签是否准确或场景是否具有代表性。
+
+本地 JSON 清单示例（需实际扩充样本；此两项示例不足以通过门槛）：
+
+```json
+{
+  "samples": [
+    {"path": "calibration/family-a-01.jpg", "identity": "family-a", "split": "calibration", "strata": ["adult"]},
+    {"path": "validation/family-b-01.jpg", "identity": "family-b", "split": "validation", "strata": ["child", "profile", "years"]}
+  ]
+}
+```
+
+```sh
+python3 scripts/evaluate-people.py /path/to/models /path/to/labeled-manifest.json /tmp/people-policy-report.json
+```
+
+- 校准阶段从预设阈值中选择通过至少 100 次已有分组归属、正确率至少 99% 的最低阈值，歧义间隔固定为 0.08；验证阶段不再修改阈值。
+- 独立验证至少包含 1000 次自动归入已有分组的判断，总正确率至少 99%；`adult`、`child`、`profile`、`occluded`、`years` 每类至少 20 次判断，且各类正确率至少 99%。这是一组工程发布条件，不是对全部家庭相册的统计保证。
+- 覆盖率为自动归入已有分组的人脸数除以总样本数；报告同时记录可用人脸数。初始代表人脸和待整理人脸不计入“归入已有分组”，避免以大量单人组虚增正确率。
+- 输出报告包含输入及图片内容的指纹、实际指标、模型特征版本和算法版本。不达标时输出 `enabled: false`。已用两张上游样例运行评估工具，确认样本不足时输出禁用；该检查不属于准确率验收。
+- 工具不自动覆盖发布策略。只有审核标注与独立评估通过后，才将通过的报告替换为仓库发布策略、运行回归并重新构建；版本不匹配或指标不完整时运行时仍拒绝自动归组。
