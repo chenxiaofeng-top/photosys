@@ -7,7 +7,7 @@ mod tests;
 
 use super::{Filter, Issue, ItemView, Page, Sort, current, favorites, scan, session};
 use crate::ai::{
-    self, MODEL_GENERATION, error,
+    self, PEOPLE_GENERATION as MODEL_GENERATION, error,
     faces::{self, FaceRuntime},
 };
 use query::{FaceScope, FaceView, Month, PersonView};
@@ -24,6 +24,10 @@ use store::{Edit, Store};
 use tauri::{AppHandle, ipc::Channel};
 static SERIAL: Mutex<()> = Mutex::new(());
 static MUTATION: Mutex<()> = Mutex::new(());
+pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    cancel_all();
+    SERIAL.lock().map_err(error)
+}
 static ACTIVE: Mutex<Option<(u64, Arc<AtomicBool>)>> = Mutex::new(None);
 static EDIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Serialize, Default)]
@@ -43,6 +47,9 @@ pub(crate) struct IndexStatus {
     pub ignored_faces: usize,
     pub undo_description: Option<String>,
     pub auto_grouping: bool,
+    pub model_id: &'static str,
+    pub needs_rebuild: bool,
+    pub rebuild_reason: Option<String>,
 }
 pub(super) fn cancel_all() {
     if let Ok(a) = ACTIVE.lock()
@@ -71,8 +78,11 @@ impl Drop for ActiveGuard {
 fn status(scan_id: u64) -> Result<IndexStatus, String> {
     let scan = scan(scan_id)?;
     let rotations = { current(&*session()?, scan_id)?.rotations.clone() };
+    let spec = ai::catalog::active(ai::ModelKind::People);
     let mut state = IndexStatus {
         scan_id,
+        model_id: spec.id,
+        needs_rebuild: spec.feature_version != faces::VERSION,
         total: scan
             .items
             .iter()
@@ -88,6 +98,7 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         .is_some_and(|(id, _)| *id == scan_id);
     if let Some(s) = Store::open(&scan, false)? {
         state.enabled = s.enabled()?;
+        state.needs_rebuild = ai::index_policy::needs_rebuild(&s.connection, spec, faces::VERSION)?;
         let records = s.records()?;
         for item in scan
             .items
@@ -97,7 +108,8 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
             if let Some(r) = records.get(&favorites::path_key(&item.file.relative))
                 && r.stamp == item.file.stamp.portable_key()
                 && r.rotation == rotations.get(&item.file.id).copied().unwrap_or(0)
-                && r.version == faces::VERSION
+                && r.geometry_version == faces::GEOMETRY_VERSION
+                && r.version == ai::catalog::active(ai::ModelKind::People).feature_version
             {
                 if r.error.is_some() {
                     state.failed += 1;
@@ -106,6 +118,9 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
                 }
             }
         }
+    }
+    if state.needs_rebuild {
+        state.rebuild_reason = Some("当前模型需要重新计算人脸特征，请手动重建人物索引。".into());
     }
     state.pending = state.total.saturating_sub(state.indexed + state.failed);
     let (pending, ignored, undo) = query::counts(scan_id)?;
@@ -119,6 +134,30 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
     }
     Ok(state)
 }
+pub(crate) fn model_impact(scan_id: u64, spec: &ai::catalog::ModelSpec) -> Result<usize, String> {
+    let scan = scan(scan_id)?;
+    let rotations = current(&*session()?, scan_id)?.rotations.clone();
+    let records = Store::open(&scan, false)?
+        .map(|s| s.records())
+        .transpose()?
+        .unwrap_or_default();
+    Ok(scan
+        .items
+        .iter()
+        .filter(|i| i.kind == super::Kind::Photo && i.preview_available)
+        .filter(|i| {
+            records
+                .get(&favorites::path_key(&i.file.relative))
+                .is_none_or(|r| {
+                    r.version != spec.feature_version
+                        || r.stamp != i.file.stamp.portable_key()
+                        || r.rotation != rotations.get(&i.file.id).copied().unwrap_or(0)
+                        || r.error.is_some()
+                })
+        })
+        .count())
+}
+
 #[tauri::command]
 pub(crate) async fn people_index_status(scan_id: u64) -> Result<IndexStatus, String> {
     tauri::async_runtime::spawn_blocking(move || status(scan_id))
@@ -134,7 +173,7 @@ fn update(
     let _serial = SERIAL.lock().map_err(error)?;
     let scan = scan(scan_id)?;
     let mut state = status(scan_id)?;
-    if automatic && (!state.enabled || !state.writable) {
+    if automatic && (!state.enabled || !state.writable || state.needs_rebuild) {
         return Ok(state);
     }
     if !state.writable {
@@ -156,12 +195,18 @@ fn update(
     super::scan(scan_id)?;
     let generation = MODEL_GENERATION.load(Ordering::Relaxed);
     let runtime = load()?;
+    if runtime.spec.id != state.model_id {
+        return Err("人物模型已变化，请重试。".into());
+    }
     let mut store = Store::open(&scan, true)?.ok_or("无法创建人物索引。")?;
     store
         .connection
         .execute("INSERT OR REPLACE INTO settings VALUES('enabled','1')", [])
         .map_err(error)?;
+    ai::index_policy::approve(&store.connection, runtime.spec)?;
     state.enabled = true;
+    state.needs_rebuild = false;
+    state.rebuild_reason = None;
     state.indexed = 0;
     state.failed = 0;
     let records = store.records()?;
@@ -188,7 +233,8 @@ fn update(
         if let Some(r) = records.get(&path)
             && r.stamp == item.file.stamp.portable_key()
             && r.rotation == rotation
-            && r.version == faces::VERSION
+            && r.geometry_version == faces::GEOMETRY_VERSION
+            && r.version == ai::catalog::active(ai::ModelKind::People).feature_version
             && (r.error.is_none() || automatic)
         {
             if r.error.is_none() {
@@ -212,7 +258,13 @@ fn update(
             if latest != rotation {
                 continue;
             }
-            let ids = store.save(&path, &item.file.stamp.portable_key(), rotation, &result)?;
+            let ids = store.save_for_model(
+                &path,
+                &item.file.stamp.portable_key(),
+                rotation,
+                &result,
+                runtime.spec.feature_version,
+            )?;
             let current_edits = EDIT_GENERATION.load(Ordering::Relaxed);
             if current_edits != edits {
                 groups = grouping::Groups::load(scan_id, policy.clone())?;
@@ -379,7 +431,8 @@ pub(crate) async fn people_index_issues(scan_id: u64, page: usize) -> Result<Pag
             if let Some(r) = records.get(&favorites::path_key(&i.file.relative))
                 && r.stamp == i.file.stamp.portable_key()
                 && r.rotation == rotations.get(&i.file.id).copied().unwrap_or(0)
-                && r.version == faces::VERSION
+                && r.geometry_version == faces::GEOMETRY_VERSION
+                && r.version == ai::catalog::active(ai::ModelKind::People).feature_version
                 && let Some(reason) = &r.error
             {
                 issues.push(Issue {

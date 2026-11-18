@@ -9,7 +9,9 @@ use tokenizers::{
     pre_tokenizers::bert::BertPreTokenizer, processors::bert::BertProcessing,
 };
 
-use super::{DIM, error};
+#[cfg(test)]
+use super::DIM;
+use super::{catalog::ModelSpec, error};
 
 static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -39,7 +41,8 @@ pub(crate) fn initialize_from(path: &Path) -> Result<(), String> {
 
 pub(crate) struct Runtime {
     vision: Mutex<Session>,
-    text: Mutex<Session>,
+    text: Option<Mutex<Session>>,
+    pub(crate) spec: &'static ModelSpec,
     tokenizer: Tokenizer,
 }
 
@@ -79,8 +82,13 @@ pub(crate) fn session(path: &Path) -> Result<Session, String> {
         .map_err(error)
 }
 
-pub(crate) fn normalize(mut vector: Vec<f32>) -> Result<Vec<f32>, String> {
-    if vector.len() != DIM || vector.iter().any(|v| !v.is_finite()) {
+#[cfg(test)]
+pub(crate) fn normalize(vector: Vec<f32>) -> Result<Vec<f32>, String> {
+    normalize_dim(vector, DIM)
+}
+
+pub(crate) fn normalize_dim(mut vector: Vec<f32>, dimension: usize) -> Result<Vec<f32>, String> {
+    if vector.len() != dimension || vector.iter().any(|v| !v.is_finite()) {
         return Err("模型返回了不兼容的向量。".into());
     }
     let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -94,40 +102,70 @@ pub(crate) fn normalize(mut vector: Vec<f32>) -> Result<Vec<f32>, String> {
 }
 
 /// Matches the pinned ChineseCLIPImageProcessor: RGB, square resize, no center crop.
+#[cfg(test)]
 pub(crate) fn pixels(image: RgbImage, rotation: u16) -> Vec<f32> {
+    pixels_at(image, rotation, 224)
+}
+
+fn pixels_at(image: RgbImage, rotation: u16, edge: usize) -> Vec<f32> {
     let image = match rotation {
         90 => image::imageops::rotate90(&image),
         180 => image::imageops::rotate180(&image),
         270 => image::imageops::rotate270(&image),
         _ => image,
     };
-    let image = image::imageops::resize(&image, 224, 224, image::imageops::FilterType::CatmullRom);
+    let image = image::imageops::resize(
+        &image,
+        edge as u32,
+        edge as u32,
+        image::imageops::FilterType::CatmullRom,
+    );
     let mean = [0.48145466, 0.4578275, 0.40821073];
     let std = [0.26862954, 0.261_302_6, 0.275_777_1];
-    let mut tensor = vec![0.0; 3 * 224 * 224];
+    let mut tensor = vec![0.0; 3 * edge * edge];
     for (index, pixel) in image.pixels().enumerate() {
         for c in 0..3 {
-            tensor[c * 224 * 224 + index] = (pixel[c] as f32 / 255.0 - mean[c]) / std[c];
+            tensor[c * edge * edge + index] = (pixel[c] as f32 / 255.0 - mean[c]) / std[c];
         }
     }
     tensor
 }
 
 impl Runtime {
+    #[cfg(test)]
     pub(crate) fn load(directory: &Path) -> Result<Self, String> {
+        Self::load_spec(
+            directory,
+            super::catalog::default_model(super::ModelKind::Search),
+        )
+    }
+    pub(crate) fn load_spec(directory: &Path, spec: &'static ModelSpec) -> Result<Self, String> {
+        let combined = spec.backend == "combined";
         let runtime = Self {
-            vision: Mutex::new(session(&directory.join("cn_clip_vision.onnx"))?),
-            text: Mutex::new(session(&directory.join("cn_clip_text.onnx"))?),
+            vision: Mutex::new(session(&directory.join(if combined {
+                "model.onnx"
+            } else {
+                "cn_clip_vision.onnx"
+            }))?),
+            text: if combined {
+                None
+            } else {
+                Some(Mutex::new(session(&directory.join("cn_clip_text.onnx"))?))
+            },
             tokenizer: tokenizer(&directory.join("vocab.txt"))?,
+            spec,
         };
         runtime.encode_text("照片")?;
         runtime.encode_image(
-            RgbImage::from_pixel(224, 224, image::Rgb([128, 128, 128])),
+            RgbImage::from_pixel(
+                spec.image_size as u32,
+                spec.image_size as u32,
+                image::Rgb([128, 128, 128]),
+            ),
             0,
         )?;
         Ok(runtime)
     }
-
     pub(crate) fn encode_text(&self, query: &str) -> Result<Vec<f32>, String> {
         if query.trim().is_empty() || query.len() > 4096 {
             return Err("请输入不超过 4096 字节的照片描述。".into());
@@ -139,62 +177,106 @@ impl Runtime {
             ids[i] = i64::from(*id);
             mask[i] = 1;
         }
-        let types = vec![0_i64; 52];
         let mut session = self
             .text
+            .as_ref()
+            .unwrap_or(&self.vision)
             .lock()
-            .map_err(|_| "文字推理状态异常，请重启软件。")?;
-        // Exported models differ in whether the all-zero segment IDs remain as an input.
+            .map_err(error)?;
         let names: Vec<_> = session
             .inputs()
             .iter()
-            .map(|input| input.name().to_owned())
+            .map(|v| v.name().to_owned())
             .collect();
         let mut inputs = Vec::new();
         for name in names {
-            let values = match name.as_str() {
-                "input_ids" => ids.clone(),
-                "attention_mask" => mask.clone(),
-                "token_type_ids" => types.clone(),
-                _ => return Err(format!("不兼容的文字模型输入：{name}")),
-            };
-            inputs.push((
-                name,
-                Tensor::from_array(([1_usize, 52], values))
-                    .map_err(error)?
-                    .into_dyn(),
-            ));
+            if name == "pixel_values" {
+                let e = self.spec.image_size;
+                inputs.push((
+                    name,
+                    Tensor::from_array(([1, 3, e, e], vec![0_f32; 3 * e * e]))
+                        .map_err(error)?
+                        .into_dyn(),
+                ));
+            } else {
+                let values = match name.as_str() {
+                    "input_ids" => ids.clone(),
+                    "attention_mask" => mask.clone(),
+                    "token_type_ids" => vec![0_i64; 52],
+                    _ => return Err(format!("不兼容的文字模型输入：{name}")),
+                };
+                inputs.push((
+                    name,
+                    Tensor::from_array(([1_usize, 52], values))
+                        .map_err(error)?
+                        .into_dyn(),
+                ));
+            }
         }
-        let outputs = session.run(inputs).map_err(error)?;
-        normalize(
+        let options = ort::session::RunOptions::new()
+            .map_err(error)?
+            .with_outputs(if self.text.is_none() {
+                ort::session::OutputSelector::no_default().with("text_embeds")
+            } else {
+                ort::session::OutputSelector::default()
+            });
+        let outputs = session.run_with_options(inputs, &options).map_err(error)?;
+        normalize_dim(
             outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(error)?
                 .1
                 .to_vec(),
+            self.spec.dimension,
         )
     }
-
     pub(crate) fn encode_image(&self, image: RgbImage, rotation: u16) -> Result<Vec<f32>, String> {
-        self.encode_pixels(pixels(image, rotation))
+        self.encode_pixels(pixels_at(image, rotation, self.spec.image_size))
     }
-
     pub(crate) fn encode_pixels(&self, pixels: Vec<f32>) -> Result<Vec<f32>, String> {
-        let mut session = self
-            .vision
-            .lock()
-            .map_err(|_| "图片推理状态异常，请重启软件。")?;
-        let name = session.inputs()[0].name().to_owned();
-        let value = Tensor::from_array(([1_usize, 3, 224, 224], pixels)).map_err(error)?;
-        let outputs = session
-            .run(ort::inputs![name.as_str() => value])
-            .map_err(error)?;
-        normalize(
+        let mut session = self.vision.lock().map_err(error)?;
+        let e = self.spec.image_size;
+        let mut inputs = vec![(
+            "pixel_values".to_owned(),
+            Tensor::from_array(([1_usize, 3, e, e], pixels))
+                .map_err(error)?
+                .into_dyn(),
+        )];
+        if self.text.is_none() {
+            for input in session.inputs() {
+                if input.name() == "pixel_values" {
+                    continue;
+                }
+                let values = if input.name() == "attention_mask" {
+                    vec![1_i64; 52]
+                } else {
+                    vec![0_i64; 52]
+                };
+                inputs.push((
+                    input.name().to_owned(),
+                    Tensor::from_array(([1_usize, 52], values))
+                        .map_err(error)?
+                        .into_dyn(),
+                ));
+            }
+        } else {
+            inputs[0].0 = session.inputs()[0].name().to_owned();
+        }
+        let options = ort::session::RunOptions::new()
+            .map_err(error)?
+            .with_outputs(if self.text.is_none() {
+                ort::session::OutputSelector::no_default().with("image_embeds")
+            } else {
+                ort::session::OutputSelector::default()
+            });
+        let outputs = session.run_with_options(inputs, &options).map_err(error)?;
+        normalize_dim(
             outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(error)?
                 .1
                 .to_vec(),
+            self.spec.dimension,
         )
     }
 }

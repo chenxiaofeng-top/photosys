@@ -112,6 +112,17 @@ jobs:
           export PHOTOSYS_PEOPLE_PACKAGE="$RUNNER_TEMP/photosys-people-test/photosys-people.zip"
           cargo test --locked --manifest-path src-tauri/Cargo.toml real_faces_install_incremental_cancel_and_restore -- --ignored --nocapture
 
+      - name: Verify all five native model options and offline imports
+        shell: bash
+        run: |
+          python scripts/prepare-model-options-test.py "$RUNNER_TEMP/photosys-model-options"
+          export PHOTOSYS_MODEL_OPTIONS_DIR="$RUNNER_TEMP/photosys-model-options"
+          export PHOTOSYS_MODEL_OPTIONS_PORTRAIT="$RUNNER_TEMP/photosys-people-test/lena.jpg"
+          export PHOTOSYS_MODEL_OPTIONS_METRICS="$RUNNER_TEMP/model-options-metrics.json"
+          cargo test --locked --manifest-path src-tauri/Cargo.toml real_model_options_install_infer_and_reference -- --ignored --nocapture --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml real_search_model_selection_manual_gate_cancel_resume_and_switch_back -- --ignored --nocapture --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml real_people_model_selection_keeps_manual_identity_and_requires_manual_start -- --ignored --nocapture --test-threads=1
+
       - name: Build desktop packages
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'

@@ -38,3 +38,17 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Additional search models (model selection v1)
+
+Chinese-CLIP ViT-L/14 and ViT-L/14@336px use the same upstream MIT license
+above. ONNX conversion sources:
+- Xenova/chinese-clip-vit-large-patch14, revision 82a6624751531459b3914fb6438cf0dff28c9e00
+- Xenova/chinese-clip-vit-large-patch14-336px, revision cf71bcf65498f8f49c82d084e7a03673ac801ed7
+
+The pinned FP32 combined graphs return `image_embeds` / `text_embeds`;
+only the requested embeddings are fetched. RGB square resize is 224 or 336,
+no center crop. Text uses the pinned upstream vocabulary and 52 BERT tokens.
+Outputs are normalized 768-dimensional vectors. B/16 remains 512-dimensional.
+File sizes, SHA-256 values and download paths are in ai-model-catalog.json.
+Model IDs and feature versions are distinct even when vector dimensions match.

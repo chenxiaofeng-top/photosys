@@ -1,7 +1,7 @@
 use super::{query, store::Store};
 use crate::ai::{
     error,
-    faces::{self, DIM, VERSION},
+    faces::{self},
 };
 use rusqlite::params;
 use serde::Deserialize;
@@ -35,7 +35,8 @@ impl Policy {
     }
     pub fn allowed(&self) -> bool {
         self.enabled
-            && self.version == VERSION
+            && self.version
+                == crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version
             && self.threshold.is_finite()
             && (0.0..1.0).contains(&self.threshold)
             && self.margin.is_finite()
@@ -74,14 +75,15 @@ pub(super) struct Groups {
     enabled: bool,
 }
 fn vector(bytes: &[u8]) -> Option<Vec<f32>> {
-    if bytes.len() != DIM * 4 {
+    if bytes.len() != crate::ai::catalog::active(crate::ai::ModelKind::People).dimension * 4 {
         return None;
     }
-    faces::normalize(
+    faces::normalize_dim(
         bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect(),
+        crate::ai::catalog::active(crate::ai::ModelKind::People).dimension,
     )
     .ok()
 }
@@ -96,7 +98,7 @@ impl Groups {
     }
     fn create(scan_id: u64, policy: Policy, enabled: bool) -> Result<Self, String> {
         let index = Index::new(&IndexOptions {
-            dimensions: DIM,
+            dimensions: crate::ai::catalog::active(crate::ai::ModelKind::People).dimension,
             metric: MetricKind::Cos,
             quantization: ScalarKind::F32,
             connectivity: 16,
@@ -118,14 +120,17 @@ impl Groups {
             let Some(s) = s else {
                 return Ok(Vec::new());
             };
-            let mut q=s.connection.prepare("WITH candidates AS(SELECT v.id,v.person_id,v.vector,v.manual,ROW_NUMBER() OVER(PARTITION BY v.person_id ORDER BY v.manual DESC,v.id) rank FROM visible_faces v JOIN people p ON p.id=v.person_id WHERE v.ignored=0 AND v.vector IS NOT NULL AND p.archived=0) SELECT id,person_id,vector FROM candidates WHERE rank=1 OR (manual=1 AND rank<=5) ORDER BY id").map_err(error)?;
-            q.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
-                ))
-            })
+            let mut q=s.connection.prepare("WITH candidates AS(SELECT v.id,v.person_id,v.vector,v.manual,ROW_NUMBER() OVER(PARTITION BY v.person_id ORDER BY v.manual DESC,v.id) rank FROM visible_faces v JOIN people p ON p.id=v.person_id JOIN media m ON m.path=v.path WHERE m.version=?1 AND m.error IS NULL AND v.ignored=0 AND v.vector IS NOT NULL AND p.archived=0) SELECT id,person_id,vector FROM candidates WHERE rank=1 OR (manual=1 AND rank<=5) ORDER BY id").map_err(error)?;
+            q.query_map(
+                [crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
             .map_err(error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(error)
@@ -155,7 +160,7 @@ impl Groups {
         let tx = s.connection.transaction().map_err(error)?;
         // A manual edit can occur while inference is running. Recheck all mutable state here.
         for id in ids {
-            let row:Option<(Vec<u8>,Vec<u8>)>=tx.query_row("SELECT path,vector FROM faces WHERE id=?1 AND active=1 AND ignored=0 AND manual=0 AND person_id IS NULL AND vector IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(error)?;
+            let row:Option<(Vec<u8>,Vec<u8>)>=tx.query_row("SELECT f.path,f.vector FROM faces f JOIN media m ON m.path=f.path WHERE f.id=?1 AND f.active=1 AND f.ignored=0 AND f.manual=0 AND f.person_id IS NULL AND f.vector IS NOT NULL AND m.version=?2 AND m.error IS NULL",params![id,crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(error)?;
             let Some((path, bytes)) = row else {
                 continue;
             };
@@ -216,11 +221,14 @@ impl Groups {
             let Some(s) = s else {
                 return Ok(Vec::new());
             };
-            let mut q=s.connection.prepare("SELECT id FROM visible_faces WHERE person_id IS NULL AND manual=0 AND ignored=0 AND vector IS NOT NULL ORDER BY id").map_err(error)?;
-            q.query_map([], |r| r.get(0))
-                .map_err(error)?
-                .collect::<Result<_, _>>()
-                .map_err(error)
+            let mut q=s.connection.prepare("SELECT v.id FROM visible_faces v JOIN media m ON m.path=v.path WHERE v.person_id IS NULL AND v.manual=0 AND v.ignored=0 AND v.vector IS NOT NULL AND m.version=?1 AND m.error IS NULL ORDER BY v.id").map_err(error)?;
+            q.query_map(
+                [crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version],
+                |r| r.get(0),
+            )
+            .map_err(error)?
+            .collect::<Result<_, _>>()
+            .map_err(error)
         })
     }
 }

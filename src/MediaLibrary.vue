@@ -647,7 +647,7 @@ async function performFileAction(action: FileAction) {
     </header>
 
     <AiSearchSettings v-show="!peopleMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
-      @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" />
+      @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" @model-changed="results = undefined; requestedPage = 0; aiRevision++" />
 
     <div v-if="task === 'starting' || task === 'scanning'" class="scan-status" role="status">
       <ElIcon class="is-loading" aria-hidden="true"><Loading /></ElIcon>

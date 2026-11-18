@@ -5,9 +5,17 @@ export interface ModelStatus {
   resumableBytes: number;
   message: string | null;
   modelId: string;
+  activeModelId: string;
+  activeReady: boolean;
+}
+
+export interface ModelOption {
+  id: string; kind: "search" | "people"; name: string; description: string; measurement: string; cpu: string; license: string; source: string; featureVersion: string; dimension: number; imageSize: number;
+  assets: { size: number }[];
 }
 
 export interface IndexStatus {
+  modelId: string; needsRebuild: boolean; rebuildReason: string | null;
   scanId: number;
   enabled: boolean;
   running: boolean;

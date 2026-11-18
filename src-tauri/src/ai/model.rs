@@ -1,5 +1,6 @@
 use std::fs;
-#[cfg(test)] use std::fs::File;
+#[cfg(test)]
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -12,10 +13,11 @@ use tauri::{AppHandle, Manager, ipc::Channel};
 use tauri_plugin_dialog::DialogExt;
 
 use super::{
-    MODEL_ID, download, error,
+    download, error,
     inference::{self, Runtime},
 };
 
+pub(crate) static PEOPLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MODEL_GENERATION: AtomicU64 = AtomicU64::new(0);
 static TASK: Mutex<()> = Mutex::new(());
 static CANCEL: AtomicBool = AtomicBool::new(false);
@@ -27,42 +29,30 @@ struct Loaded {
     runtime: Arc<Runtime>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub(crate) struct Asset {
     pub name: &'static str,
+    pub path: &'static str,
     pub size: u64,
     pub sha: &'static str,
     pub repository: &'static str,
     pub revision: &'static str,
 }
 
-pub(crate) const ASSETS: &[Asset] = &[
-    Asset {
-        name: "cn_clip_text.onnx",
-        size: 409585120,
-        sha: "5ddc2d8971b09acda8063048003d18cca9b587f089a1c0a4df7d35624bd0fcea",
-        repository: "felixdu/chinese-clip-vit-base-patch16-onnx",
-        revision: "47080d16c631d8416d2e6b155c59f8fd2c322e98",
-    },
-    Asset {
-        name: "cn_clip_vision.onnx",
-        size: 345839119,
-        sha: "980020bf226e528a202de26c6a6186df125b74c612b09cfcd797a082e046b628",
-        repository: "felixdu/chinese-clip-vit-base-patch16-onnx",
-        revision: "47080d16c631d8416d2e6b155c59f8fd2c322e98",
-    },
-    Asset {
-        name: "vocab.txt",
-        size: 109540,
-        sha: "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
-        repository: "OFA-Sys/chinese-clip-vit-base-patch16",
-        revision: "36e679e65c2a2fead755ae21162091293ad37834",
-    },
-];
+#[cfg(test)]
+static ASSETS: std::sync::LazyLock<Vec<Asset>> = std::sync::LazyLock::new(|| {
+    super::catalog::default_model(ModelKind::Search)
+        .assets
+        .clone()
+});
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ModelKind { #[default] Search, People }
+pub(crate) enum ModelKind {
+    #[default]
+    Search,
+    People,
+}
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +70,8 @@ pub(crate) struct ModelStatus {
     pub(crate) resumable_bytes: u64,
     pub(crate) message: Option<String>,
     pub(crate) model_id: &'static str,
+    pub(crate) active_model_id: &'static str,
+    pub(crate) active_ready: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -92,7 +84,7 @@ pub(crate) struct InstallProgress {
     pub(super) source: Source,
 }
 
-fn config(app: &AppHandle) -> Result<PathBuf, String> {
+pub(super) fn config(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
         .app_config_dir()
@@ -125,18 +117,20 @@ pub(super) fn regular_file(path: &Path) -> Result<std::fs::Metadata, String> {
     Ok(metadata)
 }
 
+#[cfg(test)]
 pub(crate) fn installed_directory(base: &Path) -> PathBuf {
-    base.join(MODEL_ID)
+    base.join(super::MODEL_ID)
 }
 
+#[cfg(test)]
 fn staging_directory(base: &Path) -> PathBuf {
-    base.join(format!(".{MODEL_ID}.partial"))
+    base.join(format!(".{}.partial", super::MODEL_ID))
 }
 
-
+#[cfg(test)]
 pub(crate) fn verify_assets(directory: &Path, cancel: &AtomicBool) -> Result<(), String> {
     regular_directory(directory)?;
-    for asset in ASSETS {
+    for asset in &*ASSETS {
         let path = directory.join(asset.name);
         if regular_file(&path)?.len() != asset.size || download::digest(&path, cancel)? != asset.sha
         {
@@ -146,6 +140,7 @@ pub(crate) fn verify_assets(directory: &Path, cancel: &AtomicBool) -> Result<(),
     Ok(())
 }
 
+#[cfg(test)]
 fn stamps(directory: &Path) -> Result<Vec<(u64, std::time::SystemTime)>, String> {
     ASSETS
         .iter()
@@ -157,68 +152,118 @@ fn stamps(directory: &Path) -> Result<Vec<(u64, std::time::SystemTime)>, String>
 }
 
 pub(crate) fn runtime(app: &AppHandle) -> Result<Arc<Runtime>, String> {
+    runtime_for(app, super::catalog::active(ModelKind::Search))
+}
+fn runtime_for(
+    app: &AppHandle,
+    spec: &'static super::catalog::ModelSpec,
+) -> Result<Arc<Runtime>, String> {
     let base = selected_directory(app)?.ok_or("请先选择模型目录并安装模型。")?;
     regular_directory(&base)?;
-    let directory = installed_directory(&base);
+    let directory = base.join(spec.id);
     regular_directory(&directory)?;
-    let current = stamps(&directory).map_err(|e| format!("模型不完整，请下载安装。{e}"))?;
-    let mut loaded = LOADED.lock().map_err(|_| "模型状态异常，请重启软件。")?;
+    let current = super::packages::stamps(&directory, &spec.assets)?;
+    let mut loaded = LOADED.lock().map_err(error)?;
     if let Some(model) = loaded.as_ref()
         && model.directory == directory
         && model.stamps == current
     {
         return Ok(model.runtime.clone());
     }
-    verify_assets(&directory, &AtomicBool::new(false))?;
+    verify_spec(&directory, spec)?;
     inference::initialize(app)?;
-    let runtime = Arc::new(Runtime::load(&directory)?);
-    *loaded = Some(Loaded {
-        directory,
-        stamps: current,
-        runtime: runtime.clone(),
-    });
+    let runtime = Arc::new(Runtime::load_spec(&directory, spec)?);
+    // Inspecting an inactive model must not evict the active model or keep both resident.
+    if spec.id == super::catalog::active(ModelKind::Search).id {
+        *loaded = Some(Loaded {
+            directory,
+            stamps: current,
+            runtime: runtime.clone(),
+        });
+    }
     Ok(runtime)
 }
-
-fn status(app: &AppHandle, verify: bool) -> Result<ModelStatus, String> {
+pub(super) fn verify_spec(
+    directory: &Path,
+    spec: &super::catalog::ModelSpec,
+) -> Result<(), String> {
+    regular_directory(directory)?;
+    for a in &spec.assets {
+        let path = directory.join(a.name);
+        if regular_file(&path)?.len() != a.size
+            || download::digest(&path, &AtomicBool::new(false))? != a.sha
+        {
+            return Err(format!("{} 校验失败，请重新安装。", a.name));
+        }
+    }
+    Ok(())
+}
+fn status_for(
+    app: &AppHandle,
+    verify: bool,
+    spec: &'static super::catalog::ModelSpec,
+) -> Result<ModelStatus, String> {
     let base = selected_directory(app)?;
-    let total_bytes = ASSETS.iter().map(|a| a.size).sum();
-    let mut status = ModelStatus {
+    let active = super::catalog::active(ModelKind::Search);
+    let mut value = ModelStatus {
         directory: base.as_ref().map(|p| p.to_string_lossy().into_owned()),
         ready: false,
-        total_bytes,
+        total_bytes: spec.assets.iter().map(|a| a.size).sum(),
         resumable_bytes: 0,
         message: None,
-        model_id: MODEL_ID,
+        model_id: spec.id,
+        active_model_id: active.id,
+        active_ready: false,
     };
     if let Some(base) = base {
-        let staging = staging_directory(&base);
-        status.resumable_bytes = ASSETS
+        let staging = base.join(format!(".{}.partial", spec.id));
+        value.resumable_bytes = spec
+            .assets
             .iter()
             .map(|a| regular_file(&staging.join(a.name)).map_or(0, |m| m.len().min(a.size)))
             .sum();
         if !verify {
-            status.message = Some("正在安装模型…".into());
-        } else if installed_directory(&base).is_dir() {
-            match runtime(app) {
-                Ok(_) => status.ready = true,
-                Err(e) => status.message = Some(e),
+            value.message = Some("正在安装模型…".into());
+        } else {
+            if base.join(spec.id).exists() {
+                match runtime_for(app, spec) {
+                    Ok(_) => value.ready = true,
+                    Err(e) => value.message = Some(e),
+                }
+            } else if let Err(e) = regular_directory(&base) {
+                value.message = Some(e);
             }
-        } else if let Err(e) = regular_directory(&base) {
-            status.message = Some(e);
+            value.active_ready = if spec.id == active.id {
+                value.ready
+            } else {
+                runtime(app).is_ok()
+            };
         }
     }
-    Ok(status)
+    Ok(value)
 }
-
+fn status(app: &AppHandle, verify: bool) -> Result<ModelStatus, String> {
+    status_for(app, verify, super::catalog::active(ModelKind::Search))
+}
 #[tauri::command]
-pub(crate) async fn ai_model_status(app: AppHandle, kind: Option<ModelKind>) -> Result<ModelStatus, String> {
-    if matches!(kind, Some(ModelKind::People)) {
-        return tauri::async_runtime::spawn_blocking(move || super::people_model::status(&app)).await.map_err(error)?;
-    }
-    tauri::async_runtime::spawn_blocking(move || match TASK.try_lock() {
-        Ok(_task) => status(&app, true),
-        Err(_) => status(&app, false),
+pub(crate) async fn ai_model_status(
+    app: AppHandle,
+    kind: Option<ModelKind>,
+    model_id: Option<String>,
+) -> Result<ModelStatus, String> {
+    let kind = kind.unwrap_or_default();
+    let spec = match model_id {
+        Some(id) => super::catalog::find(kind, &id)?,
+        None => super::catalog::active(kind),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        if kind == ModelKind::People {
+            return super::people_model::status_for(&app, spec);
+        }
+        match TASK.try_lock() {
+            Ok(_task) => status_for(&app, true, spec),
+            Err(_) => status_for(&app, false, spec),
+        }
     })
     .await
     .map_err(error)?
@@ -231,12 +276,17 @@ pub(crate) async fn ai_set_model_directory(
     kind: Option<ModelKind>,
 ) -> Result<ModelStatus, String> {
     if matches!(kind, Some(ModelKind::People)) {
-        return tauri::async_runtime::spawn_blocking(move || super::people_model::set_directory(&app, &directory)).await.map_err(error)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            super::people_model::set_directory(&app, &directory)
+        })
+        .await
+        .map_err(error)?;
     }
     tauri::async_runtime::spawn_blocking(move || {
         let _task = TASK
             .try_lock()
             .map_err(|_| "请先取消正在进行的模型安装。")?;
+        let _index = crate::library::ai_search::stop_and_wait()?;
         let path = Path::new(&directory);
         if !path.is_absolute() {
             return Err("请选择完整的模型目录路径。".into());
@@ -257,7 +307,10 @@ pub(crate) async fn ai_set_model_directory(
 
 #[tauri::command]
 pub(crate) fn ai_cancel_install(kind: Option<ModelKind>) {
-    if matches!(kind, Some(ModelKind::People)) { super::people_model::cancel_install(); return; }
+    if matches!(kind, Some(ModelKind::People)) {
+        super::people_model::cancel_install();
+        return;
+    }
     CANCEL.store(true, Ordering::Relaxed);
 }
 
@@ -286,23 +339,46 @@ pub(crate) async fn ai_choose_model_package(
     .map_err(error)?
 }
 
-
-fn install(
+fn install_spec(
     app: &AppHandle,
+    spec: &'static super::catalog::ModelSpec,
     source: Source,
     package: Option<&Path>,
     channel: &Channel<InstallProgress>,
 ) -> Result<ModelStatus, String> {
     let _task = TASK.try_lock().map_err(|_| "模型安装任务正在运行。")?;
     CANCEL.store(false, Ordering::Relaxed);
-    MODEL_GENERATION.fetch_add(1, Ordering::Relaxed);
     let base = selected_directory(app)?.ok_or("请先选择模型安装目录。")?;
-    install_into(&base, source, package, channel, || {
-        inference::initialize(app)
-    })?;
-    status(app, true)
+    // Installation does not select the target. Stop only when repairing active files.
+    let _index = if spec.id == super::catalog::active(ModelKind::Search).id {
+        Some(crate::library::ai_search::stop_and_wait()?)
+    } else {
+        None
+    };
+    super::packages::install(
+        &base,
+        spec.id,
+        &spec.assets,
+        &CANCEL,
+        source,
+        package,
+        channel,
+        include_str!("../../../scripts/AI-MODEL-NOTICES.md"),
+        || {
+            inference::initialize(app)?;
+            Runtime::load_spec(&base.join(format!(".{}.partial", spec.id)), spec)
+        },
+        || {
+            if spec.id == super::catalog::active(ModelKind::Search).id {
+                *LOADED.lock().map_err(error)? = None;
+            }
+            Ok(())
+        },
+    )?;
+    drop(_index);
+    status_for(app, true, spec)
 }
-
+#[cfg(test)]
 fn install_into(
     base: &Path,
     source: Source,
@@ -310,19 +386,29 @@ fn install_into(
     channel: &Channel<InstallProgress>,
     initialize: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let (checked_stamps, checked_runtime) = super::packages::install(
-        base, MODEL_ID, ASSETS, &CANCEL, source, package, channel,
+    let spec = super::catalog::default_model(ModelKind::Search);
+    let (stamps, runtime) = super::packages::install(
+        base,
+        spec.id,
+        &spec.assets,
+        &CANCEL,
+        source,
+        package,
+        channel,
         include_str!("../../../scripts/AI-MODEL-NOTICES.md"),
-        || { initialize()?; Runtime::load(&staging_directory(base)).map(Arc::new) },
-        || { *LOADED.lock().map_err(|_| "模型状态异常。")? = None; Ok(()) },
+        || {
+            initialize()?;
+            Runtime::load_spec(&staging_directory(base), spec).map(Arc::new)
+        },
+        || Ok(()),
     )?;
-    MODEL_GENERATION.fetch_add(1, Ordering::Relaxed);
-    *LOADED.lock().map_err(|_| "模型状态异常。")? = Some(Loaded {
-        directory: installed_directory(base), stamps: checked_stamps, runtime: checked_runtime,
+    *LOADED.lock().map_err(error)? = Some(Loaded {
+        directory: installed_directory(base),
+        stamps,
+        runtime,
     });
     Ok(())
 }
-
 #[tauri::command]
 pub(crate) async fn ai_install_model(
     app: AppHandle,
@@ -330,12 +416,76 @@ pub(crate) async fn ai_install_model(
     package: Option<String>,
     progress: Channel<InstallProgress>,
     kind: Option<ModelKind>,
+    model_id: Option<String>,
 ) -> Result<ModelStatus, String> {
-    if matches!(kind, Some(ModelKind::People)) {
-        return tauri::async_runtime::spawn_blocking(move || super::people_model::install(&app, source, package.as_deref().map(Path::new), &progress)).await.map_err(error)?;
-    }
+    let kind = kind.unwrap_or_default();
+    let spec = match model_id {
+        Some(id) => super::catalog::find(kind, &id)?,
+        None => super::catalog::active(kind),
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        install(&app, source, package.as_deref().map(Path::new), &progress)
+        if kind == ModelKind::People {
+            super::people_model::install_spec(
+                &app,
+                spec,
+                source,
+                package.as_deref().map(Path::new),
+                &progress,
+            )
+        } else {
+            install_spec(
+                &app,
+                spec,
+                source,
+                package.as_deref().map(Path::new),
+                &progress,
+            )
+        }
+    })
+    .await
+    .map_err(error)?
+}
+pub(super) fn persist_choice(
+    app: &AppHandle,
+    spec: &super::catalog::ModelSpec,
+) -> Result<(), String> {
+    let config = super::catalog::selection_path(app, spec.kind)?;
+    let parent = config.parent().ok_or("缺少配置目录。")?;
+    fs::create_dir_all(parent).map_err(error)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(error)?;
+    temp.write_all(spec.id.as_bytes()).map_err(error)?;
+    temp.as_file().sync_all().map_err(error)?;
+    temp.persist(config).map_err(error)?;
+    super::catalog::select(spec);
+    Ok(())
+}
+#[tauri::command]
+pub(crate) async fn ai_activate_model(
+    app: AppHandle,
+    kind: Option<ModelKind>,
+    model_id: String,
+) -> Result<ModelStatus, String> {
+    let kind = kind.unwrap_or_default();
+    let spec = super::catalog::find(kind, &model_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if kind == ModelKind::People {
+            return super::people_model::activate(&app, spec);
+        }
+        let _task = TASK.try_lock().map_err(|_| "请等待模型安装结束。")?;
+        let _index = crate::library::ai_search::stop_and_wait()?;
+        // Validate before committing. On failure the selection and old cache survive.
+        let runtime = runtime_for(&app, spec)?;
+        let base = selected_directory(&app)?.ok_or("缺少模型目录。")?;
+        let directory = base.join(spec.id);
+        let stamps = super::packages::stamps(&directory, &spec.assets)?;
+        persist_choice(&app, spec)?;
+        MODEL_GENERATION.fetch_add(1, Ordering::Relaxed);
+        *LOADED.lock().map_err(error)? = Some(Loaded {
+            stamps,
+            directory,
+            runtime,
+        });
+        status_for(&app, true, spec)
     })
     .await
     .map_err(error)?
@@ -353,7 +503,7 @@ mod tests {
                 .all(|a| a.revision.len() == 40 && a.sha.len() == 64)
         );
         let temp = tempfile::tempdir().unwrap();
-        for a in ASSETS {
+        for a in &*ASSETS {
             fs::write(temp.path().join(a.name), b"broken").unwrap();
         }
         assert!(verify_assets(temp.path(), &AtomicBool::new(false)).is_err());
@@ -467,4 +617,32 @@ mod tests {
             vocabulary
         );
     }
+}
+
+#[tauri::command]
+pub(crate) async fn ai_model_change_impact(
+    scan_id: u64,
+    kind: Option<ModelKind>,
+    model_id: String,
+) -> Result<usize, String> {
+    let kind = kind.unwrap_or_default();
+    let spec = super::catalog::find(kind, &model_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if kind == ModelKind::People {
+            crate::library::people::model_impact(scan_id, spec)
+        } else {
+            crate::library::ai_search::model_impact(scan_id, spec)
+        }
+    })
+    .await
+    .map_err(error)?
+}
+
+#[tauri::command]
+pub(crate) fn ai_open_model_source(
+    kind: Option<ModelKind>,
+    model_id: String,
+) -> Result<(), String> {
+    let spec = super::catalog::find(kind.unwrap_or_default(), &model_id)?;
+    tauri_plugin_opener::open_url(spec.source, None::<&str>).map_err(error)
 }

@@ -896,3 +896,292 @@ fn evaluate_labeled_people() {
     );
     *session().unwrap() = None;
 }
+
+#[test]
+fn model_change_keeps_unique_faces_manual_corrections_ignored_and_undo() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("people.sqlite");
+    let mut store = Store::at(&path, true).unwrap().unwrap();
+    let mut second = face(1);
+    second.bbox[0] = 0.6;
+    let old = store
+        .save(
+            b"family.jpg",
+            b"same",
+            0,
+            &Ok(vec![face(0), second.clone()]),
+        )
+        .unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: vec![old[0]],
+            person_id: None,
+            name: Some("妈妈".into()),
+        })
+        .unwrap();
+    store
+        .edit(Edit::Ignore {
+            face_ids: vec![old[1]],
+        })
+        .unwrap();
+    let mut new = face(0);
+    new.vector = Some(vec![1.; 512]);
+    second.vector = Some(vec![1.; 512]);
+    let version = "yunet640-auraface112-align5-v1";
+    let ids = store
+        .save_for_model(
+            b"family.jpg",
+            b"same",
+            0,
+            &Ok(vec![second.clone(), new.clone()]),
+            version,
+        )
+        .unwrap();
+    assert_eq!(ids, vec![old[1], old[0]]);
+    let (person, manual, active, review): (i64, bool, bool, bool) = store
+        .connection
+        .query_row(
+            "SELECT person_id,manual,active,review FROM faces WHERE id=?1",
+            [old[0]],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(manual && active && !review);
+    assert!(person > 0);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT length(vector) FROM faces WHERE id=?1",
+                [old[0]],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        512 * 4
+    );
+    drop(store);
+    let mut store = Store::at(&path, true).unwrap().unwrap();
+    store.undo().unwrap();
+    assert!(
+        !store
+            .connection
+            .query_row("SELECT ignored FROM faces WHERE id=?1", [old[1]], |r| r
+                .get::<_, bool>(0))
+            .unwrap()
+    );
+    // A failed re-embedding does not erase organization, including after a retry.
+    store
+        .save_for_model(
+            b"family.jpg",
+            b"same",
+            0,
+            &Err("temporary inference failure".into()),
+            faces::VERSION,
+        )
+        .unwrap();
+    let ids = store
+        .save_for_model(
+            b"family.jpg",
+            b"same",
+            0,
+            &Ok(vec![new, second]),
+            faces::VERSION,
+        )
+        .unwrap();
+    assert_eq!(ids, old);
+    store.undo().unwrap();
+    assert!(
+        store
+            .connection
+            .query_row(
+                "SELECT person_id IS NULL FROM faces WHERE id=?1",
+                [old[0]],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+#[test]
+fn model_change_never_transfers_ambiguous_or_replaced_faces() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::at(&temp.path().join("people.sqlite"), true)
+        .unwrap()
+        .unwrap();
+    let ids = store.save(b"a", b"stamp", 0, &Ok(vec![face(0)])).unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: ids.clone(),
+            person_id: None,
+            name: Some("家人".into()),
+        })
+        .unwrap();
+    let fresh = store
+        .save_for_model(
+            b"a",
+            b"stamp",
+            0,
+            &Ok(vec![face(0), face(1)]),
+            "yunet640-auraface112-align5-v1",
+        )
+        .unwrap();
+    assert!(!fresh.contains(&ids[0]));
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT active=0 AND review=1 FROM faces WHERE id=?1",
+                [ids[0]],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+        true
+    );
+    let newer = store
+        .save_for_model(b"a", b"changed", 90, &Ok(vec![face(0)]), faces::VERSION)
+        .unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT person_id IS NULL FROM faces WHERE id=?1",
+                [newer[0]],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+        true
+    );
+}
+#[test]
+fn legacy_people_schema_reads_without_writes_and_migrates_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("people.sqlite");
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.execute_batch("CREATE TABLE media(path BLOB PRIMARY KEY,stamp BLOB,rotation INTEGER,version TEXT,error TEXT);PRAGMA user_version=1;").unwrap();
+    c.execute(
+        "INSERT INTO media VALUES(?1,?2,0,?3,NULL)",
+        params![b"a", b"same", faces::VERSION],
+    )
+    .unwrap();
+    drop(c);
+    let store = Store::at(&path, false).unwrap().unwrap();
+    assert_eq!(
+        store.records().unwrap()[b"a".as_slice()].geometry_version,
+        faces::GEOMETRY_VERSION
+    );
+    drop(store);
+    let store = Store::at(&path, true).unwrap().unwrap();
+    assert_eq!(
+        store.records().unwrap()[b"a".as_slice()].geometry_version,
+        faces::GEOMETRY_VERSION
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+#[ignore = "requires PHOTOSYS_MODEL_OPTIONS_DIR and PHOTOSYS_MODEL_OPTIONS_PORTRAIT; run alone"]
+fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start() {
+    let _session = TEST_SESSION.lock().unwrap();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ai::catalog::select(ai::catalog::default_model(ai::ModelKind::People));
+        }
+    }
+    let _restore = Restore;
+    let models =
+        std::path::PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_DIR").expect("models"));
+    let portrait = std::path::PathBuf::from(
+        std::env::var_os("PHOTOSYS_MODEL_OPTIONS_PORTRAIT").expect("portrait"),
+    );
+    let name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    ai::inference::initialize_from(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries/onnxruntime")
+            .join(std::env::consts::ARCH)
+            .join(name),
+    )
+    .unwrap();
+    let album = tempfile::tempdir().unwrap();
+    fs::copy(portrait, album.path().join("portrait.jpg")).unwrap();
+    let id = open(album.path());
+    let old = ai::catalog::default_model(ai::ModelKind::People);
+    ai::catalog::select(old);
+    let runtime = Arc::new(FaceRuntime::load_spec(&models.join(old.id), old).unwrap());
+    assert_eq!(
+        update(id, false, &Channel::new(|_| Ok(())), || Ok(runtime.clone()))
+            .unwrap()
+            .indexed,
+        1
+    );
+    drop(runtime);
+    let cards = query::faces(id, FaceScope::Pending, None, None, 0).unwrap();
+    assert!(!cards.items.is_empty());
+    let face_id = cards.items[0].id;
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: vec![face_id],
+            person_id: None,
+            name: Some("家人".into()),
+        })
+        .unwrap();
+    drop(store);
+    let person = query::people(id, "家人", 0).unwrap().items[0].id;
+    let new = ai::catalog::find(ai::ModelKind::People, "yunet-auraface-fp32-v1").unwrap();
+    ai::catalog::select(new);
+    assert!(status(id).unwrap().needs_rebuild);
+    assert_eq!(
+        query::photos(id, person, &all(), Sort::DateAsc, 0)
+            .unwrap()
+            .total,
+        1
+    );
+    update(id, true, &Channel::new(|_| Ok(())), || {
+        panic!("must wait for manual rebuild")
+    })
+    .unwrap();
+    let runtime = Arc::new(FaceRuntime::load_spec(&models.join(new.id), new).unwrap());
+    let result = update(id, false, &Channel::new(|_| Ok(())), || Ok(runtime.clone())).unwrap();
+    assert_eq!(result.indexed, 1);
+    assert!(!result.needs_rebuild);
+    assert!(!result.auto_grouping);
+    let cards = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
+    assert_eq!(cards.items[0].id, face_id);
+    assert!(cards.items[0].manual);
+    assert!(!cards.items[0].needs_review);
+    let store = Store::open(&scan, false).unwrap().unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT length(vector) FROM faces WHERE id=?1",
+                [face_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        512 * 4
+    );
+    drop(store);
+    ai::catalog::select(old);
+    assert!(status(id).unwrap().needs_rebuild);
+    assert_eq!(
+        query::photos(id, person, &all(), Sort::DateAsc, 0)
+            .unwrap()
+            .total,
+        1
+    );
+    *session().unwrap() = None;
+}

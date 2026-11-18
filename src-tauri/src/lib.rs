@@ -113,8 +113,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            ai::initialize_choices(app.handle()).map_err(std::io::Error::other)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            ai::catalog::ai_model_catalog,
+            ai::ai_activate_model,
+            ai::ai_model_change_impact,
+            ai::ai_open_model_source,
             ai::ai_model_status,
             ai::ai_set_model_directory,
             ai::ai_install_model,

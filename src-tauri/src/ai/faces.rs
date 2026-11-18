@@ -13,8 +13,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+#[cfg(test)]
 pub(crate) const DIM: usize = 128;
 pub(crate) const VERSION: &str = "yunet640-sface112-align5-v1";
+pub(crate) const GEOMETRY_VERSION: &str = "yunet640-bgr-align5-v1";
 const EDGE: usize = 640;
 pub(crate) const TEMPLATE: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
@@ -39,9 +41,14 @@ pub(crate) struct Detection {
 pub(crate) struct FaceRuntime {
     detector: Mutex<Session>,
     recognizer: Mutex<Session>,
+    pub(crate) spec: &'static super::catalog::ModelSpec,
 }
-pub(crate) fn normalize(mut v: Vec<f32>) -> Result<Vec<f32>, String> {
-    if v.len() != DIM || v.iter().any(|x| !x.is_finite()) {
+#[cfg(test)]
+pub(crate) fn normalize(v: Vec<f32>) -> Result<Vec<f32>, String> {
+    normalize_dim(v, DIM)
+}
+pub(crate) fn normalize_dim(mut v: Vec<f32>, dimension: usize) -> Result<Vec<f32>, String> {
+    if v.len() != dimension || v.iter().any(|x| !x.is_finite()) {
         return Err("人物模型返回无效特征。".into());
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -134,14 +141,29 @@ pub(crate) fn align(image: &RgbImage, points: &[[f32; 2]; 5]) -> Result<RgbImage
     }))
 }
 impl FaceRuntime {
+    #[cfg(test)]
     pub(crate) fn load(directory: &Path) -> Result<Self, String> {
+        Self::load_spec(
+            directory,
+            super::catalog::default_model(super::ModelKind::People),
+        )
+    }
+    pub(crate) fn load_spec(
+        directory: &Path,
+        spec: &'static super::catalog::ModelSpec,
+    ) -> Result<Self, String> {
         let runtime = Self {
+            spec,
             detector: Mutex::new(inference::session(
                 &directory.join("face_detection_yunet_2023mar.onnx"),
             )?),
-            recognizer: Mutex::new(inference::session(
-                &directory.join("face_recognition_sface_2021dec.onnx"),
-            )?),
+            recognizer: Mutex::new(inference::session(&directory.join(
+                if spec.backend == "auraface" {
+                    "glintr100.onnx"
+                } else {
+                    "face_recognition_sface_2021dec.onnx"
+                },
+            ))?),
         };
         runtime.detect(&RgbImage::new(640, 640))?;
         runtime.encode(&RgbImage::from_pixel(112, 112, image::Rgb([127, 127, 127])))?;
@@ -250,18 +272,24 @@ impl FaceRuntime {
         let mut pixels = vec![0.; 3 * 112 * 112];
         for (i, p) in image.pixels().enumerate() {
             for c in 0..3 {
-                pixels[c * 112 * 112 + i] = p[c] as f32;
+                pixels[c * 112 * 112 + i] = if self.spec.backend == "auraface" {
+                    (p[c] as f32 - 127.5) / 127.5
+                } else {
+                    p[c] as f32
+                };
             }
         }
         let mut session = self.recognizer.lock().map_err(error)?;
         let input = Tensor::from_array(([1usize, 3, 112, 112], pixels)).map_err(error)?;
-        let out = session.run(ort::inputs!["data"=>input]).map_err(error)?;
-        normalize(
+        let name = session.inputs()[0].name().to_owned();
+        let out = session.run(vec![(name, input)]).map_err(error)?;
+        normalize_dim(
             out[0]
                 .try_extract_tensor::<f32>()
                 .map_err(error)?
                 .1
                 .to_vec(),
+            self.spec.dimension,
         )
     }
     pub(crate) fn analyze(

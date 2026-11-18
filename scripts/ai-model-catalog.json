@@ -1,0 +1,170 @@
+[
+  {
+    "id": "chinese-clip-vit-b16-fp32-v1",
+    "kind": "search",
+    "name": "Chinese-CLIP B/16 · 均衡版",
+    "description": "默认选择，适合日常中文照片内容搜索。约 755 MB；现有小样本验证不代表家庭相册准确率。",
+    "cpu": "较低，适合普通电脑",
+    "license": "MIT",
+    "source": "https://github.com/OFA-Sys/Chinese-CLIP",
+    "featureVersion": "cnclip-b16-fp32-rgb224-bicubic-v1",
+    "dimension": 512,
+    "imageSize": 224,
+    "backend": "split",
+    "assets": [
+      {
+        "name": "cn_clip_text.onnx",
+        "size": 409585120,
+        "sha": "5ddc2d8971b09acda8063048003d18cca9b587f089a1c0a4df7d35624bd0fcea",
+        "repository": "felixdu/chinese-clip-vit-base-patch16-onnx",
+        "revision": "47080d16c631d8416d2e6b155c59f8fd2c322e98",
+        "path": "cn_clip_text.onnx"
+      },
+      {
+        "name": "cn_clip_vision.onnx",
+        "size": 345839119,
+        "sha": "980020bf226e528a202de26c6a6186df125b74c612b09cfcd797a082e046b628",
+        "repository": "felixdu/chinese-clip-vit-base-patch16-onnx",
+        "revision": "47080d16c631d8416d2e6b155c59f8fd2c322e98",
+        "path": "cn_clip_vision.onnx"
+      },
+      {
+        "name": "vocab.txt",
+        "size": 109540,
+        "sha": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+        "repository": "OFA-Sys/chinese-clip-vit-base-patch16",
+        "revision": "36e679e65c2a2fead755ae21162091293ad37834",
+        "path": "vocab.txt"
+      }
+    ],
+    "measurement": "本机 CPU 小样本：文字查询约 0.06 秒，单图约 0.20 秒。 i7-9750H、已加载模型，实际速度受电脑和照片影响；家庭相册准确率尚未验收。"
+  },
+  {
+    "id": "chinese-clip-vit-l14-fp32-v1",
+    "kind": "search",
+    "name": "Chinese-CLIP L/14 · 增强版",
+    "description": "更大的图文模型，公开中文检索测试整体优于 B/16；实际相册提升因照片和描述而异。",
+    "cpu": "高，建索引更慢，内存开销更高",
+    "license": "MIT",
+    "source": "https://huggingface.co/Xenova/chinese-clip-vit-large-patch14",
+    "featureVersion": "cnclip-l14-fp32-rgb224-bicubic-v1",
+    "dimension": 768,
+    "imageSize": 224,
+    "backend": "combined",
+    "assets": [
+      {
+        "name": "model.onnx",
+        "path": "onnx/model.onnx",
+        "size": 1625843990,
+        "sha": "919a6618b89da10967b29ecf2c98d6ea790f82003114f9fecafdf4879a44f843",
+        "repository": "Xenova/chinese-clip-vit-large-patch14",
+        "revision": "82a6624751531459b3914fb6438cf0dff28c9e00"
+      },
+      {
+        "name": "vocab.txt",
+        "size": 109540,
+        "sha": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+        "repository": "OFA-Sys/chinese-clip-vit-base-patch16",
+        "revision": "36e679e65c2a2fead755ae21162091293ad37834",
+        "path": "vocab.txt"
+      }
+    ],
+    "measurement": "本机 CPU 小样本：文字查询约 0.58 秒，单图约 0.60 秒。 i7-9750H、已加载模型，实际速度受电脑和照片影响；家庭相册准确率尚未验收。"
+  },
+  {
+    "id": "chinese-clip-vit-l14-336px-fp32-v1",
+    "kind": "search",
+    "name": "Chinese-CLIP L/14@336px · 高分辨率版",
+    "description": "使用 336×336 输入保留更多画面细节，公开中文检索测试整体更好；实际相册效果需验证。",
+    "cpu": "最高，适合愿意等待较长分析时间的电脑",
+    "license": "MIT",
+    "source": "https://huggingface.co/Xenova/chinese-clip-vit-large-patch14-336px",
+    "featureVersion": "cnclip-l14-336px-fp32-rgb336-bicubic-v1",
+    "dimension": 768,
+    "imageSize": 336,
+    "backend": "combined",
+    "assets": [
+      {
+        "name": "model.onnx",
+        "path": "onnx/model.onnx",
+        "size": 1627157272,
+        "sha": "9ac7b29118484ec6a0b4c80363862d03d284bbf0695f4b4fe868ad9daec96193",
+        "repository": "Xenova/chinese-clip-vit-large-patch14-336px",
+        "revision": "cf71bcf65498f8f49c82d084e7a03673ac801ed7"
+      },
+      {
+        "name": "vocab.txt",
+        "size": 109540,
+        "sha": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+        "repository": "OFA-Sys/chinese-clip-vit-base-patch16",
+        "revision": "36e679e65c2a2fead755ae21162091293ad37834",
+        "path": "vocab.txt"
+      }
+    ],
+    "measurement": "本机 CPU 小样本：文字查询约 1.85 秒，单图约 2.82 秒。 i7-9750H、已加载模型，实际速度受电脑和照片影响；家庭相册准确率尚未验收。"
+  },
+  {
+    "id": "yunet-sface-fp32-v1",
+    "kind": "people",
+    "name": "YuNet + SFace · 轻量版",
+    "description": "默认选择，YuNet 检出人脸，SFace 提取人物特征。约 39 MB，适合普通电脑。自动归组尚未通过独立验收，保持关闭。",
+    "cpu": "较低，适合日常人物整理",
+    "license": "YuNet: MIT；SFace: Apache-2.0",
+    "source": "https://github.com/opencv/opencv_zoo",
+    "featureVersion": "yunet640-sface112-align5-v1",
+    "dimension": 128,
+    "imageSize": 112,
+    "backend": "sface",
+    "assets": [
+      {
+        "name": "face_detection_yunet_2023mar.onnx",
+        "size": 232589,
+        "sha": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        "repository": "opencv/face_detection_yunet",
+        "revision": "3cc26e7f1014a5ee5d74a42acee58bafc9d0a310",
+        "path": "face_detection_yunet_2023mar.onnx"
+      },
+      {
+        "name": "face_recognition_sface_2021dec.onnx",
+        "size": 38696353,
+        "sha": "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+        "repository": "opencv/face_recognition_sface",
+        "revision": "3d7082438a6e4551e840c9b2bb60b71e8da4b524",
+        "path": "face_recognition_sface_2021dec.onnx"
+      }
+    ],
+    "measurement": "本机 CPU 小样本：单张已对齐人脸特征约 18 毫秒，不含找人脸和照片解码。 i7-9750H、已加载模型，实际速度受电脑和照片影响；家庭相册准确率尚未验收。"
+  },
+  {
+    "id": "yunet-auraface-fp32-v1",
+    "kind": "people",
+    "name": "YuNet + AuraFace · 大模型版",
+    "description": "沿用 YuNet，使用更大的 AuraFace 人脸特征模型。约 261 MB；尚未完成家庭相册准确率评测，不保证优于 SFace。自动归组保持关闭。",
+    "cpu": "高，人物特征计算更慢、内存开销更高",
+    "license": "YuNet: MIT；AuraFace: Apache-2.0",
+    "source": "https://huggingface.co/fal/AuraFace-v1",
+    "featureVersion": "yunet640-auraface112-align5-v1",
+    "dimension": 512,
+    "imageSize": 112,
+    "backend": "auraface",
+    "assets": [
+      {
+        "name": "face_detection_yunet_2023mar.onnx",
+        "size": 232589,
+        "sha": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        "repository": "opencv/face_detection_yunet",
+        "revision": "3cc26e7f1014a5ee5d74a42acee58bafc9d0a310",
+        "path": "face_detection_yunet_2023mar.onnx"
+      },
+      {
+        "name": "glintr100.onnx",
+        "path": "glintr100.onnx",
+        "size": 260694151,
+        "sha": "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
+        "repository": "fal/AuraFace-v1",
+        "revision": "af6d057c9b0ec4071d4c49c80e3539258798b609"
+      }
+    ],
+    "measurement": "本机 CPU 小样本：单张已对齐人脸特征约 71 毫秒，不含找人脸和照片解码。 i7-9750H、已加载模型，实际速度受电脑和照片影响；家庭相册准确率尚未验收。"
+  }
+]

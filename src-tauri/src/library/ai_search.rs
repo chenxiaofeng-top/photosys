@@ -16,9 +16,16 @@ use super::{
     Filter, Issue, Item, ItemView, Kind, Page, STALE_SCAN, Scan, current, favorites, parse_date,
     scan, session,
 };
-use crate::ai::{self, DIM, FEATURE_VERSION, MODEL_GENERATION, error};
+#[cfg(test)]
+use crate::ai::DIM;
+use crate::ai::{self, FEATURE_VERSION, MODEL_GENERATION, error};
 
 static SERIAL: Mutex<()> = Mutex::new(());
+pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    cancel_all();
+    SERIAL.lock().map_err(error)
+}
+
 static ACTIVE: Mutex<Option<(u64, Arc<AtomicBool>)>> = Mutex::new(None);
 
 pub(super) fn cancel_all() {
@@ -52,10 +59,14 @@ pub(crate) struct IndexStatus {
     reused: usize,
     writable: bool,
     message: Option<String>,
+    model_id: &'static str,
+    needs_rebuild: bool,
+    rebuild_reason: Option<String>,
 }
 
 struct Cache {
     connection: Connection,
+    spec: &'static ai::catalog::ModelSpec,
 }
 
 impl Cache {
@@ -92,7 +103,10 @@ impl Cache {
              ) WITHOUT ROWID;"
         ).map_err(error)?;
         }
-        Ok(Some(Self { connection }))
+        Ok(Some(Self {
+            connection,
+            spec: ai::catalog::active(ai::ModelKind::Search),
+        }))
     }
 
     fn enabled(&self) -> Result<bool, String> {
@@ -146,7 +160,14 @@ impl Cache {
             transaction
                 .execute(
                     "INSERT OR REPLACE INTO embeddings VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![path, stamp, rotation, FEATURE_VERSION, vector, issue],
+                    params![
+                        path,
+                        stamp,
+                        rotation,
+                        self.spec.feature_version,
+                        vector,
+                        issue
+                    ],
                 )
                 .map_err(error)?;
         }
@@ -179,7 +200,7 @@ impl Record {
     fn matches(&self, item: &Item, rotation: u16) -> bool {
         self.stamp == item.file.stamp.portable_key()
             && self.rotation == rotation
-            && self.version == FEATURE_VERSION
+            && self.version == ai::catalog::active(ai::ModelKind::Search).feature_version
     }
 }
 
@@ -214,8 +235,11 @@ fn is_writable(scan: &Scan) -> bool {
 fn status(scan_id: u64) -> Result<IndexStatus, String> {
     let scan = scan(scan_id)?;
     let rotations = rotations(scan_id)?;
+    let spec = ai::catalog::active(ai::ModelKind::Search);
     let mut status = IndexStatus {
         scan_id,
+        model_id: spec.id,
+        needs_rebuild: spec.feature_version != FEATURE_VERSION,
         total: scan.items.iter().filter(|i| eligible(i)).count(),
         writable: is_writable(&scan),
         ..Default::default()
@@ -228,6 +252,8 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
     match Cache::open(&scan, false) {
         Ok(Some(cache)) => {
             status.enabled = cache.enabled()?;
+            status.needs_rebuild =
+                ai::index_policy::needs_rebuild(&cache.connection, spec, FEATURE_VERSION)?;
             let records = cache.records()?;
             for item in scan.items.iter().filter(|i| eligible(i)) {
                 let rotation = rotations.get(&item.file.id).copied().unwrap_or(0);
@@ -246,8 +272,35 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         Ok(None) => {}
         Err(e) => status.message = Some(e),
     }
+    if status.needs_rebuild {
+        status.rebuild_reason = Some("当前模型需要重新建立照片内容索引，请手动开始重建。".into());
+    }
     status.pending = status.total.saturating_sub(status.indexed + status.failed);
     Ok(status)
+}
+
+pub(crate) fn model_impact(scan_id: u64, spec: &ai::catalog::ModelSpec) -> Result<usize, String> {
+    let scan = scan(scan_id)?;
+    let rotations = rotations(scan_id)?;
+    let records = Cache::open(&scan, false)?
+        .map(|c| c.records())
+        .transpose()?
+        .unwrap_or_default();
+    Ok(scan
+        .items
+        .iter()
+        .filter(|i| eligible(i))
+        .filter(|i| {
+            records
+                .get(&favorites::path_key(&i.file.relative))
+                .is_none_or(|r| {
+                    r.version != spec.feature_version
+                        || r.stamp != i.file.stamp.portable_key()
+                        || r.rotation != rotations.get(&i.file.id).copied().unwrap_or(0)
+                        || !r.indexed
+                })
+        })
+        .count())
 }
 
 #[tauri::command]
@@ -257,7 +310,11 @@ pub(crate) async fn ai_index_status(scan_id: u64) -> Result<IndexStatus, String>
         .map_err(error)?
 }
 
-pub(super) fn decode(scan: &Scan, item: &Item, cancel: &AtomicBool) -> Result<image::RgbImage, String> {
+pub(super) fn decode(
+    scan: &Scan,
+    item: &Item,
+    cancel: &AtomicBool,
+) -> Result<image::RgbImage, String> {
     let mut file = scan
         .root
         .open_matching(&item.file)
@@ -300,7 +357,7 @@ fn update(
     let _serial = SERIAL.lock().map_err(error)?;
     let scan = scan(scan_id)?;
     let initial = status(scan_id)?;
-    if automatic && (!initial.enabled || !initial.writable) {
+    if automatic && (!initial.enabled || !initial.writable || initial.needs_rebuild) {
         return Ok(initial);
     }
     if !initial.writable {
@@ -313,14 +370,22 @@ fn update(
     let mut state = initial;
     state.running = true;
     let _ = progress.send(state.clone());
-    let Some(_analysis) = ai::analysis_slot(&cancel)? else { return status(scan_id); };
+    let Some(_analysis) = ai::analysis_slot(&cancel)? else {
+        return status(scan_id);
+    };
     let runtime = load_model()?;
+    if runtime.spec.id != state.model_id {
+        return Err("模型已变化，请重试索引。".into());
+    }
     let mut cache = Cache::open(&scan, true)?.ok_or("无法创建 AI 索引。")?;
     cache
         .connection
         .execute("INSERT OR REPLACE INTO settings VALUES ('enabled',1)", [])
         .map_err(error)?;
+    ai::index_policy::approve(&cache.connection, runtime.spec)?;
     state.enabled = true;
+    state.needs_rebuild = false;
+    state.rebuild_reason = None;
     let records = cache.records()?;
     let saved_rotations = rotations(scan_id)?;
     let mut batch = Vec::new();
@@ -457,15 +522,20 @@ pub(crate) struct SearchPage {
     failed: usize,
 }
 
+#[cfg(test)]
 fn vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    if bytes.len() != DIM * 4 {
+    vector_dim(bytes, DIM)
+}
+fn vector_dim(bytes: &[u8], dim: usize) -> Result<Vec<f32>, String> {
+    if bytes.len() != dim * 4 {
         return Err("AI 索引向量损坏，请更新索引。".into());
     }
-    ai::inference::normalize(
+    ai::inference::normalize_dim(
         bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect(),
+        dim,
     )
 }
 
@@ -477,6 +547,26 @@ fn rank(
     rotations: &HashMap<usize, u16>,
     page: usize,
 ) -> Result<Page<ItemView>, String> {
+    rank_for(
+        scan,
+        embedding,
+        filter,
+        favorites,
+        rotations,
+        page,
+        ai::catalog::active(ai::ModelKind::Search),
+    )
+}
+
+fn rank_for(
+    scan: &Scan,
+    embedding: &[f32],
+    filter: &Filter,
+    favorites: &HashSet<usize>,
+    rotations: &HashMap<usize, u16>,
+    page: usize,
+    spec: &'static ai::catalog::ModelSpec,
+) -> Result<Page<ItemView>, String> {
     let from = parse_date(filter.from.as_deref())?;
     let to = parse_date(filter.to.as_deref())?;
     if matches!((from, to), (Some(a), Some(b)) if a > b) {
@@ -484,7 +574,8 @@ fn rank(
     }
     let cache = Cache::open(scan, false)?;
     let mut ranked = Vec::new();
-    if let Some(cache) = cache {
+    if let Some(mut cache) = cache {
+        cache.spec = spec;
         let candidates: HashMap<_, _> = scan
             .items
             .iter()
@@ -501,7 +592,7 @@ fn rank(
             .map(|i| (favorites::path_key(&i.file.relative), i))
             .collect();
         let mut stmt = cache.connection.prepare("SELECT path, stamp, rotation, vector FROM embeddings WHERE version=?1 AND vector IS NOT NULL").map_err(error)?;
-        let mut rows = stmt.query([FEATURE_VERSION]).map_err(error)?;
+        let mut rows = stmt.query([cache.spec.feature_version]).map_err(error)?;
         while let Some(row) = rows.next().map_err(error)? {
             let path: Vec<u8> = row.get(0).map_err(error)?;
             let Some(item) = candidates.get(&path) else {
@@ -515,7 +606,10 @@ fn rank(
                 continue;
             }
             let stored: Vec<u8> = row.get(3).map_err(error)?;
-            let v = vector(&stored)?;
+            let v = vector_dim(&stored, cache.spec.dimension)?;
+            if embedding.len() != v.len() {
+                return Err("查询与索引模型不兼容。".into());
+            }
             let score: f32 = embedding.iter().zip(v).map(|(a, b)| a * b).sum();
             ranked.push((score, item.file.id));
         }
@@ -930,5 +1024,238 @@ mod tests {
         let read = Cache::at(&db, false).unwrap().unwrap();
         assert_eq!(read.records().unwrap()[b"one.jpg".as_slice()].rotation, 90);
         assert!(vector(&[0; 16]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+    #[test]
+    fn search_never_mixes_same_dimension_models_or_partially_rebuilt_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["one.png", "two.png"] {
+            image::RgbImage::new(2, 2)
+                .save(temp.path().join(name))
+                .unwrap();
+        }
+        let root = crate::duplicates::Root::new(temp.path()).unwrap();
+        favorites::initialize(&root).unwrap();
+        let scan = Scan::read(1, root, |_| {});
+        let low = ai::catalog::find(ai::ModelKind::Search, "chinese-clip-vit-l14-fp32-v1").unwrap();
+        let high =
+            ai::catalog::find(ai::ModelKind::Search, "chinese-clip-vit-l14-336px-fp32-v1").unwrap();
+        let mut cache = Cache::open(&scan, true).unwrap().unwrap();
+        for (i, spec) in [low, high].iter().enumerate() {
+            cache.spec = spec;
+            let item = &scan.items[i];
+            cache
+                .save(&[(
+                    favorites::path_key(&item.file.relative),
+                    item.file.stamp.portable_key(),
+                    0,
+                    Ok(vec![1.; 768]),
+                )])
+                .unwrap();
+        }
+        let filter = Filter {
+            query: String::new(),
+            kind: None,
+            from: None,
+            to: None,
+            unknown_date: false,
+            favorites_only: false,
+        };
+        for spec in [low, high] {
+            let page = rank_for(
+                &scan,
+                &vec![1.; 768],
+                &filter,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
+                spec,
+            )
+            .unwrap();
+            assert_eq!(page.total, 1);
+        }
+        assert_eq!(
+            rank_for(
+                &scan,
+                &vec![1.; 512],
+                &filter,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
+                ai::catalog::all().first().unwrap()
+            )
+            .unwrap()
+            .total,
+            0
+        );
+        assert!(
+            rank_for(
+                &scan,
+                &vec![1.; 512],
+                &filter,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
+                low
+            )
+            .is_err()
+        );
+        cache.spec = high;
+        let item = &scan.items[0];
+        cache
+            .save(&[(
+                favorites::path_key(&item.file.relative),
+                item.file.stamp.portable_key(),
+                0,
+                Ok(vec![1.; 768]),
+            )])
+            .unwrap();
+        assert_eq!(
+            rank_for(
+                &scan,
+                &vec![1.; 768],
+                &filter,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
+                high
+            )
+            .unwrap()
+            .total,
+            2
+        );
+        assert_eq!(
+            rank_for(
+                &scan,
+                &vec![1.; 768],
+                &filter,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
+                low
+            )
+            .unwrap()
+            .total,
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod real_selection_tests {
+    use super::*;
+    struct Choices;
+    impl Drop for Choices {
+        fn drop(&mut self) {
+            ai::catalog::select(ai::catalog::default_model(ai::ModelKind::Search));
+        }
+    }
+    #[test]
+    #[ignore = "requires PHOTOSYS_MODEL_OPTIONS_DIR; mutates process model choice, run this test alone"]
+    fn real_search_model_selection_manual_gate_cancel_resume_and_switch_back() {
+        let _session = super::super::TEST_SESSION.lock().unwrap();
+        let _restore = Choices;
+        let models = std::path::PathBuf::from(
+            std::env::var_os("PHOTOSYS_MODEL_OPTIONS_DIR").expect("models"),
+        );
+        let name = if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
+        };
+        ai::inference::initialize_from(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries/onnxruntime")
+                .join(std::env::consts::ARCH)
+                .join(name),
+        )
+        .unwrap();
+        let album = tempfile::tempdir().unwrap();
+        for (i, c) in [[255, 40, 40], [40, 255, 40], [40, 40, 255]]
+            .iter()
+            .enumerate()
+        {
+            image::RgbImage::from_pixel(64, 48, image::Rgb(*c))
+                .save(album.path().join(format!("{i}.png")))
+                .unwrap();
+        }
+        let opened = super::super::open_directory(
+            album.path().to_str().unwrap(),
+            super::super::OpenMode::Select,
+            |_| {},
+        )
+        .unwrap();
+        let id = opened.scan_id;
+        let people_before = ai::catalog::active(ai::ModelKind::People).id;
+        for (n, spec) in ai::catalog::all()
+            .iter()
+            .filter(|m| m.kind == ai::ModelKind::Search)
+            .enumerate()
+        {
+            ai::catalog::select(spec);
+            let state = status(id).unwrap();
+            assert_eq!(state.needs_rebuild, n > 0);
+            assert_eq!(state.indexed, 0);
+            let blocked = update(id, true, &Channel::new(|_| Ok(())), || {
+                panic!("automatic model rebuild must not load inference")
+            })
+            .unwrap();
+            assert_eq!(blocked.indexed, 0);
+            let runtime =
+                Arc::new(ai::inference::Runtime::load_spec(&models.join(spec.id), spec).unwrap());
+            let progress = Channel::new(move |message| {
+                if let tauri::ipc::InvokeResponseBody::Json(body) = message {
+                    let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    if data["indexed"].as_u64().unwrap_or(0) >= 1 {
+                        ai_cancel_index(id);
+                    }
+                }
+                Ok(())
+            });
+            let partial = update(id, false, &progress, || Ok(runtime.clone())).unwrap();
+            assert_eq!(partial.indexed, 1);
+            assert_eq!(partial.pending, 2);
+            let result =
+                update(id, true, &Channel::new(|_| Ok(())), || Ok(runtime.clone())).unwrap();
+            assert_eq!(result.indexed, 3);
+            assert_eq!(result.reused, 1);
+            assert!(!result.needs_rebuild);
+            let scan = scan(id).unwrap();
+            let query = runtime.encode_text("照片").unwrap();
+            let filter = Filter {
+                query: String::new(),
+                kind: None,
+                from: None,
+                to: None,
+                unknown_date: false,
+                favorites_only: false,
+            };
+            assert_eq!(
+                rank(&scan, &query, &filter, &HashSet::new(), &HashMap::new(), 0)
+                    .unwrap()
+                    .total,
+                3
+            );
+            assert_eq!(ai::catalog::active(ai::ModelKind::People).id, people_before);
+            // Same contract at another directory reuses all saved embeddings.
+            let result =
+                update(id, true, &Channel::new(|_| Ok(())), || Ok(runtime.clone())).unwrap();
+            assert_eq!(result.reused, 3);
+        }
+        ai::catalog::select(ai::catalog::default_model(ai::ModelKind::Search));
+        let state = status(id).unwrap();
+        assert!(state.needs_rebuild);
+        assert_eq!(state.indexed, 0);
+        assert_eq!(
+            model_impact(id, ai::catalog::default_model(ai::ModelKind::Search)).unwrap(),
+            3
+        );
+        *session().unwrap() = None;
     }
 }

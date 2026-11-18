@@ -3,7 +3,7 @@ use super::{
     super::{self as library, Filter, ItemView, Kind, Page, Sort, favorites},
     store::Store,
 };
-use crate::ai::{error, faces::VERSION};
+use crate::ai::{error, faces::GEOMETRY_VERSION};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ struct Reader {
     store: Store,
     favorites: HashSet<usize>,
     rotations: HashMap<usize, u16>,
+    geometry_expression: String,
 }
 pub(super) fn with<T>(
     scan_id: u64,
@@ -29,7 +30,13 @@ pub(super) fn with<T>(
         (s.favorites.clone(), s.rotations.clone())
     };
     let mut reader = READER.lock().map_err(error)?;
-    if reader.as_ref().is_none_or(|r| r.scan_id != scan_id) {
+    let reset = match reader.as_ref() {
+        Some(r) => {
+            r.scan_id != scan_id || r.geometry_expression != r.store.geometry_expression()?
+        }
+        None => true,
+    };
+    if reset {
         *reader = None;
         if let Some(store) = Store::open(&scan, false)? {
             store.connection.execute_batch("CREATE TEMP TABLE current_media(path BLOB PRIMARY KEY,file_id INTEGER NOT NULL,captured TEXT,favorite INTEGER NOT NULL,rotation INTEGER NOT NULL,stamp BLOB NOT NULL) WITHOUT ROWID; BEGIN;").map_err(error)?;
@@ -59,14 +66,15 @@ pub(super) fn with<T>(
                 .connection
                 .execute_batch("COMMIT; CREATE INDEX current_file_id ON current_media(file_id);")
                 .map_err(error)?;
-            store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND m.error IS NULL AND m.version='{VERSION}';")).map_err(error)?;
+            let geometry = store.geometry_expression()?;
+            store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND ({geometry})='{GEOMETRY_VERSION}';")).map_err(error)?;
             store.connection.execute_batch(&format!("
                 CREATE TEMP VIEW face_cards AS SELECT f.*,c.file_id,c.captured,c.favorite,
-                  COALESCE(f.active=1 AND m.error IS NULL AND m.version='{VERSION}' AND m.stamp=c.stamp AND m.rotation=c.rotation,0) valid
+                  COALESCE(f.active=1 AND ({geometry})='{GEOMETRY_VERSION}' AND m.stamp=c.stamp AND m.rotation=c.rotation,0) valid
                   FROM faces f JOIN current_media c ON c.path=f.path LEFT JOIN media m ON m.path=f.path;
                 CREATE TEMP VIEW pending_faces AS
                   WITH stale AS MATERIALIZED (SELECT c.path FROM current_media c LEFT JOIN media m ON m.path=c.path
-                    WHERE m.path IS NULL OR m.error IS NOT NULL OR m.version!='{VERSION}' OR m.stamp!=c.stamp OR m.rotation!=c.rotation)
+                    WHERE m.path IS NULL OR ({geometry})!='{GEOMETRY_VERSION}' OR m.stamp!=c.stamp OR m.rotation!=c.rotation)
                   SELECT id FROM visible_faces WHERE ignored=0 AND person_id IS NULL
                   UNION ALL SELECT f.id FROM faces f JOIN current_media c ON c.path=f.path WHERE f.active=0 AND f.review=1 AND f.manual=1 AND f.ignored=0
                   UNION ALL SELECT f.id FROM stale s CROSS JOIN faces f WHERE f.path=s.path AND f.active=1 AND f.manual=1 AND f.ignored=0;
@@ -76,6 +84,7 @@ pub(super) fn with<T>(
                 store,
                 favorites: saved_favorites.clone(),
                 rotations: saved_rotations.clone(),
+                geometry_expression: geometry,
             });
         }
     }

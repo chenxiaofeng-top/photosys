@@ -20,12 +20,13 @@ CREATE INDEX IF NOT EXISTS faces_person ON faces(person_id,active,ignored);
 CREATE INDEX IF NOT EXISTS faces_pending ON faces(active,ignored,person_id,review);
 CREATE TABLE IF NOT EXISTS rejections(face_id INTEGER NOT NULL REFERENCES faces(id),person_id INTEGER NOT NULL REFERENCES people(id),PRIMARY KEY(face_id,person_id));
 CREATE TABLE IF NOT EXISTS edits(id INTEGER PRIMARY KEY AUTOINCREMENT,description TEXT NOT NULL,payload TEXT NOT NULL);
-PRAGMA user_version=1;";
+PRAGMA user_version=2;";
 #[derive(Clone)]
 pub(super) struct Record {
     pub stamp: Vec<u8>,
     pub rotation: u16,
     pub version: String,
+    pub geometry_version: String,
     pub error: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,6 +86,26 @@ fn name(s: &str) -> Result<String, String> {
     }
 }
 impl Store {
+    fn has_geometry(c: &Connection) -> Result<bool, String> {
+        let mut q = c.prepare("PRAGMA table_info(media)").map_err(error)?;
+        let names = q
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(error)?;
+        Ok(names.iter().any(|n| n == "geometry_version"))
+    }
+    pub fn geometry_expression(&self) -> Result<String, String> {
+        Ok(if Self::has_geometry(&self.connection)? {
+            "m.geometry_version".into()
+        } else {
+            format!(
+                "CASE WHEN m.version='{VERSION}' THEN '{}' ELSE '' END",
+                crate::ai::faces::GEOMETRY_VERSION
+            )
+        })
+    }
+
     pub fn open(scan: &Scan, write: bool) -> Result<Option<Self>, String> {
         let dir = favorites::data_directory(&scan.root)?.ok_or("媒体库数据目录不可用。")?;
         Self::at(&dir.join("people.sqlite"), write)
@@ -109,11 +130,31 @@ impl Store {
         let version: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(error)?;
-        if version > 1 {
+        if version > 2 {
             return Err("人物数据库来自较新版本，请更新 PhotoSys。".into());
         }
         if write {
-            c.execute_batch(SCHEMA).map_err(error)?;
+            c.execute_batch("BEGIN IMMEDIATE").map_err(error)?;
+            let migration = (|| -> Result<(), String> {
+                c.execute_batch(SCHEMA).map_err(error)?;
+                if !Self::has_geometry(&c)? {
+                    c.execute_batch(
+                        "ALTER TABLE media ADD COLUMN geometry_version TEXT NOT NULL DEFAULT '';",
+                    )
+                    .map_err(error)?;
+                    c.execute(
+                        "UPDATE media SET geometry_version=?1 WHERE version=?2",
+                        rusqlite::params![crate::ai::faces::GEOMETRY_VERSION, VERSION],
+                    )
+                    .map_err(error)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = migration {
+                let _ = c.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            c.execute_batch("COMMIT").map_err(error)?;
         }
         Ok(Some(Self { connection: c }))
     }
@@ -147,9 +188,12 @@ impl Store {
             .map_err(error)
     }
     pub fn records(&self) -> Result<std::collections::HashMap<Vec<u8>, Record>, String> {
+        let geometry = self.geometry_expression()?.replace("m.", "");
         let mut q = self
             .connection
-            .prepare("SELECT path,stamp,rotation,version,error FROM media")
+            .prepare(&format!(
+                "SELECT path,stamp,rotation,version,error,{geometry} FROM media"
+            ))
             .map_err(error)?;
         q.query_map([], |r| {
             Ok((
@@ -159,6 +203,7 @@ impl Store {
                     rotation: r.get(2)?,
                     version: r.get(3)?,
                     error: r.get(4)?,
+                    geometry_version: r.get(5)?,
                 },
             ))
         })
@@ -166,6 +211,7 @@ impl Store {
         .collect::<Result<_, _>>()
         .map_err(error)
     }
+    #[cfg(test)]
     pub fn save(
         &mut self,
         path: &[u8],
@@ -173,20 +219,119 @@ impl Store {
         rotation: u16,
         result: &Result<Vec<Face>, String>,
     ) -> Result<Vec<i64>, String> {
+        self.save_for_model(path, stamp, rotation, result, VERSION)
+    }
+    pub fn save_for_model(
+        &mut self,
+        path: &[u8],
+        stamp: &[u8],
+        rotation: u16,
+        result: &Result<Vec<Face>, String>,
+        version: &str,
+    ) -> Result<Vec<i64>, String> {
         let tx = self.connection.transaction().map_err(error)?;
-        // Never transfer identities to replacement content without manual confirmation.
-        tx.execute("UPDATE faces SET active=0,review=CASE WHEN manual=1 AND ignored=0 THEN 1 ELSE review END WHERE path=?1 AND active=1",[path]).map_err(error)?;
+        let previous: Option<(Vec<u8>, u16, String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT stamp,rotation,version,geometry_version,error FROM media WHERE path=?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        let can_preserve = previous.as_ref().is_some_and(|(s, r, _v, g, _e)| {
+            s == stamp && *r == rotation && g == crate::ai::faces::GEOMETRY_VERSION
+        });
+        let old: Vec<(i64, [f32; 4])> = if can_preserve {
+            let mut q = tx
+                .prepare("SELECT id,bbox FROM faces WHERE path=?1 AND active=1")
+                .map_err(error)?;
+            let raw = q
+                .query_map([path], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(error)?;
+            raw.into_iter()
+                .map(|(id, b)| Ok((id, serde_json::from_str(&b).map_err(error)?)))
+                .collect::<Result<_, String>>()?
+        } else {
+            Vec::new()
+        };
+        // Failed re-embedding leaves valid geometry and manual organization intact.
+        if can_preserve && result.is_err() {
+            tx.execute(
+                "UPDATE media SET version=?2,error=?3 WHERE path=?1",
+                params![path, version, result.as_ref().err()],
+            )
+            .map_err(error)?;
+            tx.commit().map_err(error)?;
+            return Ok(Vec::new());
+        }
+        let new_faces = result.as_ref().ok();
+        let same = |a: &[f32; 4], b: &[f32; 4]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| x.is_finite() && y.is_finite() && (x - y).abs() <= 1e-6)
+        };
+        let mapping: Vec<Option<i64>> = new_faces
+            .map(|fs| {
+                fs.iter()
+                    .map(|f| {
+                        let candidates: Vec<_> =
+                            old.iter().filter(|(_, b)| same(b, &f.bbox)).collect();
+                        if candidates.len() == 1
+                            && fs
+                                .iter()
+                                .filter(|n| same(&n.bbox, &candidates[0].1))
+                                .count()
+                                == 1
+                        {
+                            Some(candidates[0].0)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let preserved: std::collections::HashSet<_> = mapping.iter().flatten().copied().collect();
+        // Only unmatched old manual faces require review. Never use embeddings for correspondence.
+        let mut q = tx
+            .prepare("SELECT id FROM faces WHERE path=?1 AND active=1")
+            .map_err(error)?;
+        let old_ids = q
+            .query_map([path], |r| r.get::<_, i64>(0))
+            .map_err(error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(error)?;
+        drop(q);
+        for id in old_ids {
+            if !preserved.contains(&id) {
+                tx.execute("UPDATE faces SET active=0,review=CASE WHEN manual=1 AND ignored=0 THEN 1 ELSE review END WHERE id=?1",[id]).map_err(error)?;
+            }
+        }
         let issue = result.as_ref().err().map(String::as_str);
-        tx.execute("INSERT INTO media VALUES(?1,?2,?3,?4,?5) ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,rotation=excluded.rotation,version=excluded.version,error=excluded.error",params![path,stamp,rotation,VERSION,issue]).map_err(error)?;
+        tx.execute("INSERT INTO media(path,stamp,rotation,version,error,geometry_version) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,rotation=excluded.rotation,version=excluded.version,error=excluded.error,geometry_version=excluded.geometry_version",params![path,stamp,rotation,version,issue,if result.is_ok() {crate::ai::faces::GEOMETRY_VERSION}else{""}]).map_err(error)?;
         let mut ids = Vec::new();
         if let Ok(faces) = result {
-            for f in faces {
+            for (i, f) in faces.iter().enumerate() {
                 let vector = f
                     .vector
                     .as_ref()
                     .map(|v| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>());
-                tx.execute("INSERT INTO faces(path,bbox,confidence,vector,thumbnail) VALUES(?1,?2,?3,?4,?5)",params![path,serde_json::to_string(&f.bbox).map_err(error)?,f.confidence,vector,f.thumbnail]).map_err(error)?;
-                ids.push(tx.last_insert_rowid());
+                let bbox = serde_json::to_string(&f.bbox).map_err(error)?;
+                if let Some(id) = mapping[i] {
+                    tx.execute(
+                        "UPDATE faces SET bbox=?2,confidence=?3,vector=?4,thumbnail=?5 WHERE id=?1",
+                        params![id, bbox, f.confidence, vector, f.thumbnail],
+                    )
+                    .map_err(error)?;
+                    ids.push(id);
+                } else {
+                    tx.execute("INSERT INTO faces(path,bbox,confidence,vector,thumbnail) VALUES(?1,?2,?3,?4,?5)",params![path,bbox,f.confidence,vector,f.thumbnail]).map_err(error)?;
+                    ids.push(tx.last_insert_rowid());
+                }
             }
         }
         tx.commit().map_err(error)?;

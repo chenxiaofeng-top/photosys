@@ -76,6 +76,22 @@ pub(super) fn install<T>(
             zip::ZipArchive::new(File::open(path).map_err(error)?).map_err(error)
         })
         .transpose()?;
+    if let Some(zip) = archive.as_mut() {
+        match zip.by_name("photosys-model.json") {
+            Ok(entry) => {
+                if entry.size() > 16384 {
+                    return Err("离线模型包说明过大。".into());
+                }
+                let descriptor: serde_json::Value =
+                    serde_json::from_reader(entry).map_err(error)?;
+                if descriptor["schema"] != 1 || descriptor["modelId"].as_str() != Some(id) {
+                    return Err("离线包与所选模型不匹配，请选择对应的模型后重试。".into());
+                }
+            }
+            Err(zip::result::ZipError::FileNotFound) => {}
+            Err(e) => return Err(error(e)),
+        }
+    }
     let mut completed = 0;
     for asset in assets {
         download::check_cancel(cancel)?;
@@ -142,7 +158,7 @@ pub(super) fn install<T>(
                 };
                 let url = format!(
                     "{host}/{}/resolve/{}/{}",
-                    asset.repository, asset.revision, asset.name
+                    asset.repository, asset.revision, asset.path
                 );
                 match download::transfer(&client, &url, &path, asset.size, cancel, |bytes| {
                     progress(

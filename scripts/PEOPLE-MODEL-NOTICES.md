@@ -236,3 +236,18 @@ SOFTWARE.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+## AuraFace v1 alternative
+
+Source: https://huggingface.co/fal/AuraFace-v1
+Revision: af6d057c9b0ec4071d4c49c80e3539258798b609
+Only `glintr100.onnx` (recognition weights) is used. No detector, attributes,
+or other InsightFace pretrained weights are installed. YuNet above remains
+the detector. AuraFace is distributed by fal under Apache License 2.0;
+the full Apache 2.0 text above also accompanies this package.
+Upstream license: https://huggingface.co/fal/AuraFace-v1/blob/af6d057c9b0ec4071d4c49c80e3539258798b609/LICENSE.md
+
+Same 5-point 112x112 alignment; RGB CHW normalized as (value-127.5)/127.5.
+Normalized 512-dimensional FP32 embeddings. SFace remains 128-dimensional.
+Recognition benchmarks are not family-album grouping accuracy. Automatic
+grouping remains disabled without a validated policy for the selected model.
