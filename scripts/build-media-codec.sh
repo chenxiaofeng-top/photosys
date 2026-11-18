@@ -97,6 +97,10 @@ build() (
     tar -xf "$sources/$vpx_source" -C "$work/vpx" --strip-components=1
     tar -xf "$sources/$ogg_source" -C "$work/ogg" --strip-components=1
     tar -xf "$sources/$vorbis_source" -C "$work/vorbis" --strip-components=1
+    if [[ "$target" == *-apple-darwin ]]; then
+      # libvorbis 1.3.7 injects a flag removed from recent Apple linkers.
+      sed -i.bak 's/ -force_cpusubtype_ALL//g' "$work/vorbis/configure"
+    fi
     export PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
     (
       cd "$work/ogg"
