@@ -127,11 +127,16 @@ jobs:
       - run: npm ci
 
       - name: Run Rust tests
+        env:
+          # Avoid macOS /var aliases in SQLite NOFOLLOW tests.
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Verify native local face inference and offline installation
         if: github.event_name == 'workflow_dispatch' && inputs.full_ai_validation
         shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           python scripts/prepare-people-test.py "$RUNNER_TEMP/photosys-people-test"
           export PHOTOSYS_PEOPLE_MODEL_DIR="$RUNNER_TEMP/photosys-people-test"
@@ -141,6 +146,8 @@ jobs:
       - name: Verify all five native model options and offline imports
         if: github.event_name == 'workflow_dispatch' && inputs.full_ai_validation
         shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           python scripts/prepare-model-options-test.py "$RUNNER_TEMP/photosys-model-options"
           export PHOTOSYS_MODEL_OPTIONS_DIR="$RUNNER_TEMP/photosys-model-options"

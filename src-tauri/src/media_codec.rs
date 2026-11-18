@@ -30,14 +30,21 @@ fn executable() -> Result<PathBuf, String> {
         "photosys-ffmpeg"
     };
     let program = std::env::current_exe().map_err(|error| error.to_string())?;
-    // Cargo runs unit tests from the deps subdirectory of the build profile.
+    Ok(companion_for(&program, companion))
+}
+
+fn companion_for(program: &Path, companion: &str) -> PathBuf {
+    // Cargo uses either <profile>/deps or <profile>/build/<crate>/<hash>/out
+    // for unit tests. tauri-build places sidecars in the profile directory.
     #[cfg(test)]
-    if let Some(directory) = program.parent().filter(|path| path.ends_with("deps"))
-        && let Some(profile) = directory.parent()
+    if let Some(profile) = program
+        .ancestors()
+        .find(|path| path.ends_with("deps") || path.ends_with("build"))
+        .and_then(Path::parent)
     {
-        return Ok(profile.join(companion));
+        return profile.join(companion);
     }
-    Ok(program.with_file_name(companion))
+    program.with_file_name(companion)
 }
 
 pub(crate) enum Input<'a> {
@@ -215,11 +222,47 @@ pub(crate) fn heif_jpeg(
     .map_err(|error| format!("无法解码 HEIC/HEIF 照片。{error}"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn locates_sidecars_with_both_cargo_test_layouts() {
+        for (program, expected) in [
+            (
+                "target/debug/deps/photosys_lib-hash",
+                "target/debug/photosys-ffmpeg",
+            ),
+            (
+                "target/debug/build/photosys/hash/out/photosys_lib-hash",
+                "target/debug/photosys-ffmpeg",
+            ),
+            (
+                "target/release/build/photosys/hash/out/photosys_lib-hash",
+                "target/release/photosys-ffmpeg",
+            ),
+            (
+                "target/coverage/deps/photosys_lib-hash",
+                "target/coverage/photosys-ffmpeg",
+            ),
+            ("app/PhotoSys", "app/photosys-ffmpeg"),
+        ] {
+            assert_eq!(
+                companion_for(Path::new(program), "photosys-ffmpeg"),
+                Path::new(expected)
+            );
+        }
+        assert_eq!(
+            companion_for(
+                Path::new("target/debug/deps/photosys_lib.exe"),
+                "photosys-ffmpeg.exe"
+            ),
+            Path::new("target/debug/photosys-ffmpeg.exe")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn cancels_and_reaps_an_active_decoder() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let cancelled = AtomicBool::new(true);

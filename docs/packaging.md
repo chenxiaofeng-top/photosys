@@ -213,11 +213,12 @@ bash scripts/build-media-codec.sh universal-apple-darwin
 python3 scripts/prepare-ai-runtime.py --universal
 python3 scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
 npm ci
+export TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri build -- --target universal-apple-darwin -- --locked
 ```
 
-产物位于 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`，同级 `macos/` 中有 `.app`。准备运行时的检查只加载本机架构；CI 另用 Intel Mac 验证 Intel 运行时，并检查通用应用及 FFmpeg 的两个架构。
+产物位于 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`，同级 `macos/` 中有 `.app`。`TMPDIR` 命令将 macOS 临时目录转换为实际路径，避免系统的 `/var` 符号链接触发 SQLite 的防链接检查。准备运行时的检查只加载本机架构；CI 另用 Intel Mac 验证 Intel 运行时，并检查通用应用及 FFmpeg 的两个架构。
 
 本地打包不会自动上传 GitHub，也不会生成 Release。源码归档位于 `src-tauri/binaries/media-codec-sources.tar.gz`，分发安装包时应一并提供。模型权重不随这些命令打包。
 
