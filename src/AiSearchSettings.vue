@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { ElButton, ElIcon } from "element-plus";
+import { MagicStick, Setting } from "@element-plus/icons-vue";
+import "element-plus/es/components/button/style/css";
+import "element-plus/es/components/icon/style/css";
 import { formatBytes } from "./formatBytes";
 import type { IndexStatus, ModelStatus } from "./aiSearch";
 
@@ -148,14 +152,15 @@ defineExpose({ refreshIndex });
 <template>
   <section class="ai-settings" aria-label="AI 搜索设置">
     <div class="ai-summary">
-      <button class="secondary" type="button" :aria-expanded="open" @click="open = !open">AI 搜索设置</button>
-      <span role="status">{{ modelTask ? '正在处理模型…' : model?.ready ? '本地模型已就绪' : '尚未安装可用模型' }}</span>
-      <span v-if="index" role="status">{{ indexTask ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张 · 待处理 {{ index.pending }} 张<span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
-      <button v-if="indexTask" class="secondary" type="button" @click="cancelIndex">停止索引</button>
-      <button v-else-if="scanId !== undefined && model?.ready" class="secondary" type="button"
-        :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.enabled ? '更新索引 / 重试失败项' : '建立索引' }}</button>
+      <span class="ai-label"><ElIcon aria-hidden="true"><MagicStick /></ElIcon>本地 AI</span>
+      <span class="model-status" :class="{ ready: model?.ready }" role="status">{{ modelTask ? '正在处理模型…' : model?.ready ? '本地模型已就绪' : '尚未安装可用模型' }}</span>
+      <span v-if="index" role="status">{{ indexTask ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
+      <ElButton v-if="indexTask" @click="cancelIndex">停止索引</ElButton>
+      <ElButton v-else-if="scanId !== undefined && model?.ready"
+        :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>
+      <ElButton class="settings-toggle" text :icon="Setting" :aria-expanded="open" aria-controls="ai-settings-body" @click="open = !open">AI 搜索设置</ElButton>
     </div>
-    <div v-if="open" class="ai-settings-body">
+    <div v-show="open" id="ai-settings-body" class="ai-settings-body">
       <p>用中文描述寻找照片。模型安装后可断网使用，照片和搜索内容只在本机处理。</p>
       <p>模型：Chinese-CLIP ViT-B/16 · CPU · {{ formatBytes(model?.totalBytes ?? 755533779) }}</p>
       <div class="ai-directory">
@@ -173,20 +178,21 @@ defineExpose({ refreshIndex });
           {{ model?.resumableBytes ? '继续下载 / 重试安装' : '下载并安装模型' }}
         </button>
         <button class="secondary" type="button" :disabled="!model?.directory || modelTask || indexTask" @click="install(true)">导入离线模型包</button>
-        <button v-if="progress" class="secondary" type="button" :disabled="cancelling" @click="cancelInstall">{{ cancelling ? '正在取消…' : '取消安装' }}</button>
+
       </div>
       <p v-if="model?.resumableBytes && !progress">可继续下载：{{ formatBytes(model.resumableBytes) }}</p>
-      <div v-if="progress" role="status">
-        <p>{{ { downloading: '正在下载', verifying: '正在校验', testing: '正在加载自检', importing: '正在导入' }[progress.phase] }} · {{ progress.file }}<span v-if="progress.phase === 'downloading'"> · {{ progress.source === 'mirror' ? 'HF-Mirror' : 'Hugging Face' }}</span></p>
-        <progress :value="progress.downloaded" :max="progress.total" aria-label="模型安装进度"></progress>
-        <p>{{ formatBytes(progress.downloaded) }} / {{ formatBytes(progress.total) }}</p>
-      </div>
-      <p v-if="model?.message" role="status">{{ model.message }}</p>
-      <p v-if="modelError" class="error" role="alert">{{ modelError }}</p>
       <p v-if="index && !index.writable">当前相册不能写入 AI 索引，已有有效索引仍可搜索。</p>
       <p>首次点击“建立索引”；之后打开或刷新相册时自动更新新增和变化的照片。可中途停止，下次继续。</p>
       <p class="description">仅分析照片及实况封面。可导入与此版本匹配的 PhotoSys 离线模型包（ZIP）。</p>
     </div>
+      <div v-if="progress" role="status">
+        <p>{{ { downloading: '正在下载', verifying: '正在校验', testing: '正在加载自检', importing: '正在导入' }[progress.phase] }} · {{ progress.file }}<span v-if="progress.phase === 'downloading'"> · {{ progress.source === 'mirror' ? 'HF-Mirror' : 'Hugging Face' }}</span></p>
+        <progress :value="progress.downloaded" :max="progress.total" aria-label="模型安装进度"></progress>
+        <p>{{ formatBytes(progress.downloaded) }} / {{ formatBytes(progress.total) }}</p>
+        <ElButton :disabled="cancelling" @click="cancelInstall">{{ cancelling ? '正在取消…' : '取消安装' }}</ElButton>
+      </div>
+      <p v-if="model?.message" role="status">{{ model.message }}</p>
+      <p v-if="modelError" class="error" role="alert">{{ modelError }}</p>
     <p v-if="index?.message" class="error" role="alert">{{ index.message }}</p>
     <p v-if="indexError" class="error" role="alert">{{ indexError }}</p>
     <details v-if="index?.failed" :open="issuesOpen" @toggle="issuesOpen = ($event.target as HTMLDetailsElement).open">
@@ -202,7 +208,17 @@ defineExpose({ refreshIndex });
 </template>
 
 <style scoped>
-.ai-settings { margin: 0 0 1rem; padding: 0.85rem 1rem; border: 1px solid #cbd8d2; border-radius: 0.65rem; background: #fff; }
+.ai-settings { margin: 0 0 1.25rem; padding: 0.625rem 0.875rem; border: 1px solid #e0e7de; border-radius: 0.75rem; background: #edf2ec; color: #52655a; }
+.ai-label { display: inline-flex; align-items: center; gap: 0.5rem; color: #176252; font-weight: 650; }
+.model-status { color: #647369; }
+.model-status.ready { color: #176252; }
+.ai-settings .ai-summary > .settings-toggle { margin-left: auto; }
+.ai-settings-body { color: #42574e; font-size: 0.875rem; }
+.ai-directory label { margin: 0; }
+.ai-directory input { box-sizing: border-box; min-height: 40px; padding: 0.5rem 0.75rem; border: 1px solid #cbd6ce; border-radius: 8px; background: #fff; color: inherit; font: inherit; text-overflow: ellipsis; }
+.ai-settings select { min-height: 40px; padding: 0.375rem; border: 1px solid #cbd6ce; border-radius: 8px; background: #fff; color: inherit; font: inherit; }
+.ai-settings-body > .ai-summary > label { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0; }
+@media (max-width: 48rem) { .ai-settings .ai-summary > .settings-toggle { margin-left: 0; } }
 .ai-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; }
 .ai-summary span { font-size: 0.9rem; }
 .ai-settings-body { margin-top: 1rem; border-top: 1px solid #e2e8e4; padding-top: 0.5rem; }

@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
+import { ElConfigProvider, ElIcon } from "element-plus";
+import zhCn from "element-plus/es/locale/lang/zh-cn";
+import { Picture, FolderOpened, CopyDocument, Connection } from "@element-plus/icons-vue";
+import "element-plus/es/components/icon/style/css";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
 import MediaLibrary from "./MediaLibrary.vue";
 import SimilarPhotosPanel from "./SimilarPhotosPanel.vue";
@@ -39,6 +43,7 @@ const error = ref("");
 const viewTitles = {
   library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片",
 };
+const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection };
 type View = keyof typeof viewTitles;
 const view = ref<View>("library");
 const libraryDirectory = ref("");
@@ -119,13 +124,14 @@ async function startArchive() {
 </script>
 
 <template>
+  <ElConfigProvider :locale="zhCn" size="large">
   <header class="app-header">
     <div class="app-header-content">
       <p class="app-name"><img :src="appIcon" alt="" width="24" height="24" />PhotoSys</p>
       <nav class="view-nav" aria-label="功能">
         <button v-for="(title, target) in viewTitles" :key="target" type="button"
-          :aria-pressed="view === target" :disabled="fileTaskBusy" @click="navigate(target)">
-          {{ title }}
+          :aria-pressed="view === target" :aria-current="view === target ? 'page' : undefined" :disabled="fileTaskBusy" @click="navigate(target)">
+          <ElIcon aria-hidden="true"><component :is="viewIcons[target]" /></ElIcon><span>{{ title }}</span>
         </button>
       </nav>
     </div>
@@ -206,14 +212,17 @@ async function startArchive() {
       <p v-if="result.reportPath" class="report">复制说明：<span>{{ result.reportPath }}</span></p>
       <p v-if="result.reportError" class="error">无法写入复制说明。{{ result.reportError }}</p>
     </section>
-    <DuplicatesPanel v-show="view === 'duplicates'" ref="duplicatesPanel" @busy-change="duplicatesBusy = $event" />
-    <SimilarPhotosPanel v-show="view === 'similar'" ref="similarPanel" @busy-change="similarBusy = $event" />
+    <DuplicatesPanel class="utility-panel" v-show="view === 'duplicates'" ref="duplicatesPanel" @busy-change="duplicatesBusy = $event" />
+    <SimilarPhotosPanel class="utility-panel" v-show="view === 'similar'" ref="similarPanel" @busy-change="similarBusy = $event" />
   </main>
+  </ElConfigProvider>
 </template>
 
 <style>
 :root {
-  font-family: Inter, system-ui, sans-serif;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
   color: #152e30;
   background: #f6f5f1;
   --workspace-gutter: clamp(1rem, 2.5vw, 3rem);
@@ -222,6 +231,7 @@ async function startArchive() {
 
 body {
   margin: 0;
+  font-size: 14px;
 }
 
 main {
@@ -243,7 +253,7 @@ header {
 .app-header {
   margin: 0;
   border-bottom: 1px solid #dedfd8;
-  background: #fdfcf9;
+  background: #fff;
 }
 
 .app-header-content {
@@ -254,7 +264,7 @@ header {
   row-gap: 0.25rem;
   box-sizing: border-box;
   max-width: var(--workspace-max-width);
-  min-height: 3.75rem;
+  min-height: 5rem;
   margin: 0 auto;
   padding: 0.5rem var(--workspace-gutter);
 }
@@ -272,11 +282,14 @@ header {
 .view-nav {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.25rem;
+  gap: 0.375rem;
 }
 
 .view-nav button {
-  padding-inline: clamp(0.5rem, 1vw, 0.875rem);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding-inline: clamp(0.75rem, 1.2vw, 1.125rem);
   background: transparent;
   color: #4d5854;
   font-size: 0.875rem;
@@ -310,20 +323,23 @@ h2 {
   color: #395d57;
 }
 
-form,
-section {
+main > form,
+main > section,
+.utility-panel form,
+.utility-panel section {
   padding: clamp(1rem, 4vw, 1.75rem);
   background: #fff;
   border: 1px solid #c9d9d4;
   border-radius: 0.875rem;
 }
 
-section,
+main > section,
+.utility-panel section,
 .folder + .folder {
   margin-top: 1rem;
 }
 
-label {
+label:not([class*="el-"]) {
   display: block;
   margin-bottom: 0.5rem;
   font-weight: 650;
@@ -385,7 +401,7 @@ label {
   overflow-wrap: anywhere;
 }
 
-button {
+button:not(:where([class*="el-"])) {
   min-height: 2.5rem;
   padding: 0.5rem 1rem;
   border: 1px solid transparent;
@@ -403,13 +419,13 @@ button.secondary {
   color: #194f44;
 }
 
-button:disabled {
+button:not(:where([class*="el-"])):disabled {
   background: #dde8e3;
   color: #536863;
   cursor: default;
 }
 
-:is(button, input):focus-visible {
+:is(button, input, select):not([class*="el-"]):focus-visible {
   outline: 2px solid #126353;
   outline-offset: 2px;
 }

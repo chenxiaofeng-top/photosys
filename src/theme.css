@@ -1,0 +1,24 @@
+/* Shared tokens also reach Element Plus dropdowns teleported to body. */
+:root {
+  --el-color-primary: #176252;
+  --el-color-primary-light-3: #528d80;
+  --el-color-primary-light-5: #8bb1a8;
+  --el-color-primary-light-7: #c0d5cf;
+  --el-color-primary-light-8: #d5e5df;
+  --el-color-primary-light-9: #edf4f0;
+  --el-color-primary-dark-2: #124e42;
+  --el-text-color-primary: #24352f;
+  --el-text-color-regular: #42574e;
+  --el-text-color-secondary: #65766e;
+  --el-border-color: #d9e2dc;
+  --el-border-color-light: #e7ece7;
+  --el-fill-color-blank: #fff;
+  --el-border-radius-base: 8px;
+  --el-font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --el-component-size: 40px;
+}
+.el-button + .el-button { margin-left: 0; }
+.el-button { font-weight: 550; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

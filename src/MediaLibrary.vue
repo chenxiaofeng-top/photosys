@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { ElButton, ElCheckbox, ElIcon, ElInput, ElOption, ElSelect } from "element-plus";
+import { FolderOpened, Refresh, Search, Star, StarFilled, Picture, Warning, Loading } from "@element-plus/icons-vue";
+import "element-plus/es/components/button/style/css";
+import "element-plus/es/components/checkbox/style/css";
+import "element-plus/es/components/icon/style/css";
+import "element-plus/es/components/input/style/css";
+import "element-plus/es/components/option/style/css";
+import "element-plus/es/components/select/style/css";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
@@ -544,74 +552,84 @@ async function performFileAction(action: FileAction) {
 <template>
   <div class="media-library">
     <header class="library-header">
-      <h1>媒体库</h1>
+      <div class="library-heading">
+        <h1>媒体库</h1>
+        <p>把每一段回忆，好好珍藏。</p>
+      </div>
       <div v-if="directory" class="directory-toolbar">
         <div class="directory-field">
-          <label for="library-directory">媒体库目录</label>
-          <input id="library-directory" :value="directory" :title="directory" readonly />
+          <label for="library-directory">当前目录</label>
+          <ElInput id="library-directory" :model-value="directory" :title="directory" readonly :prefix-icon="FolderOpened" />
         </div>
-        <button type="button" class="secondary" :disabled="busy" @click="chooseDirectory">更换目录</button>
-        <button type="button" class="secondary" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</button>
+        <ElButton :icon="FolderOpened" :disabled="busy" @click="chooseDirectory">更换目录</ElButton>
+        <ElButton :icon="Refresh" :loading="task === 'scanning'" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</ElButton>
       </div>
     </header>
 
     <AiSearchSettings ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
       @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" />
 
-    <p v-if="task === 'starting'" class="status" role="status">正在恢复媒体库…</p>
-    <p v-else-if="task === 'scanning'" class="status" role="status">正在扫描，已发现 {{ found }} 个媒体文件…</p>
-    <p v-if="scanError" class="error" role="alert">读取媒体库失败。{{ scanError }}</p>
+    <div v-if="task === 'starting' || task === 'scanning'" class="scan-status" role="status">
+      <ElIcon class="is-loading" aria-hidden="true"><Loading /></ElIcon>
+      {{ task === 'starting' ? '正在恢复媒体库…' : `正在扫描，已发现 ${found} 个媒体文件…` }}
+    </div>
+    <div v-if="scanError" class="library-notice" role="alert">
+      <ElIcon aria-hidden="true"><Warning /></ElIcon>
+      <span>读取媒体库失败。{{ scanError }}</span>
+      <ElButton v-if="directory" :disabled="busy" @click="scanDirectory(directory, 'refresh')">重试</ElButton>
+    </div>
 
     <div v-if="!directory && task !== 'starting' && task !== 'scanning'" class="library-empty">
-      <h2>打开照片和视频</h2>
-      <p>选择包含照片或视频的本地目录。</p>
-      <button type="button" :disabled="busy" @click="chooseDirectory">选择目录</button>
+      <ElIcon class="empty-icon" aria-hidden="true"><FolderOpened /></ElIcon>
+      <h2>打开你的照片与视频</h2>
+      <p>选择本地相册目录，开始浏览与收藏美好瞬间。</p>
+      <ElButton type="primary" :icon="FolderOpened" :disabled="busy" @click="chooseDirectory">选择目录</ElButton>
+      <span class="empty-hint">照片保留在原目录，安心浏览</span>
     </div>
 
     <template v-if="summary">
-      <div class="filters">
-        <label>搜索方式
-          <select v-model="searchMode">
-            <option value="filename">文件名</option>
-            <option value="content">照片内容</option>
-          </select>
-        </label>
-        <label class="search-filter">搜索
-          <input v-model="searchInput" type="search" :placeholder="searchMode === 'content' ? '描述照片，例如：海边日落' : '文件名或相对路径'"
+      <div class="library-tools" role="search" aria-label="媒体搜索与筛选">
+        <div class="search-row">
+          <ElSelect v-model="searchMode" class="mode-select" aria-label="搜索方式">
+            <ElOption label="文件名" value="filename" />
+            <ElOption label="照片内容" value="content" />
+          </ElSelect>
+          <ElInput v-model="searchInput" class="search-input" type="search" clearable :prefix-icon="Search"
+            :placeholder="searchMode === 'content' ? '描述照片，例如：海边日落' : '搜索文件名或相对路径…'"
             :aria-label="searchMode === 'content' ? '描述照片内容' : '搜索文件名或相对路径'"
-            @keydown.enter="searchMode === 'content' && submitContentSearch($event)"
+            @clear="clearSearch" @keydown.enter="searchMode === 'content' && submitContentSearch($event as KeyboardEvent)"
             @compositionstart="startComposition" @compositionend="endComposition" />
-        </label>
-        <button v-if="searchMode === 'content'" type="button" :disabled="busy || !aiReady || !searchInput.trim() || composing" @click="submitContentSearch()">搜索照片</button>
-        <button v-if="searchInput" type="button" class="secondary" @click="clearSearch">清空搜索</button>
-        <span v-if="searchMode === 'content'">按内容相关度排序 · 最多 200 张</span>
-        <label v-else>排序
-          <select v-model="sort">
-            <option value="dateDesc">拍摄日期：从新到旧</option>
-            <option value="dateAsc">拍摄日期：从旧到新</option>
-            <option value="nameAsc">名称：升序</option>
-            <option value="nameDesc">名称：降序</option>
-            <option value="sizeDesc">文件大小：从大到小</option>
-            <option value="sizeAsc">文件大小：从小到大</option>
-          </select>
-        </label>
-        <label v-if="searchMode === 'filename'">类型
-          <select v-model="kind">
-            <option value="all">全部类型</option>
-            <option value="photo">照片</option>
-            <option value="video">视频</option>
-          </select>
-        </label>
-        <label>拍摄日期
-          <select v-model="dateMode">
-            <option value="all">全部日期</option>
-            <option value="range">日期范围</option>
-            <option value="unknown">日期未知</option>
-          </select>
-        </label>
-        <label v-if="dateMode === 'range'">起始日期<input v-model="from" type="date" /></label>
-        <label v-if="dateMode === 'range'">结束日期<input v-model="to" type="date" /></label>
-        <label class="favorite-filter"><input v-model="favoritesOnly" type="checkbox" /> 仅收藏</label>
+          <ElButton v-if="searchMode === 'content'" type="primary" :icon="Search"
+            :disabled="busy || !aiReady || !searchInput.trim() || composing" @click="submitContentSearch()">搜索照片</ElButton>
+        </div>
+        <div class="filters">
+          <div v-if="searchMode === 'filename'" class="filter-field">
+            <span id="kind-label">类型</span>
+            <ElSelect v-model="kind" class="kind-select" aria-label="媒体类型">
+              <ElOption label="全部类型" value="all" /><ElOption label="照片" value="photo" /><ElOption label="视频" value="video" />
+            </ElSelect>
+          </div>
+          <div class="filter-field">
+            <span id="date-label">拍摄日期</span>
+            <ElSelect v-model="dateMode" class="date-select" aria-label="拍摄日期">
+              <ElOption label="全部日期" value="all" /><ElOption label="日期范围" value="range" /><ElOption label="日期未知" value="unknown" />
+            </ElSelect>
+          </div>
+          <div v-if="dateMode === 'range'" class="date-range">
+            <label>起始日期<input v-model="from" type="date" /></label>
+            <label>结束日期<input v-model="to" type="date" /></label>
+          </div>
+          <ElCheckbox v-model="favoritesOnly" class="favorite-filter">仅收藏</ElCheckbox>
+          <div v-if="searchMode === 'filename'" class="filter-field sort-field">
+            <span id="sort-label">排序</span>
+            <ElSelect v-model="sort" class="sort-select" aria-label="排序">
+              <ElOption label="拍摄日期：从新到旧" value="dateDesc" /><ElOption label="拍摄日期：从旧到新" value="dateAsc" />
+              <ElOption label="名称：升序" value="nameAsc" /><ElOption label="名称：降序" value="nameDesc" />
+              <ElOption label="文件大小：从大到小" value="sizeDesc" /><ElOption label="文件大小：从小到大" value="sizeAsc" />
+            </ElSelect>
+          </div>
+          <span v-else class="relevance-note">按内容相关度排序 · 最多 200 张</span>
+        </div>
       </div>
 
       <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
@@ -623,18 +641,31 @@ async function performFileAction(action: FileAction) {
       <p v-if="summary.preferenceWarning" class="error" role="alert">{{ summary.preferenceWarning }}</p>
       <p v-if="favoriteError" class="error" role="alert">{{ favoriteError }}</p>
       <p v-if="rotationError && !detail" class="error" role="alert">{{ rotationError }}</p>
-      <p v-if="itemsError" class="error" role="alert">无法读取媒体列表。{{ itemsError }}</p>
+      <div v-if="itemsError" class="library-notice" role="alert">
+        <ElIcon aria-hidden="true"><Warning /></ElIcon><span>无法读取媒体列表。{{ itemsError }}</span>
+        <ElButton :disabled="busy || itemsLoading" @click="revision++">重试</ElButton>
+      </div>
       <p v-else class="result-status status" role="status">
         <template v-if="itemsLoading">正在加载媒体…</template>
         <template v-else-if="results?.total">
           {{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}
         </template>
       </p>
-      <div v-if="!itemsLoading && results?.total === 0" class="library-empty" role="status">
-        <h2>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击搜索' : summary.total ? "没有符合筛选条件的媒体文件" : "此目录没有可识别的照片或视频" }}</h2>
+      <div v-if="itemsLoading && !results?.items.length" class="library-empty" role="status">
+        <ElIcon class="empty-icon is-loading" aria-hidden="true"><Loading /></ElIcon>
+        <h2>正在加载媒体…</h2>
+        <p>精彩回忆，即将呈现。</p>
+      </div>
+      <div v-else-if="!itemsLoading && !itemsError && results?.total === 0" class="library-empty" role="status">
+        <ElIcon class="empty-icon" aria-hidden="true"><component :is="searchMode === 'content' && !query ? Search : Picture" /></ElIcon>
+        <h2>{{ searchMode === 'content' && !query ? '用一句话，找回那个瞬间' : summary.total ? '没有找到匹配的照片或视频' : '这里还没有照片或视频' }}</h2>
+        <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
+        <ElButton v-if="summary.total && (query || kind !== 'all' || dateMode !== 'all' || favoritesOnly)"
+          @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false">清除搜索与筛选</ElButton>
+        <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
-      <ul v-if="results?.items.length" ref="grid" class="media-grid">
+      <ul v-if="results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
         <li v-for="item in results.items" :key="`${summary.scanId}:${item.id}`" class="card">
           <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
@@ -646,9 +677,9 @@ async function performFileAction(action: FileAction) {
             <p class="file-name" :title="item.relativePath">{{ item.name }}</p>
             <div class="card-info">
               <span>{{ item.capturedOn ?? "日期未知" }}</span>
-              <button type="button" class="favorite secondary" :aria-label="`收藏 ${item.name}`"
+              <button type="button" class="favorite secondary" :aria-label="`${item.favorite ? '取消收藏' : '收藏'} ${item.name}`"
                 :title="item.favorite ? '取消收藏' : '收藏'" :aria-pressed="item.favorite"
-                :disabled="busy || itemsLoading || searchPending" @click="toggleFavorite(item)">{{ item.favorite ? "★" : "☆" }}</button>
+                :disabled="busy || itemsLoading || searchPending" @click="toggleFavorite(item)"><ElIcon aria-hidden="true"><component :is="item.favorite ? StarFilled : Star" /></ElIcon></button>
             </div>
           </div>
         </li>
@@ -723,127 +754,64 @@ async function performFileAction(action: FileAction) {
 
 <style scoped>
 .media-library {
-  --library-surface: #fdfcf9;
-  --library-border: #dedfd8;
-  --library-control-border: #a9b5ad;
-  --library-muted: #53635d;
-  --library-preview: #eaece6;
+  --library-surface: #fff;
+  --library-border: #e0e5df;
+  --library-control-border: #cbd6ce;
+  --library-muted: #65736b;
+  --library-preview: #eef0ea;
   color: #24352f;
 }
-
-.library-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  justify-content: space-between;
-  gap: 0.875rem 2rem;
-  margin: 0;
+.library-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1.5rem 2rem; margin: 0 0 1.5rem; }
+.library-heading h1 { font-size: clamp(1.8rem, 2.2vw, 2.5rem); line-height: 1.3; letter-spacing: -0.03em; }
+.library-heading p { margin: 0.4rem 0 0; color: var(--library-muted); }
+.directory-toolbar { display: flex; flex: 0 1 43rem; align-items: end; gap: 0.625rem; min-width: 0; max-width: 100%; }
+.directory-field { flex: 1; min-width: 0; }
+.directory-field label { margin: 0 0 0.375rem; color: var(--library-muted); font-size: 0.8125rem; font-weight: 500; }
+.directory-field :deep(input:not(:focus)) { text-overflow: ellipsis; }
+.library-tools { padding: 1.25rem; border: 1px solid var(--library-border); border-radius: 1rem; background: #fff; }
+.search-row { display: flex; gap: 0.75rem; min-width: 0; }
+.mode-select { flex: 0 0 8.5rem; }
+.search-input { flex: 1; min-width: 0; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #edf0eb; }
+.filter-field { display: flex; align-items: center; gap: 0.625rem; min-width: 0; }
+.filter-field > span { color: var(--library-muted); white-space: nowrap; font-size: 0.875rem; }
+.kind-select { width: 8rem; }
+.date-select { width: 8rem; }
+.sort-select { width: 13rem; }
+.sort-field { margin-left: auto; }
+.favorite-filter { margin-right: 0; }
+.date-range { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.date-range label { display: flex; align-items: center; gap: 0.5rem; margin: 0; font-size: 0.875rem; font-weight: 400; color: var(--library-muted); }
+.date-range input { box-sizing: border-box; min-height: 40px; max-width: 100%; padding: 0.375rem 0.625rem; border: 1px solid var(--library-control-border); border-radius: 8px; color: #24352f; background: #fff; font: inherit; }
+.relevance-note { margin-left: auto; color: var(--library-muted); font-size: 0.875rem; }
+.scan-status, .library-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.625rem; margin: 1rem 0; padding: 0.875rem 1rem; border-radius: 0.75rem; background: #edf4f0; color: #176252; }
+.library-notice { background: #fff2ec; color: #9c3726; }
+.library-notice span { flex: 1; min-width: 12rem; overflow-wrap: anywhere; }
+.library-empty { display: grid; justify-items: center; gap: 0.875rem; margin-top: 1.5rem; padding: clamp(2.5rem, 6vw, 5rem) 1rem; border: 1px dashed #d8e0d7; border-radius: 1rem; background: #ffffffa6; text-align: center; }
+.library-empty p { margin: 0; color: var(--library-muted); }
+.empty-icon { box-sizing: border-box; width: 64px; height: 64px; margin-bottom: 0.5rem; border-radius: 20px; background: #e7f0e9; color: #176252; font-size: 30px; }
+.empty-hint { font-size: 0.8125rem; color: var(--library-muted); }
+@media (max-width: 60rem) {
+  .library-header { align-items: end; gap: 1rem; }
+  .library-heading p { display: none; }
+  .directory-toolbar { flex: 1 1 26rem; }
+  .filters { column-gap: 0.75rem; }
+  .filter-field { gap: 0.5rem; }
+  .kind-select, .date-select { width: 7.5rem; }
+  .sort-select { width: 13rem; }
 }
-
-.library-header h1 {
-  font-size: clamp(1.75rem, 2.2vw, 2.5rem);
-  line-height: 1.2;
+@media (max-width: 48rem) {
+  .directory-toolbar { flex-basis: 100%; }
+  .sort-field { margin-left: 0; }
 }
-
-.directory-toolbar {
-  display: flex;
-  flex: 0 1 44rem;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: 0.5rem;
-  min-width: 0;
-}
-
-.directory-field {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-.directory-field label {
-  margin: 0 0 0.375rem;
-  color: var(--library-muted);
-  font-size: 0.8125rem;
-}
-
-.directory-field input,
-.filters :is(select, input[type="date"], input[type="search"]) {
-  box-sizing: border-box;
-  min-height: 2.5rem;
-  padding: 0.375rem 0.625rem;
-  border: 1px solid var(--library-control-border);
-  border-radius: 0.5rem;
-  background: var(--library-surface);
-  color: inherit;
-  font: inherit;
-}
-
-.directory-field input {
-  width: 100%;
-  font-size: 0.875rem;
-}
-
-.directory-field input:not(:focus) {
-  text-overflow: ellipsis;
-}
-
-.media-library button.secondary:not(.media-preview, .favorite) {
-  border-color: var(--library-control-border);
-  background: var(--library-surface);
-}
-
-.media-library button.secondary:hover:not(.media-preview, .favorite, :disabled) {
-  background: #e7efe9;
-}
-
-.library-empty {
-  display: grid;
-  justify-items: center;
-  gap: 0.75rem;
-  margin-top: 1.25rem;
-  padding: clamp(2rem, 6vw, 5rem) 1rem;
-  border: 1px solid var(--library-border);
-  border-radius: 0.75rem;
-  background: var(--library-surface);
-  text-align: center;
-}
-
-.library-empty p {
-  margin: 0;
-  color: var(--library-muted);
-}
-
-.filters {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.625rem 1.25rem;
-  margin-top: 1.25rem;
-  padding-block: 0.75rem;
-  border-block: 1px solid var(--library-border);
-}
-
-.filters label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin: 0;
-  font-size: 0.875rem;
-}
-
-.filters :is(select, input):focus-visible {
-  outline: 2px solid #126353;
-  outline-offset: 2px;
-}
-
-.favorite-filter {
-  min-height: 2.5rem;
-}
-
-.favorite-filter input {
-  width: 1rem;
-  height: 1rem;
-  margin: 0;
-  accent-color: #176252;
+@media (max-width: 34rem) {
+  .directory-toolbar { flex-wrap: wrap; }
+  .directory-field { flex-basis: 100%; }
+  .search-row { flex-wrap: wrap; }
+  .search-input { flex-basis: calc(100% - 10rem); }
+  .search-row > .el-button { width: 100%; }
+  .sort-field, .sort-select { flex: 1; }
+  .relevance-note { margin-left: 0; }
 }
 
 .status {
@@ -862,7 +830,7 @@ async function performFileAction(action: FileAction) {
 .media-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: clamp(0.625rem, 1vw, 1rem);
+  gap: clamp(1rem, 1.4vw, 1.5rem);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -870,10 +838,13 @@ async function performFileAction(action: FileAction) {
 
 .card {
   min-width: 0;
-  border: 1px solid var(--library-border);
-  border-radius: 0.75rem;
+  border: 1px solid #e7eae4;
+  border-radius: 0.875rem;
   background: var(--library-surface);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
 }
+
+.card:hover, .card:focus-within { border-color: #b6cbbd; box-shadow: 0 5px 18px #24352f0a; }
 
 button.media-preview {
   display: grid;
@@ -884,14 +855,14 @@ button.media-preview {
   padding: 0;
   overflow: hidden;
   border: 0;
-  border-radius: 0.7rem 0.7rem 0 0;
+  border-radius: 0.8rem 0.8rem 0 0;
   background: var(--library-preview);
   color: var(--library-muted);
   font-size: 0.875rem;
 }
 
 .card-details {
-  padding: 0.625rem 0.75rem 0.25rem;
+  padding: 0.875rem 0.875rem 0.375rem;
 }
 
 .file-name {
@@ -914,7 +885,10 @@ button.media-preview {
 }
 
 button.favorite {
-  min-width: 2.5rem;
+  display: grid;
+  place-items: center;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
   padding: 0;
   border-color: transparent;
   background: transparent;
@@ -941,7 +915,8 @@ button.favorite:hover:not(:disabled) {
 }
 
 .pagination {
-  margin-top: 1rem;
+  justify-content: center;
+  margin-top: 1.75rem;
 }
 
 details {
@@ -976,7 +951,7 @@ dialog::backdrop {
 .detail-navigation span { font-variant-numeric: tabular-nums; }
 .detail-actions { margin-top: 1rem; }
 .rotation-actions { margin-top: 0.75rem; }
-.search-filter input { min-width: 0; width: 14rem; max-width: 100%; }
+
 
 .detail-header {
   justify-content: space-between;
