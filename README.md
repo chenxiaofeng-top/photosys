@@ -115,7 +115,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 首次构建、开发或运行 Rust 测试前，在项目根目录执行 `bash scripts/build-media-codec.sh`，生成随包提供的 FFmpeg。脚本会校验固定版本的源码并复用构建产物。macOS 先安装 `brew install pkgconf nasm`。Windows 在 MSYS2 的 UCRT64 终端安装下列工具，并在该终端运行脚本。
 
 ```sh
-pacman -S --needed curl diffutils make mingw-w64-ucrt-x86_64-gcc \
+pacman -S --needed curl diffutils make perl mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
 ```
 

@@ -184,7 +184,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri build -- -- --locked
 2. 安装 [MSYS2](https://www.msys2.org/)，打开 **MSYS2 UCRT64** 终端，进入项目目录（例如 `cd /c/code/photosys`），运行：
 
 ```sh
-pacman -S --needed curl diffutils make mingw-w64-ucrt-x86_64-gcc \
+pacman -S --needed curl diffutils make perl mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
 bash scripts/build-media-codec.sh
 ```
