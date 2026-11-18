@@ -235,6 +235,7 @@ npm run tauri build -- --target universal-apple-darwin -- --locked
 | SHA-256 mismatch | 不要删除校验或随意改哈希。先确认上游来源和实际文件；本地可删掉对应缓存文件后重新下载。运行时缓存为 `src-tauri/target/ai-runtime/`，解码器缓存为 `src-tauri/target/media-codec/sources/`。 |
 | 完整 AI 验证下载或推理失败 | 只有手动勾选时才运行。网络问题可重跑；功能错误需修复后重新验证。日常打包可在新的手动运行中取消勾选，不代表完整 AI 验证已经通过。 |
 | FFmpeg、WebKitGTK、MSVC 或 pkg-config 缺失 | 核对对应平台的依赖安装步骤；本地优先按第 5 节准备，Windows 特别注意 UCRT64 与 PowerShell 的区别。 |
+| failed to run linuxdeploy | 对已经编译的应用运行 `APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri bundle -- --bundles appimage --verbose` 查看具体错误；确认 `patchelf` 命令可用，并按 Linux 依赖命令补齐缺失工具。`bundle` 复用已有应用，修改代码后须重新 `build`。 |
 | Check expected packages / Expected exactly one nonempty | 检查 Build desktop packages 是否成功、产物扩展名和目录是否与 Tauri 平台配置一致；缺少安装包不能发布。 |
 | Artifacts 没有下载项 | 检查该平台任务和 Upload desktop packages 是否成功；过期文件需要重新构建。Artifact 下载需要登录且有仓库读权限。 |
 | Publish GitHub Release 未运行 | 确认是推送版本标签触发，且配置检查、三平台构建、Intel macOS 检查全部成功。main、PR 和手动运行均不发布。 |
