@@ -860,7 +860,7 @@ async function performFileAction(action: FileAction) {
       <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
       <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
       <details v-if="summary && detail.kind === 'photo'" class="detail-people">
-        <summary>照片中的人物 / 整理人脸</summary>
+        <summary>照片中的人物 / 修改分组</summary>
         <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
           @changed="detailPeopleChanged" />
       </details>

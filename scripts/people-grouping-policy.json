@@ -1,8 +1,18 @@
-{
-  "enabled": false,
-  "version": "yunet640-sface112-align5-v1",
-  "threshold": 0.65,
-  "margin": 0.08,
-  "validation": null,
-  "reason": "尚无覆盖成人、儿童、侧脸、遮挡及多年跨度的独立标注验证；自动归组默认关闭。"
-}
+[
+  {
+    "enabled": true,
+    "version": "yunet640-sface112-align5-v1",
+    "threshold": 0.65,
+    "margin": 0.08,
+    "validation": null,
+    "reason": "已开启保守自动分组，家庭相册准确率尚未独立验证。分组有误可手动修改，不确定的人脸保留在待整理。"
+  },
+  {
+    "enabled": true,
+    "version": "yunet640-auraface112-align5-v1",
+    "threshold": 0.65,
+    "margin": 0.08,
+    "validation": null,
+    "reason": "已开启保守自动分组，家庭相册准确率尚未独立验证。分组有误可手动修改，不确定的人脸保留在待整理。"
+  }
+]

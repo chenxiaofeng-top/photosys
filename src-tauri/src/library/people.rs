@@ -129,7 +129,7 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
     state.undo_description = undo;
     let policy = grouping::Policy::shipped();
     state.auto_grouping = policy.allowed();
-    if !state.auto_grouping {
+    if !policy.accuracy_validated() {
         state.message = Some(policy.reason);
     }
     Ok(state)
@@ -212,8 +212,13 @@ fn update(
     let records = store.records()?;
     let rotations = { current(&*session()?, scan_id)?.rotations.clone() };
     let policy = grouping::Policy::shipped();
-    let mut groups = grouping::Groups::load(scan_id, policy.clone())?;
-    let mut edits = EDIT_GENERATION.load(Ordering::Relaxed);
+    let (mut groups, mut edits) = {
+        let _edit = MUTATION.lock().map_err(error)?;
+        (
+            grouping::Groups::load(scan_id, policy.clone())?,
+            EDIT_GENERATION.load(Ordering::Relaxed),
+        )
+    };
     let interrupted = || {
         cancel.load(Ordering::Relaxed)
             || MODEL_GENERATION.load(Ordering::Relaxed) != generation
@@ -265,12 +270,7 @@ fn update(
                 &result,
                 runtime.spec.feature_version,
             )?;
-            let current_edits = EDIT_GENERATION.load(Ordering::Relaxed);
-            if current_edits != edits {
-                groups = grouping::Groups::load(scan_id, policy.clone())?;
-                edits = current_edits;
-            }
-            groups.assign(&mut store, &ids)?;
+            assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, &ids)?;
             if result.is_ok() {
                 state.indexed += 1;
             } else {
@@ -294,7 +294,7 @@ fn update(
                 .collect::<HashSet<_>>(),
         )?;
     }
-    // Also organize previously detected faces after a policy becomes validated.
+    // Reuse existing features to organize faces detected before automatic grouping was enabled.
     if policy.allowed() && !interrupted() {
         let ids = grouping::Groups::pending_ids(scan_id)?;
         for chunk in ids.chunks(64) {
@@ -302,18 +302,29 @@ fn update(
                 break;
             }
             let _edit = MUTATION.lock().map_err(error)?;
-            let current_edits = EDIT_GENERATION.load(Ordering::Relaxed);
-            if edits != current_edits {
-                groups = grouping::Groups::load(scan_id, policy.clone())?;
-                edits = current_edits;
-            }
-            groups.assign(&mut store, chunk)?;
+            assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, chunk)?;
         }
     }
     drop(_active);
     let mut final_state = status(scan_id)?;
     final_state.reused = state.reused;
     Ok(final_state)
+}
+// Caller holds MUTATION so representative reload and assignment see the same manual edits.
+fn assign_with_edits(
+    scan_id: u64,
+    store: &mut Store,
+    groups: &mut grouping::Groups,
+    policy: &grouping::Policy,
+    edits: &mut u64,
+    ids: &[i64],
+) -> Result<(), String> {
+    let current_edits = EDIT_GENERATION.load(Ordering::Relaxed);
+    if *edits != current_edits {
+        *groups = grouping::Groups::load(scan_id, policy.clone())?;
+        *edits = current_edits;
+    }
+    groups.assign(store, ids)
 }
 #[tauri::command]
 pub(crate) async fn people_update_index(

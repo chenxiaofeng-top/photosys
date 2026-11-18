@@ -100,16 +100,17 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
       <button v-if="!selected" type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>
     </div>
     <progress v-if="running && state?.total" :value="state.indexed + state.failed" :max="state.total" aria-label="人物分析进度"></progress>
-    <p v-if="state?.message" class="notice" role="status">{{ state.message }} 检出的人脸可在“待整理”中手动归入人物。</p>
+    <p v-if="state" class="muted" role="status">{{ state.autoGrouping ? '保守自动分组已开启 · 自动生成未命名人物，可为整组命名；不确定的人脸保留在待整理。' : '自动分组未开启，可在待整理中手动指定人物。' }}</p>
+    <p v-if="state?.message" class="notice" role="status">{{ state.message }}</p>
     <p v-if="state && !state.writable" class="notice">此相册只读，可以浏览已有的人物和时间线。</p>
     </details>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <template v-if="selected">
       <div class="people-actions detail-title"><button type="button" class="secondary" @click="emit('select', undefined)">返回人物列表</button><h2>{{ personName(selected) }}</h2><button type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button></div>
-      <details class="person-management"><summary>管理人物与人脸</summary>
+      <details class="person-management"><summary>修改分组 / 管理人物与人脸</summary>
         <form class="people-actions" @submit.prevent="mutate('rename')"><label>人物名称 <input v-model="rename" maxlength="80" placeholder="例如：妈妈" :disabled="editDisabled" /></label><button type="submit" :disabled="editDisabled">保存名称</button></form>
         <div class="people-actions"><label>查找合并目标 <input v-model="mergeSearch" maxlength="80" placeholder="输入另一人物的名称" /></label><label>合并到 <select v-model="mergeTarget" :disabled="editDisabled"><option value="">选择人物</option><option v-for="p in mergeTargets?.items.filter(p => p.id !== selected!.id)" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option></select></label><button type="button" class="secondary" :disabled="editDisabled || !mergeTarget" @click="mutate('merge')">合并人物</button></div>
-        <p class="muted">误分的人脸可归入其他人物或新建人物。合并和改名均可撤销。</p>
+        <p class="muted">勾选误分的人脸，可移入已有人物或拆成新人物；同一人的重复分组可合并。人工修改优先，后续自动分析不会覆盖，可撤销。</p>
         <PeopleFaceEditor :scan-id="scanId" :person-id="selected.id" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
       </details>
     </template>
@@ -122,7 +123,7 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
       <template v-if="scope === 'people'">
         <label class="people-search">查找人物 <input v-model="search" placeholder="输入人物名称" maxlength="80" /></label>
         <p v-if="loading" role="status">正在读取人物…</p>
-        <div v-else-if="!people?.total" class="people-empty"><h2>把家人的回忆聚在一起</h2><p>建立人物索引后，在“待整理”中选择人脸并命名，创建人物相册和成长时间线。</p></div>
+        <div v-else-if="!people?.total" class="people-empty"><h2>把家人的回忆聚在一起</h2><p>建立人物索引后，系统自动生成未命名人物分组，你可以给整组命名；不确定的人脸可在“待整理”中手动归入人物。</p></div>
         <ul v-if="people?.items.length" class="person-grid">
           <li v-for="person in people.items" :key="person.id"><button type="button" class="person-card secondary" @click="emit('select', person)">
             <img v-if="person.thumbnail" :src="person.thumbnail" :alt="personName(person)" width="112" height="112" loading="lazy" /><span v-else class="avatar-placeholder" aria-hidden="true">人</span>

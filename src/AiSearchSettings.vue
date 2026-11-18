@@ -218,7 +218,7 @@ defineExpose({ refreshIndex });
       <ElButton class="settings-toggle" text :icon="Setting" :aria-expanded="open" :aria-controls="settingsId" @click="open = !open">{{ peopleModel ? '人物模型设置' : 'AI 搜索设置' }}</ElButton>
     </div>
     <div v-show="open" :id="settingsId" class="ai-settings-body">
-      <p>{{ peopleModel ? "在本机检出人脸，按人物整理家庭照片。" : "用中文描述寻找照片。" }}模型安装后可断网使用，照片只在本机处理。</p>
+      <p>{{ peopleModel ? "在本机检出人脸，自动按人物分组，可命名和修改归属。" : "用中文描述寻找照片。" }}模型安装后可断网使用，照片只在本机处理。</p>
       <p>当前使用：<strong>{{ activeModel?.name ?? '正在读取…' }}</strong></p>
       <label class="model-picker">选择模型
         <select v-model="selectedModelId" :disabled="modelTask" @change="selectModel">

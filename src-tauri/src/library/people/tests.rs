@@ -443,6 +443,226 @@ fn fixed_anchors_avoid_transitive_merges_and_respect_manual_decisions() {
     *session().unwrap() = None;
 }
 
+// The active model is process-wide; callers hold TEST_SESSION and restore it on exit.
+struct RestorePeopleModel(&'static ai::catalog::ModelSpec);
+impl Drop for RestorePeopleModel {
+    fn drop(&mut self) {
+        ai::catalog::select(self.0);
+        *session().unwrap() = None;
+    }
+}
+fn model_face(spec: &ai::catalog::ModelSpec, components: &[f32]) -> Face {
+    let mut f = face(0);
+    let mut v = vec![0.; spec.dimension];
+    v[..components.len()].copy_from_slice(components);
+    f.vector = Some(v);
+    f
+}
+fn assigned(store: &Store, id: i64) -> Option<i64> {
+    store
+        .connection
+        .query_row("SELECT person_id FROM faces WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn conservative_grouping_for_both_models_reuses_features_and_keeps_uncertain_faces_pending() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let _restore = RestorePeopleModel(ai::catalog::active(ai::ModelKind::People));
+    for model in ["yunet-sface-fp32-v1", "yunet-auraface-fp32-v1"] {
+        let spec = ai::catalog::find(ai::ModelKind::People, model).unwrap();
+        ai::catalog::select(spec);
+        let album = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            RgbImage::new(2, 2)
+                .save(album.path().join(format!("{i}.png")))
+                .unwrap();
+        }
+        let id = open(album.path());
+        let scan = scan(id).unwrap();
+        let mut store = Store::open(&scan, true).unwrap().unwrap();
+        let mut small = model_face(spec, &[1.]);
+        small.vector = None;
+        let mut malformed = model_face(spec, &[1.]);
+        malformed.vector = Some(vec![1.]);
+        let found = [
+            model_face(spec, &[1.]),
+            model_face(spec, &[0.9, 0., 0.4358899]),
+            model_face(spec, &[0., 1.]),
+            model_face(spec, &[0.70710677, 0.70710677]),
+            small,
+            malformed,
+            model_face(spec, &[f32::NAN]),
+            model_face(spec, &[1.]),
+        ];
+        let mut ids = Vec::new();
+        for (i, (item, f)) in scan.items.iter().zip(found).enumerate() {
+            let mut faces = vec![f.clone()];
+            if i == 7 {
+                faces.push(f);
+            }
+            ids.extend(
+                store
+                    .save_for_model(
+                        &favorites::path_key(&item.file.relative),
+                        &item.file.stamp.portable_key(),
+                        0,
+                        &Ok(faces),
+                        spec.feature_version,
+                    )
+                    .unwrap(),
+            );
+        }
+        // These were indexed before grouping was enabled. Only cached vectors are read.
+        let before = store.records().unwrap();
+        let mut groups = grouping::Groups::load(id, grouping::Policy::shipped()).unwrap();
+        groups
+            .assign(&mut store, &grouping::Groups::pending_ids(id).unwrap())
+            .unwrap();
+        let a = assigned(&store, ids[0]).unwrap();
+        assert_eq!(assigned(&store, ids[1]), Some(a));
+        let b = assigned(&store, ids[2]).unwrap();
+        assert_ne!(a, b);
+        for index in [3, 4, 5, 6, 8] {
+            assert_eq!(assigned(&store, ids[index]), None);
+        }
+        assert_eq!(assigned(&store, ids[7]), Some(a));
+        assert!(status(id).unwrap().auto_grouping);
+        assert_eq!(status(id).unwrap().pending_faces, 5);
+        assert_eq!(status(id).unwrap().indexed, 8);
+        assert!(
+            query::faces(id, FaceScope::Person, Some(a), None, 0)
+                .unwrap()
+                .items
+                .iter()
+                .all(|f| !f.manual)
+        );
+        // Simulate stopping/reopening and continuing: no duplicate groups or inference writes.
+        let mut groups = grouping::Groups::load(id, grouping::Policy::shipped()).unwrap();
+        groups
+            .assign(&mut store, &grouping::Groups::pending_ids(id).unwrap())
+            .unwrap();
+        assert_eq!(query::people(id, "", 0).unwrap().total, 2);
+        for (path, record) in before {
+            let after = store.records().unwrap();
+            assert_eq!(record.stamp, after[&path].stamp);
+            assert_eq!(record.version, after[&path].version);
+        }
+    }
+}
+
+#[test]
+fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_models() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let _restore = RestorePeopleModel(ai::catalog::active(ai::ModelKind::People));
+    for model in ["yunet-sface-fp32-v1", "yunet-auraface-fp32-v1"] {
+        let spec = ai::catalog::find(ai::ModelKind::People, model).unwrap();
+        ai::catalog::select(spec);
+        let album = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            RgbImage::new(2, 2)
+                .save(album.path().join(format!("{i}.png")))
+                .unwrap();
+        }
+        let id = open(album.path());
+        let scan = scan(id).unwrap();
+        let mut store = Store::open(&scan, true).unwrap().unwrap();
+        let mut ids = Vec::new();
+        for (i, item) in scan.items.iter().enumerate() {
+            let f = if i == 1 {
+                model_face(spec, &[0.9, 0., 0.4358899])
+            } else {
+                model_face(spec, &[1.])
+            };
+            ids.extend(
+                store
+                    .save_for_model(
+                        &favorites::path_key(&item.file.relative),
+                        &item.file.stamp.portable_key(),
+                        0,
+                        &Ok(vec![f]),
+                        spec.feature_version,
+                    )
+                    .unwrap(),
+            );
+        }
+        let policy = grouping::Policy::shipped();
+        let mut groups = grouping::Groups::load(id, policy.clone()).unwrap();
+        let mut edits = EDIT_GENERATION.load(Ordering::Relaxed);
+        assign_with_edits(id, &mut store, &mut groups, &policy, &mut edits, &ids[..2]).unwrap();
+        let old = assigned(&store, ids[0]).unwrap();
+        // Use the same IPC mutation path as the UI while analysis still holds its old anchors.
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Assign {
+                face_ids: vec![ids[0]],
+                person_id: None,
+                name: Some("纠正的人物".into()),
+            },
+        ))
+        .unwrap();
+        let corrected = assigned(&store, ids[0]).unwrap();
+        assert_ne!(corrected, old);
+        assign_with_edits(id, &mut store, &mut groups, &policy, &mut edits, &ids[..3]).unwrap();
+        assert_eq!(assigned(&store, ids[0]), Some(corrected));
+        assert_eq!(assigned(&store, ids[1]), Some(old));
+        assert_eq!(assigned(&store, ids[2]), Some(corrected));
+        // Move another batch, then merge the duplicate group and ignore a detection.
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Assign {
+                face_ids: vec![ids[1], ids[3]],
+                person_id: Some(corrected),
+                name: None,
+            },
+        ))
+        .unwrap();
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Merge {
+                source_id: old,
+                target_id: corrected,
+            },
+        ))
+        .unwrap();
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Ignore {
+                face_ids: vec![ids[4]],
+            },
+        ))
+        .unwrap();
+        assign_with_edits(id, &mut store, &mut groups, &policy, &mut edits, &ids).unwrap();
+        assert_eq!(assigned(&store, ids[4]), None);
+        assert_eq!(assigned(&store, ids[5]), Some(corrected));
+        drop(store);
+        query::close_for_test();
+        let mut store = Store::open(&scan, true).unwrap().unwrap();
+        // Persistent undo restores ignore, merge, and batch move in reverse order.
+        for _ in 0..3 {
+            tauri::async_runtime::block_on(people_undo(id)).unwrap();
+        }
+        assert_eq!(assigned(&store, ids[1]), Some(old));
+        assert_eq!(assigned(&store, ids[3]), None);
+        let mut groups = grouping::Groups::load(id, policy).unwrap();
+        groups.assign(&mut store, &ids).unwrap();
+        assert_eq!(assigned(&store, ids[0]), Some(corrected));
+        assert_eq!(assigned(&store, ids[1]), Some(old));
+        assert_eq!(assigned(&store, ids[3]), Some(corrected));
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Rename {
+                person_id: corrected,
+                name: "家人".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(query::people(id, "家人", 0).unwrap().items[0].id, corrected);
+    }
+}
+
 #[test]
 #[ignore = "requires PHOTOSYS_PEOPLE_MODEL_DIR and PHOTOSYS_PEOPLE_PACKAGE"]
 fn real_faces_install_incremental_cancel_and_restore() {
@@ -480,11 +700,25 @@ fn real_faces_install_incremental_cancel_and_restore() {
     assert_eq!(initial.indexed, 3);
     assert!(initial.enabled);
     assert!(!initial.running);
-    assert_eq!(initial.pending_faces, 3);
-    assert!(!initial.auto_grouping);
+    assert_eq!(initial.pending_faces, 0);
+    assert!(initial.auto_grouping);
+    assert_eq!(query::people(id, "", 0).unwrap().total, 1);
+    // Emulate an existing pre-grouping index and exercise the real automatic update path.
+    {
+        let scan = scan(id).unwrap();
+        let store = Store::open(&scan, true).unwrap().unwrap();
+        store
+            .connection
+            .execute_batch("UPDATE faces SET person_id=NULL; DELETE FROM people;")
+            .unwrap();
+    }
+    assert_eq!(status(id).unwrap().pending_faces, 3);
     let same = update(id, true, &channel, || Ok(runtime.clone())).unwrap();
     assert_eq!(same.reused, 3);
-    let f = query::faces(id, FaceScope::Pending, None, None, 0).unwrap();
+    assert_eq!(same.pending_faces, 0);
+    assert_eq!(query::people(id, "", 0).unwrap().total, 1);
+    let person = query::people(id, "", 0).unwrap().items[0].id;
+    let f = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
     let face_id = f.items[0].id;
     let scan = scan(id).unwrap();
     let mut s = Store::open(&scan, true).unwrap().unwrap();
@@ -894,7 +1128,7 @@ fn evaluate_labeled_people() {
         && accepted >= 1000
         && correct as f64 / accepted as f64 >= 0.99
         && strata_ok;
-    let report = serde_json::json!({"enabled":enabled,"version":faces::VERSION,"threshold":threshold,"margin":0.08,"validation":{"pipeline":"fixed-anchors-hnsw-exact-v1","correct_links":correct,"accepted_links":accepted,"coverage":m.coverage,"strata":m.strata,"strata_correct":m.strata_correct,"dataset_sha256":fingerprint},"reason":if enabled{"独立标注验证通过。"}else{"独立标注验证未达到发布门槛，自动归组保持关闭。"},"calibration":candidates,"validation_total_samples":m.total_samples,"validation_usable_faces":m.usable_faces});
+    let report = serde_json::json!({"enabled":enabled,"version":faces::VERSION,"threshold":threshold,"margin":0.08,"validation":{"pipeline":"fixed-anchors-hnsw-exact-v1","correct_links":correct,"accepted_links":accepted,"coverage":m.coverage,"strata":m.strata,"strata_correct":m.strata_correct,"dataset_sha256":fingerprint},"reason":if enabled{"独立标注验证通过。"}else{"独立标注验证未达到准确率验收门槛。运行时启用状态不由此报告决定。"},"calibration":candidates,"validation_total_samples":m.total_samples,"validation_usable_faces":m.usable_faces});
     fs::write(&output, serde_json::to_string_pretty(&report).unwrap()).unwrap();
     println!(
         "release gate passed={enabled}; accepted={accepted}; correct={correct}; report={}",
@@ -1120,7 +1354,7 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
     )
     .unwrap();
     let album = tempfile::tempdir().unwrap();
-    fs::copy(portrait, album.path().join("portrait.jpg")).unwrap();
+    fs::copy(&portrait, album.path().join("portrait.jpg")).unwrap();
     let id = open(album.path());
     let old = ai::catalog::default_model(ai::ModelKind::People);
     ai::catalog::select(old);
@@ -1132,7 +1366,8 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
         1
     );
     drop(runtime);
-    let cards = query::faces(id, FaceScope::Pending, None, None, 0).unwrap();
+    let person = query::people(id, "", 0).unwrap().items[0].id;
+    let cards = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
     assert!(!cards.items.is_empty());
     let face_id = cards.items[0].id;
     let scan = scan(id).unwrap();
@@ -1163,7 +1398,7 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
     let result = update(id, false, &Channel::new(|_| Ok(())), || Ok(runtime.clone())).unwrap();
     assert_eq!(result.indexed, 1);
     assert!(!result.needs_rebuild);
-    assert!(!result.auto_grouping);
+    assert!(result.auto_grouping);
     let cards = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
     assert_eq!(cards.items[0].id, face_id);
     assert!(cards.items[0].manual);
@@ -1181,13 +1416,25 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
         512 * 4
     );
     drop(store);
+    fs::copy(&portrait, album.path().join("new-portrait.jpg")).unwrap();
+    let id = open(album.path());
+    let incremental = update(id, true, &Channel::new(|_| Ok(())), || Ok(runtime.clone())).unwrap();
+    assert_eq!(incremental.reused, 1);
+    assert_eq!(incremental.indexed, 2);
+    assert_eq!(incremental.pending_faces, 0);
+    assert_eq!(
+        query::faces(id, FaceScope::Person, Some(person), None, 0)
+            .unwrap()
+            .total,
+        2
+    );
     ai::catalog::select(old);
     assert!(status(id).unwrap().needs_rebuild);
     assert_eq!(
         query::photos(id, person, &all(), Sort::DateAsc, 0)
             .unwrap()
             .total,
-        1
+        2
     );
     *session().unwrap() = None;
 }

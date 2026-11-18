@@ -64,21 +64,21 @@ function selectAll() { selected.value = results.value?.items.map(f => f.id) ?? [
           <label><input v-model="selected" type="checkbox" :value="face.id" :disabled="disabled" :aria-label="`选择人脸 ${face.id}`" />
             <img :src="face.thumbnail" :alt="face.personName || '未命名人脸'" width="112" height="112" loading="lazy" />
           </label>
-          <p>{{ face.personName || (face.personId ? `未命名人物 ${face.personId}` : '待整理') }}<span v-if="face.ignored"> · 已忽略</span></p>
+          <p>{{ face.personName || (face.personId ? `未命名人物 ${face.personId}` : '待整理') }}<span v-if="face.personId"> · {{ face.manual ? '人工指定' : '自动归入' }}</span><span v-if="face.ignored"> · 已忽略</span></p>
           <p v-if="face.needsReview" class="review">照片已变化，这是旧标注。请核对当前检出的人脸后重新指定人物，或忽略此标注。</p>
           <button type="button" class="photo-link secondary" :title="face.fileName" @click="emit('preview', face.fileId)">查看原照片</button>
         </li>
       </ul>
       <fieldset :disabled="disabled" class="assign-controls">
-        <legend>整理选中的人脸</legend>
+        <legend>修改选中人脸的分组</legend>
         <label>查找目标人物 <input v-model="search" placeholder="输入人物名称" maxlength="80" /></label>
         <label>归属人物 <select v-model="target">
-          <option value="new">新建人物</option>
+          <option value="new">拆成新人物 / 新建人物</option>
           <option v-for="p in targets?.items" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option>
         </select></label>
         <span v-if="targets && targets.total > 24" class="muted">仅显示前 24 项，请输入名称缩小范围。</span>
         <label v-if="target === 'new'">新人物名称 <input v-model="newName" placeholder="可稍后命名" maxlength="80" /></label>
-        <button type="button" :disabled="!canAssign" @click="edit('assign')">{{ target === 'new' ? '创建人物并归入' : '归入此人物' }}</button>
+        <button type="button" :disabled="!canAssign" @click="edit('assign')">{{ target === 'new' ? '创建人物并归入' : '移入此人物' }}</button>
         <button v-if="scope !== 'ignored'" type="button" class="secondary" :disabled="!selected.length" @click="edit('ignore')">忽略所选</button>
         <button v-else type="button" class="secondary" :disabled="!selected.length" @click="edit('restore')">恢复所选</button>
       </fieldset>

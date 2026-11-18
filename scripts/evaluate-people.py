@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Calibrate and evaluate the actual Rust face/grouping pipeline on labeled local photos.
-Writes a report; does not enable automatic grouping or modify the release policy.
+Writes an accuracy acceptance report; does not modify runtime grouping policies.
 """
 import argparse
 import os

@@ -28,19 +28,41 @@ pub(super) struct Validation {
 }
 impl Policy {
     pub fn shipped() -> Self {
-        serde_json::from_str(include_str!(
+        Self::for_version(crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version)
+    }
+    fn for_version(version: &str) -> Self {
+        let policies: Vec<Self> = serde_json::from_str(include_str!(
             "../../../../scripts/people-grouping-policy.json"
         ))
-        .expect("bundled grouping policy")
+        .expect("bundled grouping policies");
+        policies
+            .into_iter()
+            .find(|p| p.version == version)
+            .unwrap_or_else(|| Self {
+                enabled: false,
+                version: version.into(),
+                threshold: 0.65,
+                margin: 0.08,
+                validation: None,
+                reason: "当前人物模型版本不支持自动分组，可手动整理人脸。".into(),
+            })
     }
-    pub fn allowed(&self) -> bool {
+    fn allowed_for_version(&self, version: &str) -> bool {
         self.enabled
-            && self.version
-                == crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version
+            && self.version == version
             && self.threshold.is_finite()
             && (0.0..1.0).contains(&self.threshold)
             && self.margin.is_finite()
             && (0.0..1.0).contains(&self.margin)
+    }
+    pub fn allowed(&self) -> bool {
+        self.allowed_for_version(
+            crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version,
+        )
+    }
+    // Accuracy acceptance is independent of whether correctable grouping can run.
+    pub fn accuracy_validated(&self) -> bool {
+        self.allowed()
             && self.validation.as_ref().is_some_and(|v| {
                 v.pipeline == "fixed-anchors-hnsw-exact-v1"
                     && v.accepted_links >= 1000
@@ -237,11 +259,27 @@ use rusqlite::OptionalExtension;
 mod tests {
     use super::*;
     #[test]
-    fn unvalidated_policy_never_groups() {
-        let mut p = Policy::shipped();
-        p.enabled = true;
-        assert!(!p.allowed());
-        assert!(!Policy::shipped().allowed());
+    fn runtime_policy_supports_both_versions_without_claiming_accuracy() {
+        for version in [
+            "yunet640-sface112-align5-v1",
+            "yunet640-auraface112-align5-v1",
+        ] {
+            let mut p = Policy::for_version(version);
+            assert!(p.allowed_for_version(version));
+            assert!(p.validation.is_none());
+            assert!(!p.accuracy_validated());
+            assert!(!p.allowed_for_version("unknown"));
+            p.threshold = f32::NAN;
+            assert!(!p.allowed_for_version(version));
+            p.threshold = 0.65;
+            p.margin = -0.1;
+            assert!(!p.allowed_for_version(version));
+            p.margin = 0.08;
+            p.enabled = false;
+            assert!(!p.allowed_for_version(version));
+        }
+        let p = Policy::for_version("unknown");
+        assert!(!p.allowed_for_version("unknown"));
     }
 }
 
@@ -249,7 +287,8 @@ mod tests {
 mod release_gate_tests {
     use super::*;
     #[test]
-    fn release_gate_requires_accuracy_each_stratum_and_matching_pipeline() {
+    fn accuracy_acceptance_requires_each_stratum_and_matching_pipeline() {
+        let _session = crate::library::TEST_SESSION.lock().unwrap();
         let mut policy = Policy::shipped();
         policy.enabled = true;
         let strata = ["adult", "child", "profile", "occluded", "years"]
@@ -265,9 +304,9 @@ mod release_gate_tests {
             strata_correct: strata,
             dataset_sha256: "a".repeat(64),
         });
-        assert!(policy.allowed());
+        assert!(policy.accuracy_validated());
         policy.validation.as_mut().unwrap().correct_links = 989;
-        assert!(!policy.allowed());
+        assert!(!policy.accuracy_validated());
         policy.validation.as_mut().unwrap().correct_links = 995;
         policy
             .validation
@@ -275,7 +314,7 @@ mod release_gate_tests {
             .unwrap()
             .strata_correct
             .insert("child".into(), 98);
-        assert!(!policy.allowed());
+        assert!(!policy.accuracy_validated());
         policy
             .validation
             .as_mut()
@@ -283,6 +322,6 @@ mod release_gate_tests {
             .strata_correct
             .insert("child".into(), 100);
         policy.version = "old".into();
-        assert!(!policy.allowed());
+        assert!(!policy.accuracy_validated());
     }
 }
