@@ -2,7 +2,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { ElButton, ElCheckbox, ElIcon, ElInput, ElOption, ElSelect } from "element-plus";
-import { FolderOpened, Refresh, Search, Star, StarFilled, Picture, Warning, Loading } from "@element-plus/icons-vue";
+import { FolderOpened, Refresh, Search, Star, StarFilled, Picture, Warning, Loading, VideoPlay } from "@element-plus/icons-vue";
 import "element-plus/es/components/button/style/css";
 import "element-plus/es/components/checkbox/style/css";
 import "element-plus/es/components/icon/style/css";
@@ -822,16 +822,18 @@ async function performFileAction(action: FileAction) {
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
             <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId"
               :file-id="item.id" :video="item.kind === 'video'" :rotation="item.rotation" />
-            <span v-else>{{ item.kind === "video" ? "▶ 视频" : "照片" }}</span>
+            <span v-else class="media-placeholder"><ElIcon aria-hidden="true"><component :is="item.kind === 'video' ? VideoPlay : Picture" /></ElIcon>{{ item.kind === "video" ? "视频" : "照片" }}</span>
           </button>
           <div class="card-details">
-            <p class="file-name" :title="item.relativePath">{{ item.name }}</p>
-            <p class="card-location" :title="item.location?.address ?? shortLocation(item.location)">{{ shortLocation(item.location) }}</p>
-            <div class="card-info">
-              <span>{{ item.capturedOn ?? "日期未知" }}</span>
+            <div class="card-heading">
+              <p class="file-name" :title="item.relativePath">{{ item.name }}</p>
               <button type="button" class="favorite secondary" :aria-label="`${item.favorite ? '取消收藏' : '收藏'} ${item.name}`"
                 :title="item.favorite ? '取消收藏' : '收藏'" :aria-pressed="item.favorite"
                 :disabled="busy || itemsLoading || searchPending" @click="toggleFavorite(item)"><ElIcon aria-hidden="true"><component :is="item.favorite ? StarFilled : Star" /></ElIcon></button>
+            </div>
+            <div class="card-info">
+              <span :title="item.capturedOn ?? '日期未知'">{{ item.capturedOn ?? "日期未知" }}</span>
+              <span class="card-location" :title="item.location?.address ?? shortLocation(item.location)">{{ shortLocation(item.location) }}</span>
             </div>
           </div>
         </li>
@@ -860,10 +862,10 @@ async function performFileAction(action: FileAction) {
       </details>
     </template>
 
-    <dialog v-if="detail" ref="dialog" aria-labelledby="library-preview-title"
+    <dialog v-if="detail" ref="dialog" class="media-detail" aria-labelledby="library-preview-title"
       @cancel.prevent="closeDetails" @close="finishDetails" @keydown="handleDetailKey">
       <header class="detail-header">
-        <h2 id="library-preview-title">{{ detail.name }}</h2>
+        <h2 id="library-preview-title" :title="detail.name">{{ detail.name }}</h2>
         <button type="button" class="secondary" @click="closeDetails">关闭</button>
       </header>
       <nav class="detail-navigation" aria-label="连续浏览">
@@ -871,306 +873,180 @@ async function performFileAction(action: FileAction) {
         <span role="status">第 {{ detailPosition + 1 }} / {{ detailPage?.total ?? 0 }} 项</span>
         <button type="button" class="secondary" :disabled="detailNavigating || rotationSaving || detailPosition + 1 >= (detailPage?.total ?? 0)" @click="moveDetail(1)">下一项</button>
       </nav>
-      <p v-if="detailNavigating" class="status" role="status">正在切换媒体…</p>
-      <video v-else-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
-        :aria-label="detail.name" controls playsinline
-        @error="handleLiveVideoError" />
-      <RotatableImage v-else-if="detailImage" :src="detailImage" :alt="detail.name" :rotation="detail.rotation" detail
-        @error="previewReady = false; previewError = '无法显示图片预览。'" />
-      <p v-else-if="detail.previewAvailable && !previewError" class="status" role="status">正在加载预览…</p>
-      <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
-      <div v-if="detail.kind === 'photo' && detail.previewAvailable && !liveVideoUrl" class="rotation-actions">
-        <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(-90)">向左旋转 90°</button>
-        <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(90)">向右旋转 90°</button>
-        <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
+      <div class="detail-body">
+        <div class="detail-viewer">
+          <p v-if="detailNavigating" class="status" role="status">正在切换媒体…</p>
+          <video v-else-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
+            :aria-label="detail.name" controls playsinline
+            @error="handleLiveVideoError" />
+          <RotatableImage v-else-if="detailImage" :src="detailImage" :alt="detail.name" :rotation="detail.rotation" detail
+            @error="previewReady = false; previewError = '无法显示图片预览。'" />
+          <p v-else-if="detail.previewAvailable && !previewError" class="status" role="status">正在加载预览…</p>
+          <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
+          <p v-else-if="!detail.previewAvailable && !detailNavigating" class="viewer-placeholder">此媒体暂不支持预览，可用系统默认应用打开。</p>
+        </div>
+        <aside class="detail-information" aria-label="媒体信息与操作">
+          <h3 class="information-heading">{{ detail.kind === 'video' ? '视频信息' : '照片信息' }}</h3>
+          <div v-if="detail.kind === 'photo' && detail.previewAvailable && !liveVideoUrl" class="rotation-actions">
+            <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(-90)">向左旋转 90°</button>
+            <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(90)">向右旋转 90°</button>
+            <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
+          </div>
+          <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
+          <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
+          <details v-if="summary && detail.kind === 'photo'" class="detail-people">
+            <summary>照片中的人物 / 修改分组</summary>
+            <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
+              @changed="detailPeopleChanged" />
+          </details>
+          <div class="detail-location">
+            <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
+            <template v-if="detail.location">
+              <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
+              <button type="button" class="secondary" @click="locateDetail">在地图中查看</button>
+            </template>
+          </div>
+          <p class="detail-path">{{ detail.relativePath }}</p>
+          <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
+          <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
+            @click="playLivePhoto">
+            {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
+          </button>
+          <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
+          <div class="detail-actions">
+            <button type="button" :disabled="!!fileAction || detailNavigating" @click="performFileAction('open')">
+              {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
+            </button>
+            <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('reveal')">在文件管理器中显示</button>
+            <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('copy')">复制完整路径</button>
+          </div>
+          <p v-if="detailStatus" class="status" role="status">{{ detailStatus }}</p>
+          <p v-if="detailError" class="error" role="alert">{{ detailError }}</p>
+        </aside>
       </div>
-      <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
-      <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
-      <details v-if="summary && detail.kind === 'photo'" class="detail-people">
-        <summary>照片中的人物 / 修改分组</summary>
-        <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
-          @changed="detailPeopleChanged" />
-      </details>
-      <div class="detail-location">
-        <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
-        <template v-if="detail.location">
-          <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
-          <button type="button" class="secondary" @click="locateDetail">在地图中查看</button>
-        </template>
-      </div>
-      <p class="detail-path">{{ detail.relativePath }}</p>
-      <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
-      <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
-        @click="playLivePhoto">
-        {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
-      </button>
-      <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
-      <div class="detail-actions">
-        <button type="button" :disabled="!!fileAction || detailNavigating" @click="performFileAction('open')">
-          {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
-        </button>
-        <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('reveal')">在文件管理器中显示</button>
-        <button type="button" class="secondary" :disabled="!!fileAction || detailNavigating" @click="performFileAction('copy')">复制完整路径</button>
-      </div>
-      <p v-if="detailStatus" class="status" role="status">{{ detailStatus }}</p>
-      <p v-if="detailError" class="error" role="alert">{{ detailError }}</p>
     </dialog>
   </div>
 </template>
 
 <style scoped>
-.timeline-months { display: flex; flex-wrap: wrap; gap: .5rem; max-height: 12rem; overflow-y: auto; margin: 1rem 0; }
-.timeline-months button { padding: .45rem .65rem; font-size: .85rem; }
-.timeline-months [aria-pressed="true"] { color: #fff; background: #176252; border-color: #176252; }
-.timeline-heading { grid-column: 1 / -1; padding-top: .75rem; list-style: none; color: #3f6252; font-size: 1.25rem; font-weight: 650; }
-.timeline-intro { color: #65736b; }
-.people-tools .filters { margin-top: 0; padding-top: 0; border-top: 0; }
-@media (max-width: 34rem) {
-  .people-tools .sort-field { flex: 1 1 100%; }
-  .people-tools .sort-select { flex: 1; min-width: 0; width: auto; }
-}
-.detail-people { margin-top: 1rem; padding: .75rem; border: 1px solid #dce5dc; border-radius: .5rem; }
-
-.media-library {
-  --library-surface: #fff;
-  --library-border: #e0e5df;
-  --library-control-border: #cbd6ce;
-  --library-muted: #65736b;
-  --library-preview: #eef0ea;
-  color: #24352f;
-}
-.library-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1.5rem 2rem; margin: 0 0 1.5rem; }
-.library-heading h1 { font-size: clamp(1.8rem, 2.2vw, 2.5rem); line-height: 1.3; letter-spacing: -0.03em; }
-.library-heading p { margin: 0.4rem 0 0; color: var(--library-muted); }
-.directory-toolbar { display: flex; flex-wrap: wrap; flex: 0 1 52rem; align-items: end; gap: 0.625rem; min-width: 0; max-width: 100%; }
-.directory-field { flex: 1 1 13rem; min-width: 0; }
-.directory-field label { margin: 0 0 0.375rem; color: var(--library-muted); font-size: 0.8125rem; font-weight: 500; }
-.directory-field :deep(input:not(:focus)) { text-overflow: ellipsis; }
-.library-tools { padding: 1.25rem; border: 1px solid var(--library-border); border-radius: 1rem; background: #fff; }
-.search-row { display: flex; gap: 0.75rem; min-width: 0; }
-.mode-select { flex: 0 0 8.5rem; }
+.media-library { color: var(--text); --library-preview: var(--preview); }
+.library-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
+.library-heading { flex: 1 0 160px; }
+.library-heading h1 { font-size: 28px; }
+.library-heading p { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+.directory-toolbar { display: flex; flex-wrap: wrap; flex: 0 1 720px; align-items: end; gap: 8px; min-width: 0; max-width: 100%; }
+.directory-field { flex: 1 1 200px; min-width: 0; }
+.directory-field label { margin: 0 0 4px; font-size: 12px; font-weight: 400; color: var(--muted); }
+.directory-field :deep(input) { text-overflow: ellipsis; }
+.library-tools { margin-top: 20px; padding: 0 0 20px; border-bottom: 1px solid var(--border); }
+.search-row { display: flex; gap: 8px; min-width: 0; }
+.mode-select { flex: 0 0 120px; }
 .search-input { flex: 1; min-width: 0; }
-.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #edf0eb; }
-.filter-field { display: flex; align-items: center; gap: 0.625rem; min-width: 0; }
-.location-select { width: 8.5rem; }
-.card-location { margin: .35rem 0; color: var(--library-muted); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.detail-location { margin: .8rem 0; color: var(--library-muted); font-size: .875rem; }
-.location-selection { display: inline-flex; align-items: center; gap: .5rem; font-size: .875rem; }
-.filter-field > span { color: var(--library-muted); white-space: nowrap; font-size: 0.875rem; }
-.kind-select { width: 8rem; }
-.date-select { width: 8rem; }
-.sort-select { width: 13rem; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 16px; }
+.filter-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.filter-field > span { color: var(--muted); white-space: nowrap; font-size: 13px; }
+.kind-select, .date-select, .location-select { width: 120px; }
+.sort-select { width: 200px; }
 .sort-field { margin-left: auto; }
 .favorite-filter { margin-right: 0; }
-.date-range { display: flex; flex-wrap: wrap; gap: 0.75rem; }
-.date-range label { display: flex; align-items: center; gap: 0.5rem; margin: 0; font-size: 0.875rem; font-weight: 400; color: var(--library-muted); }
-.date-range input { box-sizing: border-box; min-height: 40px; max-width: 100%; padding: 0.375rem 0.625rem; border: 1px solid var(--library-control-border); border-radius: 8px; color: #24352f; background: #fff; font: inherit; }
-.relevance-note { margin-left: auto; color: var(--library-muted); font-size: 0.875rem; }
-.scan-status, .library-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.625rem; margin: 1rem 0; padding: 0.875rem 1rem; border-radius: 0.75rem; background: #edf4f0; color: #176252; }
-.library-notice { background: #fff2ec; color: #9c3726; }
-.library-notice span { flex: 1; min-width: 12rem; overflow-wrap: anywhere; }
-.library-empty { display: grid; justify-items: center; gap: 0.875rem; margin-top: 1.5rem; padding: clamp(2.5rem, 6vw, 5rem) 1rem; border: 1px dashed #d8e0d7; border-radius: 1rem; background: #ffffffa6; text-align: center; }
-.library-empty p { margin: 0; color: var(--library-muted); }
-.empty-icon { box-sizing: border-box; width: 64px; height: 64px; margin-bottom: 0.5rem; border-radius: 20px; background: #e7f0e9; color: #176252; font-size: 30px; }
-.empty-hint { font-size: 0.8125rem; color: var(--library-muted); }
-@media (max-width: 60rem) {
-  .library-header { align-items: end; gap: 1rem; }
-  .library-heading p { display: none; }
-  .directory-toolbar { flex: 1 1 26rem; }
-  .filters { column-gap: 0.75rem; }
-  .filter-field { gap: 0.5rem; }
-  .kind-select, .date-select { width: 7.5rem; }
-  .sort-select { width: 13rem; }
-}
-@media (max-width: 48rem) {
+.date-range { display: flex; flex-wrap: wrap; gap: 8px; }
+.date-range label { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; font-weight: 400; color: var(--muted); }
+.date-range input { max-width: 100%; }
+.relevance-note { margin-left: auto; color: var(--muted); font-size: 13px; }
+.location-selection { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--accent); font-size: 13px; }
+.scan-status, .library-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; padding: 12px 16px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
+.library-notice { background: var(--danger-soft); color: var(--danger); }
+.library-notice span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.library-empty { display: grid; justify-items: center; gap: 16px; margin-top: 24px; padding: clamp(40px, 8vw, 100px) 20px; border-radius: 12px; background: var(--surface); text-align: center; }
+.library-empty h2 { font-size: 22px; }
+.library-empty p { margin: 0; max-width: 440px; color: var(--muted); }
+.empty-icon { width: 72px; height: 72px; margin-bottom: 8px; border-radius: 20px; background: var(--accent-soft); color: var(--accent); font-size: 32px; }
+.empty-hint { font-size: 12px; color: var(--muted); }
+.result-status { margin: 20px 0 12px; font-size: 13px; }
+.result-status:empty { margin: 0; }
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 180px), 1fr)); gap: 20px 12px; padding: 0; margin: 0; list-style: none; }
+.card { min-width: 0; border-radius: 10px; }
+button.media-preview { display: grid; width: 100%; aspect-ratio: 4 / 3; grid-template: minmax(0, 1fr) / minmax(0, 1fr); place-items: center; padding: 0; overflow: hidden; border: 0; border-radius: 10px; background: var(--preview); color: var(--muted); font-size: 13px; }
+button.media-preview:hover:not(:disabled) { background: var(--hover); }
+button.media-preview:focus-visible { outline-offset: 3px; }
+.card-details { padding: 7px 2px 0; }
+.media-placeholder { display: inline-flex; align-items: center; gap: 6px; }
+.card-heading { display: flex; align-items: center; gap: 4px; }
+.file-name { flex: 1; min-width: 0; margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
+.card-info { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.card-info > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.card-info > span:first-child { flex-shrink: 0; }
+.card-location { min-width: 0; text-align: right; }
+button.favorite { display: grid; place-items: center; flex: none; width: 32px; min-height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 18px; }
+button.favorite[aria-pressed="true"] { color: var(--accent); }
+button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.pagination, .detail-navigation, .rotation-actions, .detail-actions, .detail-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.pagination { justify-content: center; margin-top: 28px; color: var(--muted); font-size: 13px; }
+.timeline-months { display: flex; flex-wrap: wrap; gap: 8px; max-height: 160px; overflow-y: auto; margin: 20px 0; }
+.timeline-months button { font-size: 13px; }
+.timeline-months [aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.timeline-heading { grid-column: 1 / -1; margin-top: 20px; font-size: 20px; font-weight: 600; color: var(--text); }
+.timeline-intro { color: var(--muted); }
+.people-tools .filters { margin-top: 0; }
+.media-library > details { margin-top: 24px; }
+.media-detail { width: min(1320px, calc(100vw - 48px)); max-width: calc(100vw - 32px); padding: 0; overflow: hidden; }
+.detail-header { justify-content: space-between; align-items: center; padding: 16px 24px; margin: 0; }
+.detail-header h2 { flex: 1; min-width: 0; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-navigation { justify-content: center; padding: 0 24px 16px; margin: 0; font-size: 13px; color: var(--muted); }
+.detail-navigation span { font-variant-numeric: tabular-nums; }
+.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: min(72vh, 820px); border-top: 1px solid var(--border); }
+.detail-viewer { display: grid; place-items: center; min-width: 0; min-height: 0; overflow: hidden; background: var(--viewer); color: var(--viewer-text); }
+.detail-viewer .status, .viewer-placeholder { padding: 24px; color: var(--viewer-text); text-align: center; }
+.detail-viewer .error { padding: 24px; color: var(--viewer-error); }
+.detail-viewer :deep(.rotatable-image.detail) { width: 100%; height: 100%; max-height: none; aspect-ratio: auto !important; background: var(--viewer); }
+.detail-image { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; background: var(--viewer); }
+.detail-information { min-width: 0; overflow-y: auto; padding: 24px; border-left: 1px solid var(--border); background: var(--surface); }
+.information-heading { margin: 0 0 20px; font-size: 14px; font-weight: 600; }
+.detail-location, .detail-path, .detail-information .status { font-size: 13px; }
+.detail-location { margin: 16px 0; color: var(--text-secondary); }
+.detail-path { padding-top: 16px; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.rotation-actions { gap: 8px; }
+.rotation-actions button { flex: 1; padding-inline: 8px; font-size: 12px; }
+.rotation-actions .status { flex-basis: 100%; }
+.detail-people { margin-top: 16px; padding-block: 16px; border-block: 1px solid var(--border); font-size: 13px; }
+.detail-actions { align-items: stretch; flex-direction: column; gap: 8px; margin-top: 16px; }
+@media (max-width: 1199px) {
   .directory-toolbar { flex-basis: 100%; }
+  .directory-field { flex-basis: 200px; }
   .sort-field { margin-left: 0; }
 }
-@media (max-width: 34rem) {
-  .directory-toolbar { flex-wrap: wrap; }
+@media (max-width: 959px) {
+  .detail-body { display: flex; flex-direction: column; height: auto; max-height: calc(100dvh - 180px); overflow-y: auto; }
+  .detail-viewer { flex: none; height: 50vh; min-height: 240px; }
+  .detail-information { flex: none; overflow: visible; border-left: 0; border-top: 1px solid var(--border); }
+  .detail-actions { flex-direction: row; }
+  .detail-people :deep(.faces) { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+}
+@media (max-width: 639px) {
+  .library-header { gap: 20px; }
+  .library-heading h1 { font-size: 26px; }
   .directory-field { flex-basis: 100%; }
+  .directory-toolbar { gap: 8px; }
+  .directory-toolbar :deep(.el-button) { padding-inline: 12px; }
   .search-row { flex-wrap: wrap; }
-  .search-input { flex-basis: calc(100% - 10rem); }
+  .mode-select { flex-basis: 110px; }
+  .search-input { flex-basis: calc(100% - 118px); }
   .search-row > .el-button { width: 100%; }
-  .sort-field, .sort-select { flex: 1; }
+  .filters { gap: 12px; }
+  .filter-field { flex: 1 1 150px; justify-content: space-between; }
+  .filter-field :deep(.el-select) { flex: 1; min-width: 0; width: auto; }
+  .sort-field { flex-basis: 100%; }
+  .date-range { width: 100%; }
+  .date-range label { flex: 1 1 100%; }
+  .date-range input { flex: 1; }
   .relevance-note { margin-left: 0; }
+  .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  button.favorite { width: 40px; min-height: 40px; }
+  .media-detail { width: calc(100vw - 24px); max-width: calc(100vw - 24px); }
+  .detail-header { padding: 12px 16px; }
+  .detail-navigation { gap: 8px; padding: 0 12px 12px; }
+  .detail-navigation button { padding-inline: 10px; }
+  .detail-information { padding: 20px 16px; }
 }
-
-.status {
-  color: var(--library-muted);
-}
-
-.result-status {
-  margin: 1rem 0 0.75rem;
-  font-size: 0.875rem;
-}
-
-.result-status:empty {
-  margin: 0;
-}
-
-.media-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: clamp(1rem, 1.4vw, 1.5rem);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.card {
-  min-width: 0;
-  border: 1px solid #e7eae4;
-  border-radius: 0.875rem;
-  background: var(--library-surface);
-  transition: border-color 160ms ease, box-shadow 160ms ease;
-}
-
-.card:hover, .card:focus-within { border-color: #b6cbbd; box-shadow: 0 5px 18px #24352f0a; }
-
-button.media-preview {
-  display: grid;
-  width: 100%;
-  aspect-ratio: 4 / 3;
-  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
-  place-items: center;
-  padding: 0;
-  overflow: hidden;
-  border: 0;
-  border-radius: 0.8rem 0.8rem 0 0;
-  background: var(--library-preview);
-  color: var(--library-muted);
-  font-size: 0.875rem;
-}
-
-.card-details {
-  padding: 0.875rem 0.875rem 0.375rem;
-}
-
-.file-name {
-  margin: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-size: 0.875rem;
-  font-weight: 650;
-}
-
-.card-info {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 0.25rem;
-  color: var(--library-muted);
-  font-size: 0.8125rem;
-  font-variant-numeric: tabular-nums;
-}
-
-button.favorite {
-  display: grid;
-  place-items: center;
-  min-width: 2.75rem;
-  min-height: 2.75rem;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  font-size: 1.375rem;
-}
-
-button.favorite[aria-pressed="true"] {
-  color: #865000;
-}
-
-button.favorite:hover:not(:disabled) {
-  background: #e7efe9;
-}
-
-.pagination,
-.detail-navigation,
-.rotation-actions,
-.detail-actions,
-.detail-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.pagination {
-  justify-content: center;
-  margin-top: 1.75rem;
-}
-
-details {
-  margin-top: 1rem;
-  overflow-wrap: anywhere;
-}
-
-summary {
-  cursor: pointer;
-  font-weight: 600;
-}
-
-dialog {
-  width: min(44rem, calc(100% - 4rem));
-  max-height: calc(100% - 3rem);
-  padding: 1.25rem;
-  border: 1px solid #829d95;
-  border-radius: 0.875rem;
-  background: var(--library-surface);
-  color: inherit;
-}
-
-dialog::backdrop {
-  background: rgb(18 36 32 / 60%);
-}
-
-.detail-navigation {
-  justify-content: center;
-  margin-bottom: 1rem;
-}
-
-.detail-navigation span { font-variant-numeric: tabular-nums; }
-.detail-actions { margin-top: 1rem; }
-.rotation-actions { margin-top: 0.75rem; }
-
-
-.detail-header {
-  justify-content: space-between;
-  align-items: start;
-  margin-bottom: 1rem;
-}
-
-.detail-header h2 {
-  flex: 1;
-  overflow-wrap: anywhere;
-}
-
-.detail-image {
-  display: block;
-  width: 100%;
-  max-height: 55vh;
-  object-fit: contain;
-  background: var(--library-preview);
-}
-
-.detail-path {
-  overflow-wrap: anywhere;
-}
-
-@media (min-width: 40rem) {
-  .media-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
-
-@media (min-width: 48rem) {
-  .media-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-}
-
-@media (min-width: 72rem) {
-  .media-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-}
-
-@media (min-width: 90rem) {
-  .media-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-}
+@media (max-width: 359px) { .media-grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

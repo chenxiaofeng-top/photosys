@@ -390,16 +390,15 @@ fn groups_one_hundred_thousand_and_pages_results() {
                 relative: format!("{id}.jpg").into(),
                 stamp: FileStamp::read(&file).unwrap(),
             },
-            width: 300,
-            height: 200,
-            captured_at: None,
+            features: features(0, 0, None),
+            moved: false,
         })
         .collect();
     let scan = Scan {
         id: 1,
         root: Root::new(directory.path()).unwrap(),
         photos,
-        groups,
+        groups: groups.into_iter().map(Some).collect(),
         issues: Vec::new(),
     };
     let first = scan.groups(None, 0);
@@ -448,5 +447,391 @@ fn benchmark_real_photo_folder() {
         first_time.as_secs_f64(),
         second_start.elapsed().as_secs_f64(),
         second.reused
+    );
+}
+
+// Real files and stamps, with deterministic visual features; no system trash is
+// touched by these tests.
+fn trash_scan(directory: &Path, items: Vec<Features>) -> Scan {
+    let refs: Vec<_> = items.iter().collect();
+    let groups = matching::group(&refs, |_| ControlFlow::Continue(()))
+        .continue_value()
+        .unwrap();
+    let photos = items
+        .into_iter()
+        .enumerate()
+        .map(|(id, features)| {
+            let relative = PathBuf::from(format!("photo-{id}.jpg"));
+            fs::write(directory.join(&relative), format!("original photo {id}")).unwrap();
+            let (_, file) = open_photo(&Root::new(directory).unwrap(), &relative, id).unwrap();
+            Photo {
+                file,
+                features,
+                moved: false,
+            }
+        })
+        .collect();
+    Scan {
+        id: 17,
+        root: Root::new(directory).unwrap(),
+        photos,
+        groups: groups.into_iter().map(Some).collect(),
+        issues: Vec::new(),
+    }
+}
+
+fn identical_trash_scan(directory: &Path, count: usize) -> Scan {
+    trash_scan(
+        directory,
+        (0..count).map(|_| features(0, 61, None)).collect(),
+    )
+}
+
+fn mock_trash(path: &Path) -> Result<(), String> {
+    fs::remove_file(path).map_err(|error| error.to_string())
+}
+
+#[test]
+fn trash_members_preserves_photo_ids_and_unrelated_groups() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, None),
+            features(0, 61, None),
+            features(0, 61, None),
+            features(0, 200, None),
+            features(0, 200, None),
+        ],
+    );
+    let result = scan.recycle(17, 0, vec![1], mock_trash).unwrap();
+    assert_eq!(result.total_groups, 2);
+    assert_eq!(result.outcomes[0].status, TrashStatus::Moved);
+    assert_eq!(result.affected_groups[0].count, 2);
+    assert_eq!(
+        scan.members(0, 0)
+            .unwrap()
+            .items
+            .iter()
+            .map(|m| m.photo.id)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    let unrelated = scan.groups(None, 0).items.remove(1);
+    assert_eq!(
+        (unrelated.id, unrelated.representative.id, unrelated.count),
+        (1, 3, 2)
+    );
+    assert!(scan.photos[1].moved);
+    assert!(preview(&scan.root, &scan.photos[1].file, false).is_err());
+    assert!(
+        scan.recycle(17, 0, vec![1], |_| panic!("must not trash twice"))
+            .is_err()
+    );
+}
+
+#[test]
+fn trash_rejects_invalid_selections_before_any_move() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, None),
+            features(0, 61, None),
+            features(0, 200, None),
+            features(0, 200, None),
+        ],
+    );
+    for (scan_id, group_id, ids) in [
+        (16, 0, vec![1]),
+        (17, 99, vec![1]),
+        (17, 0, vec![]),
+        (17, 0, vec![99]),
+        (17, 0, vec![1, 2]),
+        (17, 0, vec![0, 1]),
+    ] {
+        assert!(
+            scan.recycle(scan_id, group_id, ids, |_| panic!(
+                "invalid request reached trash"
+            ))
+            .is_err()
+        );
+    }
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 4);
+}
+
+#[test]
+fn trash_deduplicates_ids_and_hides_single_photo_groups() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 2);
+    let mut calls = 0;
+    let result = scan
+        .recycle(17, 0, vec![1, 1], |path| {
+            calls += 1;
+            mock_trash(path)
+        })
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(result.outcomes.len(), 1);
+    assert_eq!(result.total_groups, 0);
+    assert!(result.affected_groups.is_empty());
+    assert!(scan.members(0, 0).is_err());
+    assert!(directory.path().join("photo-0.jpg").exists());
+    assert!(!scan.photos[0].moved);
+}
+
+#[test]
+fn trash_representative_rematches_and_splits_without_renumbering_other_groups() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, None),
+            features(0x00f, 61, None),
+            features(0x00f, 61, None),
+            features(0xff0, 61, None),
+            features(0xff0, 61, None),
+            features(0, 200, None),
+            features(0, 200, None),
+        ],
+    );
+    assert_eq!(scan.groups(None, 0).items[0].count, 5);
+    let result = scan.recycle(17, 0, vec![0], mock_trash).unwrap();
+    assert_eq!(result.total_groups, 3);
+    assert_eq!(
+        result
+            .affected_groups
+            .iter()
+            .map(|g| (g.id, g.representative.id, g.count))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (2, 3, 2)]
+    );
+    assert_eq!(scan.groups(None, 0).items[1].representative.id, 5);
+    assert_eq!(scan.members(2, 0).unwrap().items[1].photo.id, 4);
+}
+
+#[test]
+fn trash_representative_can_leave_only_unmatched_survivors() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, None),
+            features(0x00f, 61, None),
+            features(0xff0, 61, None),
+        ],
+    );
+    let result = scan.recycle(17, 0, vec![0], mock_trash).unwrap();
+    assert_eq!(result.total_groups, 0);
+    assert!(result.affected_groups.is_empty());
+    assert!(directory.path().join("photo-1.jpg").exists());
+    assert!(directory.path().join("photo-2.jpg").exists());
+}
+
+#[test]
+fn trash_updates_variant_and_burst_filters() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, Some((0, true))),
+            features(0x1fff, 81, Some((5_000, true))),
+            features(0x03, 65, None),
+        ],
+    );
+    assert_eq!(scan.groups(Some(MatchKind::Burst), 0).total, 1);
+    scan.recycle(17, 0, vec![1], mock_trash).unwrap();
+    assert_eq!(scan.groups(Some(MatchKind::Burst), 0).total, 0);
+    assert_eq!(scan.groups(Some(MatchKind::Variant), 0).total, 1);
+}
+
+#[test]
+fn trash_reports_partial_failures_and_keeps_failed_members() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 4);
+    let result = scan
+        .recycle(17, 0, vec![1, 2], |path| {
+            if path.ends_with("photo-1.jpg") {
+                Err("回收站不可用".into())
+            } else {
+                mock_trash(path)
+            }
+        })
+        .unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Failed);
+    assert_eq!(result.outcomes[0].reason.as_deref(), Some("回收站不可用"));
+    assert_eq!(result.outcomes[1].status, TrashStatus::Moved);
+    assert_eq!(result.affected_groups[0].count, 3);
+    assert!(!scan.photos[1].moved);
+    assert!(scan.photos[2].moved);
+    let retried = scan.recycle(17, 0, vec![1], mock_trash).unwrap();
+    assert_eq!(retried.outcomes[0].status, TrashStatus::Moved);
+}
+
+#[test]
+fn trash_failure_preserves_representative_and_group() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 3);
+    let result = scan
+        .recycle(17, 0, vec![0], |_| Err("拒绝访问".into()))
+        .unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Failed);
+    assert_eq!(result.affected_groups[0].representative.id, 0);
+    assert_eq!(result.affected_groups[0].count, 3);
+    assert!(!scan.photos[0].moved);
+}
+
+#[test]
+fn trash_skips_missing_changed_and_replaced_targets() {
+    for change in 0..3 {
+        let directory = tempdir().unwrap();
+        let mut scan = identical_trash_scan(directory.path(), 3);
+        let target = directory.path().join("photo-1.jpg");
+        match change {
+            0 => fs::remove_file(&target).unwrap(),
+            1 => fs::write(&target, b"changed size").unwrap(),
+            _ => {
+                fs::rename(&target, directory.path().join("original.bin")).unwrap();
+                fs::copy(directory.path().join("original.bin"), &target).unwrap();
+            }
+        }
+        let result = scan
+            .recycle(17, 0, vec![1, 2], |path| {
+                assert!(!path.ends_with("photo-1.jpg"));
+                mock_trash(path)
+            })
+            .unwrap();
+        assert_eq!(result.outcomes[0].status, TrashStatus::Skipped);
+        assert!(
+            result.outcomes[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("重新扫描")
+        );
+        assert_eq!(result.outcomes[1].status, TrashStatus::Moved);
+    }
+}
+
+#[test]
+fn trash_revalidates_keeper_for_each_target() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 3);
+    let result = scan
+        .recycle(17, 0, vec![1, 2], |path| {
+            mock_trash(path)?;
+            fs::write(directory.path().join("photo-0.jpg"), b"keeper changed").unwrap();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Moved);
+    assert_eq!(result.outcomes[1].status, TrashStatus::Skipped);
+    assert!(directory.path().join("photo-2.jpg").exists());
+}
+
+#[test]
+fn trash_accepts_another_valid_unselected_keeper() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 3);
+    fs::remove_file(directory.path().join("photo-0.jpg")).unwrap();
+    let result = scan.recycle(17, 0, vec![1], mock_trash).unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Moved);
+    assert!(directory.path().join("photo-2.jpg").exists());
+}
+
+#[test]
+fn trash_skips_when_no_unselected_keeper_is_valid() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 2);
+    fs::remove_file(directory.path().join("photo-0.jpg")).unwrap();
+    let result = scan
+        .recycle(17, 0, vec![1], |_| panic!("no surviving keeper"))
+        .unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Skipped);
+    assert!(
+        result.outcomes[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("保留照片")
+    );
+}
+
+#[test]
+fn trash_refuses_hard_links() {
+    let directory = tempdir().unwrap();
+    let mut scan = identical_trash_scan(directory.path(), 2);
+    let original = directory.path().join("photo-1.jpg");
+    fs::hard_link(&original, directory.path().join("linked.jpg")).unwrap();
+    scan.photos[1].file.stamp = FileStamp::read(&fs::File::open(&original).unwrap()).unwrap();
+    assert!(scan.members(0, 0).unwrap().items[1].photo.hard_link);
+    assert!(
+        scan.recycle(17, 0, vec![1], |_| panic!("hard link reached trash"))
+            .is_err()
+    );
+}
+
+#[test]
+fn trash_skips_replaced_scan_root() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("photos");
+    fs::create_dir(&root).unwrap();
+    let mut scan = identical_trash_scan(&root, 2);
+    fs::rename(&root, directory.path().join("original")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("photo-0.jpg"), b"replacement keeper").unwrap();
+    fs::write(root.join("photo-1.jpg"), b"replacement target").unwrap();
+    let result = scan
+        .recycle(17, 0, vec![1], |_| panic!("root replaced"))
+        .unwrap();
+    assert_eq!(result.outcomes[0].status, TrashStatus::Skipped);
+}
+
+#[cfg(unix)]
+#[test]
+fn trash_skips_symlink_targets_and_parent_directories() {
+    use std::os::unix::fs::symlink;
+    for replace_parent in [false, true] {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("photos");
+        fs::create_dir(&root).unwrap();
+        let mut scan = identical_trash_scan(&root, 2);
+        if replace_parent {
+            let moved = directory.path().join("moved");
+            fs::rename(&root, &moved).unwrap();
+            symlink(&moved, &root).unwrap();
+        } else {
+            let target = root.join("photo-1.jpg");
+            let moved = directory.path().join("original.jpg");
+            fs::rename(&target, &moved).unwrap();
+            symlink(&moved, &target).unwrap();
+        }
+        let result = scan
+            .recycle(17, 0, vec![1], |_| panic!("symlink reached trash"))
+            .unwrap();
+        assert_eq!(result.outcomes[0].status, TrashStatus::Skipped);
+    }
+}
+
+#[test]
+fn trash_representative_reclassifies_burst_members_as_variants() {
+    let directory = tempdir().unwrap();
+    let mut scan = trash_scan(
+        directory.path(),
+        vec![
+            features(0, 61, Some((5_000, true))),
+            features(0x1fff, 81, Some((0, true))),
+            features(0x1ffe, 81, Some((10_000, true))),
+        ],
+    );
+    assert_eq!(scan.groups(Some(MatchKind::Burst), 0).total, 1);
+    assert_eq!(scan.groups(Some(MatchKind::Variant), 0).total, 0);
+    let result = scan.recycle(17, 0, vec![0], mock_trash).unwrap();
+    assert_eq!(result.total_groups, 1);
+    assert_eq!(scan.groups(Some(MatchKind::Burst), 0).total, 0);
+    assert_eq!(scan.groups(Some(MatchKind::Variant), 0).total, 1);
+    assert_eq!(
+        scan.members(0, 0).unwrap().items[1].kind,
+        Some(MatchKind::Variant)
     );
 }

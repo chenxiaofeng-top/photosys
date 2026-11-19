@@ -64,7 +64,7 @@ watch(
   box-sizing: border-box;
   width: 100%;
   aspect-ratio: 4 / 3;
-  background: #e3eeea;
+  background: var(--preview);
   overflow: hidden;
   display: grid;
   place-items: center;
@@ -92,6 +92,6 @@ watch(
 }
 
 .preview-error {
-  color: #812f28;
+  color: var(--danger);
 }
 </style>

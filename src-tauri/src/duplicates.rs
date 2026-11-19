@@ -96,6 +96,10 @@ pub(crate) struct FileStamp {
 }
 
 impl FileStamp {
+    pub(crate) fn hard_link(&self) -> bool {
+        self.links > 1
+    }
+
     pub(crate) fn read(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if platform::is_link(&metadata) || !metadata.is_file() {

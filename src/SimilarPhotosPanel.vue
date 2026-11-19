@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { computed, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, ref, shallowRef, watch } from "vue";
 import SimilarPhotoPreview from "./SimilarPhotoPreview.vue";
 import { formatBytes } from "./formatBytes";
 
@@ -30,6 +30,7 @@ interface Photo {
   width: number;
   height: number;
   capturedAt: string | null;
+  hardLink: boolean;
 }
 
 interface Group {
@@ -55,6 +56,19 @@ interface Page<T> {
   items: T[];
 }
 
+interface TrashOutcome {
+  id: number;
+  relativePath: string;
+  status: "moved" | "skipped" | "failed";
+  reason: string | null;
+}
+
+interface TrashResult {
+  outcomes: TrashOutcome[];
+  totalGroups: number;
+  affectedGroups: Group[];
+}
+
 const pageSize = 25;
 const labels = { variant: "同图变体", burst: "疑似连拍" };
 const emit = defineEmits<{ busyChange: [busy: boolean] }>();
@@ -62,7 +76,8 @@ const directory = ref("");
 const choosing = ref(false);
 const activeScan = ref<number>();
 const cancelling = ref(false);
-const busy = computed(() => choosing.value || activeScan.value !== undefined);
+const trashing = ref(false);
+const busy = computed(() => choosing.value || activeScan.value !== undefined || trashing.value);
 watch(busy, (value) => emit("busyChange", value), { flush: "sync" });
 
 const progress = shallowRef<Progress>();
@@ -81,6 +96,20 @@ const members = shallowRef<Page<Member>>();
 const memberError = ref("");
 const left = shallowRef<Photo>();
 const right = shallowRef<Photo>();
+const selected = shallowRef(new Map<number, Photo>());
+const selectedBytes = computed(() => [...selected.value.values()].reduce((total, photo) => total + photo.size, 0));
+const confirmation = ref<HTMLDialogElement>();
+const resultsSection = ref<HTMLElement>();
+const outcomes = shallowRef<TrashOutcome[]>([]);
+const trashError = ref("");
+const revision = ref(0);
+let refreshGroup: { preferredId?: number } | undefined;
+const statusLabels = { moved: "已移入回收站", skipped: "已跳过", failed: "失败" };
+const outcomeCounts = computed(() => {
+  const counts = { moved: 0, skipped: 0, failed: 0 };
+  for (const outcome of outcomes.value) counts[outcome.status]++;
+  return counts;
+});
 
 const issuesOpen = ref(false);
 const issuePage = ref(0);
@@ -88,13 +117,19 @@ const issues = shallowRef<Page<Issue>>();
 const issueError = ref("");
 
 function closeGroup() {
+  selected.value = new Map();
+  confirmation.value?.close();
   expanded.value = undefined;
+  members.value = undefined;
   memberPage.value = 0;
   left.value = undefined;
   right.value = undefined;
 }
 
 function resetResults() {
+  outcomes.value = [];
+  trashError.value = "";
+  refreshGroup = undefined;
   summary.value = undefined;
   filter.value = "all";
   groupPage.value = 0;
@@ -104,7 +139,7 @@ function resetResults() {
 }
 
 function useDirectory(folder: string) {
-  if (directory.value === folder) return;
+  if (trashing.value || directory.value === folder) return;
   directory.value = folder;
   scanError.value = "";
   notice.value = "";
@@ -165,10 +200,12 @@ async function cancelScan() {
 }
 
 function toggleGroup(group: Group) {
+  if (busy.value) return;
   if (expanded.value?.id === group.id) {
     closeGroup();
     return;
   }
+  closeGroup();
   expanded.value = group;
   memberPage.value = 0;
   left.value = group.representative;
@@ -176,10 +213,51 @@ function toggleGroup(group: Group) {
 }
 
 function selectPhoto(photo: Photo, side: "left" | "right") {
+  if (busy.value) return;
   const target = side === "left" ? left : right;
   const other = side === "left" ? right : left;
   if (other.value?.id === photo.id) other.value = target.value;
   target.value = photo;
+}
+
+function selectionDisabled(photo: Photo) {
+  return busy.value || photo.hardLink ||
+    (!selected.value.has(photo.id) && selected.value.size >= (expanded.value?.count ?? 0) - 1);
+}
+
+function toggleSelection(photo: Photo) {
+  if (selectionDisabled(photo)) return;
+  const selection = new Map(selected.value);
+  if (selection.has(photo.id)) selection.delete(photo.id);
+  else selection.set(photo.id, photo);
+  selected.value = selection;
+}
+
+async function trashSelection() {
+  const current = summary.value;
+  const group = expanded.value;
+  if (!current || !group || busy.value || !selected.value.size || !confirmation.value?.open) return;
+  const fileIds = [...selected.value.keys()];
+  confirmation.value.close();
+  trashing.value = true;
+  trashError.value = "";
+  outcomes.value = [];
+  try {
+    const result = await invoke<TrashResult>("trash_similar", { scanId: current.scanId, groupId: group.id, fileIds });
+    summary.value = { ...current, groups: result.totalGroups };
+    outcomes.value = result.outcomes;
+    closeGroup();
+    refreshGroup = { preferredId: result.affectedGroups.find((group) =>
+      filter.value === "all" || (filter.value === "variant" ? group.hasVariant : group.hasBurst),
+    )?.id };
+    revision.value++;
+  } catch (cause) {
+    trashError.value = String(cause);
+  } finally {
+    trashing.value = false;
+    await nextTick();
+    resultsSection.value?.focus({ preventScroll: true });
+  }
 }
 
 function pageCount(total: number) {
@@ -187,12 +265,13 @@ function pageCount(total: number) {
 }
 
 function changeGroupPage(page: number) {
+  if (busy.value) return;
   closeGroup();
   groupPage.value = page;
 }
 
 watch(filter, () => changeGroupPage(0), { flush: "sync" });
-watch([scanId, filter, groupPage], async ([id, kind, page], _, onCleanup) => {
+watch([scanId, filter, groupPage, revision], async ([id, kind, page], _, onCleanup) => {
   groups.value = undefined;
   groupError.value = "";
   if (id === undefined) return;
@@ -200,7 +279,19 @@ watch([scanId, filter, groupPage], async ([id, kind, page], _, onCleanup) => {
   onCleanup(() => { current = false; });
   try {
     const result = await invoke<Page<Group>>("similar_groups", { scanId: id, kind: kind === "all" ? null : kind, page });
-    if (current) groups.value = result;
+    if (current) {
+      const lastPage = pageCount(result.total) - 1;
+      if (page > lastPage) {
+        groupPage.value = lastPage;
+        return;
+      }
+      groups.value = result;
+      if (refreshGroup) {
+        const group = result.items.find((group) => group.id === refreshGroup?.preferredId) ?? result.items[0];
+        refreshGroup = undefined;
+        if (group) toggleGroup(group);
+      }
+    }
   } catch (cause) {
     if (current) groupError.value = String(cause);
   }
@@ -266,9 +357,10 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
       </div>
       <p v-if="notice" role="status">{{ notice }}</p>
       <p v-if="scanError" class="error" role="alert">{{ scanError }}</p>
+      <p v-if="trashing" role="status">正在核验照片并移到回收站…</p>
     </form>
 
-    <section v-if="summary" aria-labelledby="similar-results">
+    <section v-if="summary" ref="resultsSection" tabindex="-1" aria-labelledby="similar-results" :aria-busy="trashing">
       <h2 id="similar-results">扫描结果</h2>
       <dl aria-live="polite">
         <div><dt>成功检查</dt><dd>{{ summary.checked }}</dd></div>
@@ -278,6 +370,21 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
       </dl>
       <p v-if="summary.cacheWarning" role="status">{{ summary.cacheWarning }}</p>
       <p v-if="summary.unsupported">跳过了 {{ summary.unsupported }} 张格式暂不支持的照片。</p>
+      <p v-if="trashError" class="error" role="alert">{{ trashError }}</p>
+      <div v-if="outcomes.length" class="batch-result">
+        <p role="status">
+          已移入回收站 {{ outcomeCounts.moved }} 张，跳过 {{ outcomeCounts.skipped }} 张，失败 {{ outcomeCounts.failed }} 张。
+        </p>
+        <details :open="outcomeCounts.skipped + outcomeCounts.failed > 0">
+          <summary>处理明细</summary>
+          <ul class="duplicate-list">
+            <li v-for="outcome in outcomes" :key="outcome.id">
+              <strong>{{ outcome.relativePath }}</strong>
+              <span>{{ statusLabels[outcome.status] }}<template v-if="outcome.reason"> · {{ outcome.reason }}</template></span>
+            </li>
+          </ul>
+        </details>
+      </div>
       <details v-if="summary.skipped" class="duplicate-details"
         @toggle="issuesOpen = ($event.currentTarget as HTMLDetailsElement).open">
         <summary>问题明细（{{ summary.skipped }} 项）</summary>
@@ -290,9 +397,9 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
             </li>
           </ul>
           <nav v-if="pageCount(issues.total) > 1" class="actions" aria-label="问题明细分页">
-            <button type="button" class="secondary" :disabled="issuePage === 0" @click="issuePage--">上一页</button>
+            <button type="button" class="secondary" :disabled="busy || issuePage === 0" @click="issuePage--">上一页</button>
             <span role="status">第 {{ issuePage + 1 }} / {{ pageCount(issues.total) }} 页</span>
-            <button type="button" class="secondary" :disabled="issuePage + 1 >= pageCount(issues.total)" @click="issuePage++">下一页</button>
+            <button type="button" class="secondary" :disabled="busy || issuePage + 1 >= pageCount(issues.total)" @click="issuePage++">下一页</button>
           </nav>
         </template>
         <p v-else-if="issuesOpen" role="status">正在加载问题明细…</p>
@@ -301,17 +408,18 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
       <p v-if="!summary.checked">
         {{ summary.found ? "所发现的照片均已跳过。" : summary.skipped ? "没有可检查的照片，请查看问题明细。" : "目录中未发现照片。" }}
       </p>
-      <p v-else-if="!summary.groups">未发现相似照片组。</p>
+      <p v-else-if="!summary.groups">{{ outcomes.length ? "当前结果中已无可列出的相似组，保留照片仍在原目录中。" : "未发现相似照片组。" }}</p>
       <template v-else>
         <div class="result-filter">
           <label for="similar-filter">匹配类型</label>
-          <select id="similar-filter" v-model="filter">
+          <select id="similar-filter" v-model="filter" :disabled="busy">
             <option value="all">全部</option>
             <option value="variant">同图变体</option>
             <option value="burst">疑似连拍</option>
           </select>
         </div>
         <p v-if="groupError" class="error" role="alert">{{ groupError }}</p>
+        <button v-if="groupError" type="button" class="secondary" :disabled="busy" @click="revision++">重新加载相似组</button>
         <p v-else-if="!groups" role="status">正在加载相似组…</p>
         <p v-else-if="!groups.total" role="status">当前筛选条件下没有相似组。</p>
         <template v-else>
@@ -321,7 +429,7 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
               <div class="photo-info">
                 <h3>{{ group.representative.name }}</h3>
                 <p>代表图 · {{ group.count }} 张<span v-if="group.hasVariant"> · 同图变体</span><span v-if="group.hasBurst"> · 疑似连拍</span></p>
-                <button type="button" class="secondary" :aria-expanded="expanded?.id === group.id"
+                <button type="button" class="secondary" :disabled="busy" :aria-expanded="expanded?.id === group.id"
                   @click="toggleGroup(group)">
                   {{ expanded?.id === group.id ? "收起对比" : "展开对比" }}
                 </button>
@@ -329,6 +437,12 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
             </div>
 
             <div v-if="expanded?.id === group.id" class="group-content">
+              <div class="actions">
+                <button type="button" class="secondary" :disabled="busy || !selected.size" @click="selected = new Map()">清除勾选</button>
+                <button type="button" class="danger" :disabled="busy || !selected.size" @click="confirmation?.showModal()">移到回收站</button>
+              </div>
+              <p class="selection-total" role="status">已勾选 {{ selected.size }} 张，共 {{ formatBytes(selectedBytes) }}；本组保留 {{ group.count - selected.size }} 张。</p>
+              <p id="similar-selection-rule">请手动勾选要移到回收站的照片，每组至少保留一张。代表图也可勾选，硬链接照片保留。</p>
               <div class="compare" aria-label="并排对比">
                 <div v-for="(photo, side) in { left, right }" :key="side" class="photo-info">
                   <h4>{{ side === "left" ? "左图" : "右图" }}</h4>
@@ -342,21 +456,29 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
                 </div>
               </div>
               <p v-if="memberError" class="error" role="alert">{{ memberError }}</p>
+              <button v-if="memberError" type="button" class="secondary" :disabled="busy" @click="expanded = { ...group }">重新加载组内照片</button>
               <ul v-else-if="members" class="member-list">
                 <li v-for="{ photo, kind } in members.items" :key="photo.id">
+                  <label class="photo-selection">
+                    <input type="checkbox" :checked="selected.has(photo.id)" :disabled="selectionDisabled(photo)"
+                      :aria-label="`勾选 ${photo.relativePath} 移到回收站`" aria-describedby="similar-selection-rule"
+                      @change="toggleSelection(photo)" />
+                  </label>
                   <SimilarPhotoPreview :scan-id="summary.scanId" :file-id="photo.id" :name="photo.name" />
                   <div class="photo-info">
                     <strong>{{ photo.name }}</strong>
                     <p>{{ photo.relativePath }}</p>
                     <p>{{ kind ? labels[kind] : "代表图" }} · {{ photo.width }} × {{ photo.height }} · {{ formatBytes(photo.size) }}</p>
                     <p v-if="photo.capturedAt">拍摄于 {{ photo.capturedAt }}</p>
+                    <p v-if="photo.hardLink">硬链接，保留</p>
+                    <p v-else-if="!selected.has(photo.id) && selected.size === group.count - 1">本组保留项</p>
                     <div class="actions">
                       <button type="button" class="secondary" :aria-label="`${photo.name} 设为左图`"
-                        :disabled="left?.id === photo.id" @click="selectPhoto(photo, 'left')">
+                        :disabled="busy || left?.id === photo.id" @click="selectPhoto(photo, 'left')">
                         {{ left?.id === photo.id ? "当前左图" : "设为左图" }}
                       </button>
                       <button type="button" class="secondary" :aria-label="`${photo.name} 设为右图`"
-                        :disabled="right?.id === photo.id" @click="selectPhoto(photo, 'right')">
+                        :disabled="busy || right?.id === photo.id" @click="selectPhoto(photo, 'right')">
                         {{ right?.id === photo.id ? "当前右图" : "设为右图" }}
                       </button>
                     </div>
@@ -365,20 +487,35 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
               </ul>
               <p v-else role="status">正在加载组内照片…</p>
               <nav v-if="pageCount(group.count) > 1" class="actions" aria-label="组内照片分页">
-                <button type="button" class="secondary" :disabled="memberPage === 0" @click="memberPage--">上一页</button>
+                <button type="button" class="secondary" :disabled="busy || memberPage === 0" @click="memberPage--">上一页</button>
                 <span role="status">第 {{ memberPage + 1 }} / {{ pageCount(group.count) }} 页</span>
-                <button type="button" class="secondary" :disabled="memberPage + 1 >= pageCount(group.count)" @click="memberPage++">下一页</button>
+                <button type="button" class="secondary" :disabled="busy || memberPage + 1 >= pageCount(group.count)" @click="memberPage++">下一页</button>
               </nav>
             </div>
           </article>
           <nav v-if="pageCount(groups.total) > 1" class="actions" aria-label="相似组分页">
-            <button type="button" class="secondary" :disabled="groupPage === 0" @click="changeGroupPage(groupPage - 1)">上一页</button>
+            <button type="button" class="secondary" :disabled="busy || groupPage === 0" @click="changeGroupPage(groupPage - 1)">上一页</button>
             <span role="status">第 {{ groupPage + 1 }} / {{ pageCount(groups.total) }} 页</span>
-            <button type="button" class="secondary" :disabled="groupPage + 1 >= pageCount(groups.total)" @click="changeGroupPage(groupPage + 1)">下一页</button>
+            <button type="button" class="secondary" :disabled="busy || groupPage + 1 >= pageCount(groups.total)" @click="changeGroupPage(groupPage + 1)">下一页</button>
           </nav>
         </template>
       </template>
     </section>
+
+    <dialog ref="confirmation" class="trash-dialog" aria-labelledby="similar-trash-heading" aria-describedby="similar-trash-summary">
+      <h2 id="similar-trash-heading">确认移到回收站</h2>
+      <p id="similar-trash-summary">
+        将移入 {{ selected.size }} 张照片，逻辑大小共 {{ formatBytes(selectedBytes) }}；本组保留 {{ (expanded?.count ?? 0) - selected.size }} 张。可从系统回收站恢复。
+      </p>
+      <p class="current-file">扫描目录 {{ directory }}</p>
+      <div class="trash-preview" tabindex="0" aria-label="将移到回收站的照片">
+        <ul><li v-for="photo in selected.values()" :key="photo.id">{{ photo.relativePath }}</li></ul>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" autofocus @click="confirmation?.close()">取消</button>
+        <button type="button" class="danger" :disabled="busy || !selected.size" @click="trashSelection">确认移到回收站</button>
+      </div>
+    </dialog>
   </div>
 </template>
 
@@ -406,7 +543,7 @@ select {
 }
 
 .similar-group {
-  border: 1px solid #ceded8;
+  border: 1px solid var(--border);
   border-radius: 0.65rem;
   margin-bottom: 0.75rem;
   padding: 0.75rem;
@@ -433,7 +570,7 @@ select {
 }
 
 .group-content {
-  border-top: 1px solid #ceded8;
+  border-top: 1px solid var(--border);
   margin-top: 0.75rem;
   padding-top: 0.75rem;
 }
@@ -452,13 +589,57 @@ select {
 }
 
 .member-list li {
-  border-top: 1px solid #ceded8;
+  border-top: 1px solid var(--border);
   padding: 0.65rem 0;
 }
 
-.member-list li > :first-child {
+.member-list li > .photo-preview {
   width: 4rem;
   flex: none;
+}
+
+.photo-selection {
+  margin: 0;
+  flex: none;
+  display: flex;
+  padding: 0.5rem 0;
+}
+
+.photo-selection input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+}
+
+.selection-total {
+  color: var(--muted);
+}
+
+.batch-result {
+  border-block: 1px solid var(--border);
+  margin-block: 1rem;
+  padding-bottom: 0.75rem;
+}
+
+.duplicate-list li > :is(strong, span) {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.trash-dialog {
+  box-sizing: border-box;
+  width: min(36rem, calc(100% - 2rem));
+}
+
+.trash-preview {
+  max-height: 35vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  border-block: 1px solid var(--border);
+}
+
+.trash-dialog .actions {
+  justify-content: end;
 }
 
 .member-list .actions {

@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { ElConfigProvider, ElIcon } from "element-plus";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
-import { Picture, FolderOpened, CopyDocument, Connection, User } from "@element-plus/icons-vue";
+import { Picture, FolderOpened, CopyDocument, Connection, User, Sunny, Moon, Monitor, Menu, Close } from "@element-plus/icons-vue";
 import "element-plus/es/components/icon/style/css";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
 import MediaLibrary from "./MediaLibrary.vue";
 import SimilarPhotosPanel from "./SimilarPhotosPanel.vue";
 import { formatBytes } from "./formatBytes";
 import appIcon from "../src-tauri/icons/32x32.png";
+import { themePreference, setThemePreference, type ThemePreference } from "./theme";
 
 interface ArchiveSummary {
   found: number;
@@ -46,6 +47,16 @@ const viewTitles = {
 const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection, people: User };
 type View = keyof typeof viewTitles;
 const view = ref<View>("library");
+const navigationOpen = ref(false);
+const navigationGroups: { title: string; views: View[] }[] = [
+  { title: "浏览", views: ["library", "people"] },
+  { title: "整理", views: ["archive", "duplicates", "similar"] },
+];
+const themeOptions = [
+  { value: "light", label: "浅色", icon: Sunny },
+  { value: "dark", label: "深色", icon: Moon },
+  { value: "system", label: "跟随系统", icon: Monitor },
+] satisfies { value: ThemePreference; label: string; icon: typeof Sunny }[];
 const libraryDirectory = ref("");
 const libraryBusy = ref(false);
 const duplicatesBusy = ref(false);
@@ -71,6 +82,15 @@ function navigate(target: View) {
     }
   }
   view.value = target;
+  const wasOpen = navigationOpen.value;
+  navigationOpen.value = false;
+  if (wasOpen) void nextTick(() => document.getElementById("workspace")?.focus({ preventScroll: true }));
+}
+
+function closeNavigation() {
+  if (!navigationOpen.value) return;
+  navigationOpen.value = false;
+  void nextTick(() => document.querySelector<HTMLButtonElement>(".navigation-toggle")?.focus());
 }
 
 async function chooseFolder(kind: "source" | "destination") {
@@ -125,22 +145,44 @@ async function startArchive() {
 
 <template>
   <ElConfigProvider :locale="zhCn" size="large">
-  <header class="app-header">
-    <div class="app-header-content">
-      <p class="app-name"><img :src="appIcon" alt="" width="24" height="24" />PhotoSys</p>
-      <nav class="view-nav" aria-label="功能">
-        <button v-for="(title, target) in viewTitles" :key="target" type="button"
-          :aria-pressed="view === target" :aria-current="view === target ? 'page' : undefined" :disabled="fileTaskBusy" @click="navigate(target)">
-          <ElIcon aria-hidden="true"><component :is="viewIcons[target]" /></ElIcon><span>{{ title }}</span>
-        </button>
-      </nav>
+  <div class="app-shell" :class="{ 'navigation-open': navigationOpen }">
+  <a class="skip-link" href="#workspace">跳到主要内容</a>
+  <aside class="app-sidebar" @keydown.esc="closeNavigation">
+    <div class="sidebar-brand">
+      <p class="app-name"><img :src="appIcon" alt="" width="28" height="28" /><span>PhotoSys</span></p>
+      <button type="button" class="navigation-toggle secondary" :aria-expanded="navigationOpen" aria-controls="sidebar-navigation"
+        :aria-label="navigationOpen ? '收起导航' : '展开导航'" @click="navigationOpen = !navigationOpen">
+        <ElIcon aria-hidden="true"><component :is="navigationOpen ? Close : Menu" /></ElIcon>
+      </button>
     </div>
-  </header>
+    <div id="sidebar-navigation" class="sidebar-content">
+      <nav class="view-nav" aria-label="功能">
+        <div v-for="group in navigationGroups" :key="group.title" class="navigation-group">
+          <p class="navigation-label">{{ group.title }}</p>
+          <button v-for="target in group.views" :key="target" type="button" :title="viewTitles[target]" :aria-label="viewTitles[target]"
+            :aria-pressed="view === target" :aria-current="view === target ? 'page' : undefined" :disabled="fileTaskBusy" @click="navigate(target)">
+            <ElIcon aria-hidden="true"><component :is="viewIcons[target]" /></ElIcon><span>{{ viewTitles[target] }}</span>
+          </button>
+        </div>
+      </nav>
+      <div class="sidebar-footer">
+        <p class="sidebar-caption">珍藏每一段回忆</p>
+        <div class="theme-picker" role="group" aria-label="外观主题">
+          <button v-for="option in themeOptions" :key="option.value" type="button" :aria-label="option.label" :title="option.label"
+            :aria-pressed="themePreference === option.value" @click="setThemePreference(option.value)">
+            <ElIcon aria-hidden="true"><component :is="option.icon" /></ElIcon><span>{{ option.label }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </aside>
 
-  <main :class="{ 'library-layout': view === 'library' || view === 'people' }">
+  <main id="workspace" tabindex="-1" :class="{ 'library-layout': view === 'library' || view === 'people' }">
     <header v-if="view !== 'library' && view !== 'people'">
       <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
+      <p v-else-if="view === 'duplicates'" class="description">找出相同文件，给珍贵回忆留出更多空间。</p>
+      <p v-else-if="view === 'similar'" class="description">并排看看相似的瞬间，慢慢选出最喜欢的一张。</p>
     </header>
 
     <MediaLibrary v-show="view === 'library' || view === 'people'" :people-mode="view === 'people'" @busy-change="libraryBusy = $event"
@@ -215,241 +257,65 @@ async function startArchive() {
     <DuplicatesPanel class="utility-panel" v-show="view === 'duplicates'" ref="duplicatesPanel" @busy-change="duplicatesBusy = $event" />
     <SimilarPhotosPanel class="utility-panel" v-show="view === 'similar'" ref="similarPanel" @busy-change="similarBusy = $event" />
   </main>
+  </div>
   </ElConfigProvider>
 </template>
 
-<style>
-:root {
-  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  font-size: 16px;
-  line-height: 1.5;
-  color: #152e30;
-  background: #f6f5f1;
-  --workspace-gutter: clamp(1rem, 2.5vw, 3rem);
-  --workspace-max-width: 120rem;
+<style scoped>
+.app-shell { --sidebar-width: 224px; min-height: 100vh; }
+.app-sidebar { position: fixed; inset: 0 auto 0 0; z-index: 20; display: flex; flex-direction: column; width: var(--sidebar-width); padding: 32px 16px 20px; border-right: 1px solid var(--border); background: var(--sidebar); }
+.sidebar-brand { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; }
+.app-name { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.5px; }
+.sidebar-content { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.view-nav { flex: 1; overflow-y: auto; margin-top: 44px; }
+.navigation-group + .navigation-group { margin-top: 30px; }
+.navigation-label { margin: 0 0 10px 14px; color: var(--muted); font-size: 12px; letter-spacing: .1em; }
+.view-nav button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 44px; margin: 4px 0; padding: 10px 14px; border: 0; background: transparent; color: var(--text-secondary); text-align: left; font-weight: 500; }
+.view-nav .el-icon { flex: none; font-size: 19px; }
+.view-nav button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.view-nav button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.view-nav button:disabled { opacity: .55; background: transparent; }
+.view-nav button:disabled[aria-pressed="true"] { background: var(--accent-soft); opacity: 1; }
+.sidebar-footer { padding-top: 24px; }
+.sidebar-caption { margin: 0 0 14px; color: var(--muted); font-size: 12px; text-align: center; }
+.theme-picker { display: flex; gap: 3px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.theme-picker button { display: grid; flex: 1; justify-items: center; align-content: center; gap: 4px; min-height: 50px; padding: 6px 2px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; }
+.theme-picker .el-icon { font-size: 16px; }
+.theme-picker button:hover { background: var(--hover); }
+.theme-picker button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
+.navigation-toggle { display: none; }
+main { min-width: 0; margin-left: var(--sidebar-width); padding: 40px clamp(20px, 3vw, 48px) 48px; }
+main > header { margin-bottom: 28px; }
+main > form, main > section, .utility-panel { max-width: 1000px; }
+.skip-link { position: fixed; top: -80px; left: 16px; z-index: 100; padding: 12px; background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; }
+.skip-link:focus { top: 12px; }
+@media (min-width: 1904px) { main { max-width: 1680px; } }
+@media (max-width: 959px) and (min-width: 640px) {
+  .app-shell { --sidebar-width: 72px; }
+  .app-sidebar { padding: 26px 10px 16px; }
+  .sidebar-brand { padding: 0; justify-content: center; }
+  .app-name span, .view-nav button span, .navigation-label, .sidebar-caption, .theme-picker button span { display: none; }
+  .view-nav button { justify-content: center; padding: 12px; }
+  .view-nav { margin-top: 36px; }
+  .navigation-group + .navigation-group { padding-top: 18px; margin-top: 18px; border-top: 1px solid var(--border); }
+  .theme-picker { flex-direction: column; }
+  .theme-picker button { min-height: 36px; }
+  main { padding-top: 28px; }
 }
-
-body {
-  margin: 0;
-  font-size: 14px;
-}
-
-main {
-  max-width: 42rem;
-  margin: 0 auto;
-  padding: clamp(1.25rem, 6vw, 3.5rem);
-}
-
-main.library-layout {
-  box-sizing: border-box;
-  max-width: var(--workspace-max-width);
-  padding: clamp(1.25rem, 2vw, 2rem) var(--workspace-gutter) 2.5rem;
-}
-
-header {
-  margin-bottom: 1.5rem;
-}
-
-.app-header {
-  margin: 0;
-  border-bottom: 1px solid #dedfd8;
-  background: #fff;
-}
-
-.app-header-content {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  column-gap: clamp(1rem, 3vw, 3rem);
-  row-gap: 0.25rem;
-  box-sizing: border-box;
-  max-width: var(--workspace-max-width);
-  min-height: 5rem;
-  margin: 0 auto;
-  padding: 0.5rem var(--workspace-gutter);
-}
-
-.app-name {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  margin: 0;
-  color: #233732;
-  font-size: 1.125rem;
-  font-weight: 700;
-}
-
-.view-nav {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.375rem;
-}
-
-.view-nav button {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding-inline: clamp(0.75rem, 1.2vw, 1.125rem);
-  background: transparent;
-  color: #4d5854;
-  font-size: 0.875rem;
-}
-
-.view-nav button:hover:not(:disabled) {
-  background: #eeeee8;
-}
-
-.view-nav button[aria-pressed="true"] {
-  background: #deede6;
-  color: #185746;
-}
-
-.view-nav button:disabled:not([aria-pressed="true"]) {
-  color: #6b746f;
-}
-
-h1 {
-  margin: 0;
-  font-size: 2rem;
-}
-
-h2 {
-  margin: 0;
-  font-size: 1.25rem;
-}
-
-.description {
-  margin: 0.5rem 0 0;
-  color: #395d57;
-}
-
-main > form,
-main > section,
-.utility-panel form,
-.utility-panel section {
-  padding: clamp(1rem, 4vw, 1.75rem);
-  background: #fff;
-  border: 1px solid #c9d9d4;
-  border-radius: 0.875rem;
-}
-
-main > section,
-.utility-panel section,
-.folder + .folder {
-  margin-top: 1rem;
-}
-
-label:not([class*="el-"]) {
-  display: block;
-  margin-bottom: 0.5rem;
-  font-weight: 650;
-}
-
-.folder-row,
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.folder-row input {
-  flex: 1 1 14rem;
-  min-width: 0;
-  padding: 0.625rem 0.75rem;
-  border: 1px solid #829d95;
-  border-radius: 0.5rem;
-  background: #fcfefd;
-  color: inherit;
-  font: inherit;
-}
-
-.actions {
-  align-items: center;
-  gap: 0.75rem;
-  margin-top: 1.25rem;
-}
-
-.archive-progress {
-  display: grid;
-  gap: 0.375rem;
-  margin-top: 1rem;
-  color: #395d57;
-  font-variant-numeric: tabular-nums;
-}
-
-.archive-progress p {
-  margin: 0;
-}
-
-.archive-progress progress {
-  width: 100%;
-  accent-color: #176252;
-}
-
-.current-file {
-  overflow-wrap: anywhere;
-}
-
-.report {
-  margin: 0;
-  color: #395d57;
-}
-
-.error {
-  margin: 0.75rem 0 0;
-  color: #9c2626;
-  overflow-wrap: anywhere;
-}
-
-button:not(:where([class*="el-"])) {
-  min-height: 2.5rem;
-  padding: 0.5rem 1rem;
-  border: 1px solid transparent;
-  border-radius: 0.5rem;
-  background: #176252;
-  color: #fff;
-  font: inherit;
-  font-weight: 650;
-  cursor: pointer;
-}
-
-button.secondary {
-  border-color: #a6c4bb;
-  background: #f0f7f4;
-  color: #194f44;
-}
-
-button:not(:where([class*="el-"])):disabled {
-  background: #dde8e3;
-  color: #536863;
-  cursor: default;
-}
-
-:is(button, input, select):not([class*="el-"]):focus-visible {
-  outline: 2px solid #126353;
-  outline-offset: 2px;
-}
-
-dl {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(5rem, 1fr));
-  gap: 0.75rem;
-  margin: 1rem 0;
-}
-
-dt {
-  color: #395d57;
-  font-size: 0.875rem;
-}
-
-dd {
-  margin: 0.25rem 0 0;
-  font-size: 1.25rem;
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-}
-
-.report span {
-  overflow-wrap: anywhere;
+@media (max-width: 639px) {
+  .app-shell { --sidebar-width: 0px; }
+  .app-sidebar { position: sticky; inset: 0 0 auto; width: 100%; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar-brand { padding: 0; }
+  .app-name { font-size: 18px; }
+  .navigation-toggle { display: grid; place-items: center; width: 40px; padding: 8px; }
+  .sidebar-content { display: none; max-height: calc(100dvh - 72px); overflow-y: auto; }
+  .navigation-open .sidebar-content { display: flex; }
+  .view-nav { margin-top: 20px; overflow: visible; }
+  .navigation-group + .navigation-group { margin-top: 16px; }
+  .sidebar-footer { padding-top: 16px; }
+  .sidebar-caption { display: none; }
+  .theme-picker button { display: flex; justify-content: center; min-height: 36px; gap: 8px; }
+  .theme-picker button span { font-size: 12px; }
+  main { padding: 24px 16px 32px; }
 }
 </style>

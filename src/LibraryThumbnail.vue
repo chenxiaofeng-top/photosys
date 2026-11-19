@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { queueLibraryThumbnail } from "./libraryThumbnailQueue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
+import { ElIcon } from "element-plus";
+import { VideoPlay } from "@element-plus/icons-vue";
 
 const props = defineProps<{ scanId: number; fileId: number; video: boolean; rotation: Rotation }>();
 const target = ref<HTMLElement>();
@@ -49,8 +51,8 @@ async function load() {
   <span ref="target" class="thumbnail">
     <RotatableImage v-if="image" :src="image" alt="" :rotation="rotation" />
     <span v-else-if="error" class="preview-error" :title="error">预览失败</span>
-    <span v-else>{{ video ? "▶ 视频" : "照片" }}</span>
-    <span v-if="video && image" class="video-label" aria-hidden="true">▶ 视频</span>
+    <span v-else class="thumbnail-placeholder"><ElIcon v-if="video" aria-hidden="true"><VideoPlay /></ElIcon>{{ video ? "视频" : "照片" }}</span>
+    <span v-if="video && image" class="video-label" aria-hidden="true"><ElIcon><VideoPlay /></ElIcon>视频</span>
   </span>
 </template>
 
@@ -64,17 +66,21 @@ async function load() {
 }
 
 .preview-error {
-  color: #9c2626;
+  color: var(--danger);
 }
 
 .video-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   position: absolute;
   right: 0.5rem;
   bottom: 0.5rem;
   padding: 0.2rem 0.4rem;
   border-radius: 0.25rem;
-  background: #162922;
-  color: #fff;
+  background: var(--viewer);
+  color: var(--viewer-text);
   font-size: 0.75rem;
 }
+.thumbnail-placeholder { display: inline-flex; align-items: center; gap: 4px; }
 </style>

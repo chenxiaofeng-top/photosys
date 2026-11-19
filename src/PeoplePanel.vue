@@ -92,8 +92,7 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
 </script>
 <template>
   <section class="people-panel" aria-label="人物相册">
-    <details class="analysis-settings" :open="!selected">
-    <summary>人物分析与模型设置 · {{ running ? '正在分析 / 等待任务' : `已分析 ${state?.indexed ?? 0} / ${state?.total ?? 0} 张` }}</summary>
+    <section class="analysis-settings" aria-label="人物分析与模型设置">
     <AiSearchSettings model-kind="people" :scan-id="scanId" :library-busy="libraryBusy" :people-status="state" :analysis-busy="running" @model-ready="ready = $event" @model-changed="request++; indexTask = false; cancelling = false; refresh(false); emit('changed')" @rebuild="updateIndex(false)" />
     <div class="people-actions">
       <span role="status">{{ running ? '正在分析 / 等待其他 AI 任务 · ' : '' }}已分析 {{ state?.indexed ?? 0 }} / {{ state?.total ?? 0 }} 张照片<span v-if="state?.pending"> · 待处理 {{ state.pending }} 张</span><span v-if="state?.failed"> · 失败 {{ state.failed }} 张</span></span>
@@ -105,7 +104,7 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
     <p v-if="state" class="muted" role="status">{{ state.autoGrouping ? '保守自动分组已开启 · 自动生成未命名人物，可为整组命名；不确定的人脸保留在待整理。' : '自动分组未开启，可在待整理中手动指定人物。' }}</p>
     <p v-if="state?.message" class="notice" role="status">{{ state.message }}</p>
     <p v-if="state && !state.writable" class="notice">此相册只读，可以浏览已有的人物和时间线。</p>
-    </details>
+    </section>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <template v-if="selected">
       <div class="people-actions detail-title"><button type="button" class="secondary" @click="emit('select', undefined)">返回人物列表</button><h2>{{ personName(selected) }}</h2><button type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button></div>
@@ -142,24 +141,22 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
 <style scoped>
 .people-panel { margin: 0 0 1.5rem; }
 .analysis-settings { margin-bottom: 1rem; }
-.analysis-settings > summary { padding: .75rem 0; color: #52655a; font-size: .875rem; }
-.analysis-settings[open] > summary { margin-bottom: .5rem; }
 .detail-title h2 { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .people-actions, .people-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; margin: 1rem 0; }
-.people-actions > span { flex: 1; color: #65736b; }
+.people-actions > span { flex: 1; color: var(--muted); }
 .people-actions label, .people-search { min-width: 0; max-width: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin: .5rem 0; font-size: .875rem; }
-.people-panel input, .people-panel select { min-height: 40px; max-width: 100%; box-sizing: border-box; padding: .5rem .75rem; border: 1px solid #bdcec3; border-radius: .5rem; background: white; color: #24352f; font: inherit; }
+.people-panel input, .people-panel select { min-height: 40px; max-width: 100%; box-sizing: border-box; padding: .5rem .75rem; border: 1px solid var(--control-border); border-radius: .5rem; background: var(--surface); color: var(--text); font: inherit; }
 .people-search input { width: min(24rem, 100%); }
-.person-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px,1fr)); gap: 1rem; padding: 0; margin: 1rem 0; list-style: none; }
-.person-card { display: flex; width: 100%; flex-direction: column; align-items: center; gap: .75rem; padding: 1.5rem .75rem; background: white; border: 1px solid #dce5dc; border-radius: 1rem; color: #24352f; }
-.person-card:hover { border-color: #176252; background: #f3f8f2; }
+.person-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 170px),1fr)); gap: 12px; padding: 0; margin: 24px 0; list-style: none; }
+.person-card { display: flex; width: 100%; flex-direction: column; align-items: center; gap: 12px; padding: 24px 12px; background: transparent; border: 1px solid transparent; border-radius: 12px; color: var(--text); }
+.person-card:hover { border-color: var(--accent); background: var(--surface-subtle); }
 .person-card img, .avatar-placeholder { width: 112px; height: 112px; border-radius: 50%; object-fit: cover; }
-.avatar-placeholder { display: grid; place-items: center; background: #e9f0e8; font-size: 2rem; color: #61766b; }
+.avatar-placeholder { display: grid; place-items: center; background: var(--accent-soft); font-size: 2rem; color: var(--muted); }
 .person-card strong { overflow-wrap: anywhere; max-width: 100%; }
-.person-card > span:last-child, .muted { color: #65736b; font-size: .875rem; }
-.people-empty { padding: 3rem 1rem; margin: 1rem 0; text-align: center; border: 1px dashed #cfdbce; border-radius: 1rem; background: #ffffff90; }
-.notice { padding: .75rem 1rem; border-radius: .75rem; background: #f3f1e7; color: #776127; font-size: .875rem; }
-.person-management { margin: 1rem 0; padding: 1rem; border: 1px solid #dce5dc; border-radius: .75rem; background: #fff; }
+.person-card > span:last-child, .muted { color: var(--muted); font-size: .875rem; }
+.people-empty { padding: 3rem 1rem; margin: 1rem 0; text-align: center; border: 1px dashed var(--border); border-radius: 1rem; background: var(--surface); }
+.notice { padding: .75rem 1rem; border-radius: .75rem; background: var(--warning-soft); color: var(--warning); font-size: .875rem; }
+.person-management { margin: 1rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); }
 .detail-title h2 { margin: 0; }
 progress { width: 100%; }
 </style>

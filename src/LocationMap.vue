@@ -8,6 +8,7 @@ import { layers, namedFlavor } from "@protomaps/basemaps";
 import "maplibre-gl/dist/maplibre-gl.css";
 import OfflineMapSettings from "./OfflineMapSettings.vue";
 import { mapArchives, type Coordinates, type MapPackage, type MapPoints, type MediaFilter, type Selection } from "./locations";
+import { resolvedTheme } from "./theme";
 
 const props = defineProps<{ scanId: number; filter: MediaFilter; personId: number | null; contentQuery: string | null; revision: number; focus: Coordinates | null }>();
 const emit = defineEmits<{ select: [selection: Selection | null] }>();
@@ -61,25 +62,27 @@ function selectionData() {
     geometry: { type: "Polygon" as const, coordinates: [[[s.west, s.south], [s.east, s.south], [s.east, s.north], [s.west, s.north], [s.west, s.south]]] } }] : [] };
 }
 function style(): StyleSpecification {
+  const tokens = getComputedStyle(document.documentElement);
+  const color = (name: string) => tokens.getPropertyValue(`--${name}`).trim();
   return { version: 8, glyphs: `${new URL("/maps/fonts/", location.href).href}{fontstack}/{range}.pbf`, sprite: new URL("/maps/sprites/light", location.href).href,
     sources: {
       overview: { type: "geojson", data: new URL("/maps/overview.geojson", location.href).href },
       streets: { type: "vector", tiles: [`${protocol}://tiles/{z}/{x}/{y}`], minzoom: 0, maxzoom: 15, attribution: '© OpenStreetMap contributors · Protomaps' },
-      media: { type: "geojson", data: geojson(), cluster: true, clusterRadius: 45, clusterMaxZoom: 18 },
+      media: { type: "geojson", data: geojson(), cluster: true, clusterRadius: 45, clusterMaxZoom: 18, maxzoom: 19 },
       selection: { type: "geojson", data: selectionData() },
     },
     layers: [
-      { id: "background", type: "background", paint: { "background-color": "#e7eef0" } },
-      { id: "land", type: "fill", source: "overview", paint: { "fill-color": "#f2f3eb", "fill-outline-color": "#bcc9bc" } },
-      ...layers("streets", namedFlavor("light"), { lang: "zh-Hans" }).filter(l => l.type !== "background").map(l => {
+      { id: "background", type: "background", paint: { "background-color": color("map-water") } },
+      { id: "land", type: "fill", source: "overview", paint: { "fill-color": color("map-land"), "fill-outline-color": color("border") } },
+      ...layers("streets", namedFlavor(resolvedTheme.value), { lang: "zh-Hans" }).filter(l => l.type !== "background").map(l => {
         if (l.type === "symbol" && l.layout?.["text-font"]) return { ...l, layout: { ...l.layout, "text-font": ["Noto Sans Regular"] } };
         return l;
       }),
-      { id: "selection-fill", type: "fill", source: "selection", paint: { "fill-color": "#386d49", "fill-opacity": .12 } },
-      { id: "selection-outline", type: "line", source: "selection", paint: { "line-color": "#386d49", "line-width": 2 } },
-      { id: "clusters", type: "circle", source: "media", filter: ["has", "point_count"], paint: { "circle-color": "#386d49", "circle-radius": ["step", ["get", "point_count"], 19, 100, 25, 1000, 31], "circle-stroke-width": 2, "circle-stroke-color": "#fff" } },
-      { id: "cluster-count", type: "symbol", source: "media", filter: ["has", "point_count"], layout: { "text-field": ["get", "point_count_abbreviated"], "text-font": ["Noto Sans Regular"], "text-size": 13 }, paint: { "text-color": "#fff" } },
-      { id: "media-point", type: "circle", source: "media", filter: ["!", ["has", "point_count"]], paint: { "circle-color": "#d58440", "circle-radius": 7, "circle-stroke-width": 2, "circle-stroke-color": "#fff" } },
+      { id: "selection-fill", type: "fill", source: "selection", paint: { "fill-color": color("accent"), "fill-opacity": .12 } },
+      { id: "selection-outline", type: "line", source: "selection", paint: { "line-color": color("accent"), "line-width": 2 } },
+      { id: "clusters", type: "circle", source: "media", filter: ["has", "point_count"], paint: { "circle-color": color("accent"), "circle-radius": ["step", ["get", "point_count"], 19, 100, 25, 1000, 31], "circle-stroke-width": 2, "circle-stroke-color": color("surface") } },
+      { id: "cluster-count", type: "symbol", source: "media", filter: ["has", "point_count"], layout: { "text-field": ["get", "point_count_abbreviated"], "text-font": ["Noto Sans Regular"], "text-size": 13 }, paint: { "text-color": color("on-accent") } },
+      { id: "media-point", type: "circle", source: "media", filter: ["!", ["has", "point_count"]], paint: { "circle-color": color("accent"), "circle-radius": 7, "circle-stroke-width": 2, "circle-stroke-color": color("surface") } },
     ] };
 }
 function updateCoverage() {
@@ -147,6 +150,8 @@ watch([() => props.scanId, () => props.filter, () => props.personId, () => props
   finally { if (active) loading.value = false; }
 });
 watch(() => props.filter.locationSelection, () => { if (map?.isStyleLoaded()) (map.getSource("selection") as GeoJSONSource)?.setData(selectionData()); });
+// Replacing the style preserves the map instance, camera and current filters.
+watch(resolvedTheme, () => { if (map) map.setStyle(style()); }, { flush: "post" });
 function cancelDrawing() { drawing.value = false; drawStart.value = undefined; drawEnd.value = undefined; map?.dragPan.enable(); }
 function startDrawing() { drawing.value = true; map?.dragPan.disable(); }
 function beginDraw(event: MapMouseEvent) { if (drawing.value && event.originalEvent.button === 0) { drawStart.value = { x: event.point.x, y: event.point.y }; drawEnd.value = drawStart.value; } }
@@ -194,12 +199,12 @@ onBeforeUnmount(() => { disposed = true; map?.remove(); maplibregl.removeProtoco
 <style scoped>
 .location-section { margin: .8rem 0; }
 .map-toggle { font-size: .9rem; }
-.map-panel { margin-top: .7rem; padding: 1rem; background: #f7f9f4; border: 1px solid #dce4d9; border-radius: 12px; }
+.map-panel { margin-top: .7rem; padding: 1rem; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 12px; }
 .map-toolbar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
-.map-toolbar span,p { font-size: .875rem; color: #566252; }
+.map-toolbar span,p { font-size: .875rem; color: var(--muted); }
 .map-container { position: relative; margin-top: .75rem; }
 .map-canvas { height: clamp(300px, 48vh, 600px); width: 100%; border-radius: 8px; overflow: hidden; }
 .drawing :deep(canvas) { cursor: crosshair !important; }
-.draw-box { position: absolute; pointer-events: none; border: 2px solid #386d49; background: #386d4920; }
-.error { color: #a13927; }
+.draw-box { position: absolute; pointer-events: none; border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.error { color: var(--danger); }
 </style>

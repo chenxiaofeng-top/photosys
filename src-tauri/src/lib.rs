@@ -177,6 +177,7 @@ pub fn run() {
             trash_duplicates,
             similar::scan_similar,
             similar::cancel_similar,
+            similar::trash_similar,
             similar::similar_groups,
             similar::similar_members,
             similar::similar_issues,

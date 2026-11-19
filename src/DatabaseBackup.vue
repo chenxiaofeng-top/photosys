@@ -121,14 +121,14 @@ async function restoreBackup() {
 <style scoped>
 .backup-actions { display: flex; flex-wrap: wrap; gap: .75rem; }
 .backup-actions :deep(.el-button + .el-button) { margin-left: 0; }
-.backup-hint { color: #52655a; }
-.restore-confirmation { margin-top: 1.25rem; border: 1px solid #d9dfd7; border-radius: .6rem; padding: 1rem; }
+.backup-hint { color: var(--muted); }
+.restore-confirmation { margin-top: 1.25rem; border: 1px solid var(--border); border-radius: .6rem; padding: 1rem; }
 .restore-confirmation h3 { margin-top: 0; }
 .restore-confirmation dl { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: .5rem; }
 .restore-confirmation dd { margin: 0; font-size: inherit; font-weight: 400; }
 .restore-confirmation dd, .restore-confirmation p, .backup-result { overflow-wrap: anywhere; }
-.overwrite-notice { padding: .75rem; background: #fff4e6; border-radius: .4rem; color: #704b15; }
-.backup-result { white-space: pre-wrap; color: #176252; }
+.overwrite-notice { padding: .75rem; background: var(--warning-soft); border-radius: .4rem; color: var(--warning); }
+.backup-result { white-space: pre-wrap; color: var(--accent); }
 </style>
 
 <style>

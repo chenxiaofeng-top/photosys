@@ -92,16 +92,16 @@ async function cancel() { try { await invoke("offline_map_cancel"); } catch (cau
 </template>
 
 <style scoped>
-.offline-settings { border-top: 1px solid #dce4d9; padding-top: .75rem; margin-top: .75rem; }
+.offline-settings { border-top: 1px solid var(--border); padding-top: .75rem; margin-top: .75rem; }
 summary { cursor: pointer; font-weight: 600; }
-p { color: #566252; font-size: .875rem; }
+p { color: var(--muted); font-size: .875rem; }
 .map-directory { overflow-wrap: anywhere; }
 .map-package-actions,.download-region { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
 .download-region { margin-top: .8rem; }
 .download-region .el-select { width: min(100%, 25rem); }
 .download-region .el-input { width: 14rem; }
 .map-packages { list-style: none; padding: 0; }
-.map-packages li { display: flex; justify-content: space-between; align-items: center; padding: .6rem 0; border-bottom: 1px solid #e4e9e1; gap: 1rem; }
-.map-packages span { display: block; margin-top: .25rem; color: #566252; font-size: .8rem; }
-.error { color: #a13927; }
+.map-packages li { display: flex; justify-content: space-between; align-items: center; padding: .6rem 0; border-bottom: 1px solid var(--border); gap: 1rem; }
+.map-packages span { display: block; margin-top: .25rem; color: var(--muted); font-size: .8rem; }
+.error { color: var(--danger); }
 </style>

@@ -254,7 +254,7 @@ async function trashSelection() {
           <button type="button" class="secondary" :disabled="busy || !selected.size" @click="selected = new Set()">
             清除勾选
           </button>
-          <button type="button" :disabled="busy || !selected.size" @click="confirmation?.showModal()">
+          <button type="button" class="danger" :disabled="busy || !selected.size" @click="confirmation?.showModal()">
             {{ task === "trashing" ? "正在移入回收站…" : "移到回收站" }}
           </button>
         </div>
@@ -317,19 +317,19 @@ async function trashSelection() {
 
 <style scoped>
 .batch-result {
-  border-block-start: 1px solid #c9d9d4;
+  border-block-start: 1px solid var(--border);
   margin-top: 1rem;
 }
 
 .duplicate-details summary {
   cursor: pointer;
-  color: #194f44;
+  color: var(--accent);
 }
 
 .duplicate-group {
   margin-top: 0.875rem;
   padding: 0.875rem 1rem;
-  border: 1px solid #c9d9d4;
+  border: 1px solid var(--border);
   border-radius: 0.625rem;
 }
 
@@ -362,7 +362,7 @@ async function trashSelection() {
   align-items: start;
   margin: 0;
   padding: 0.625rem 0 0;
-  border-block-start: 1px solid #e1ebe7;
+  border-block-start: 1px solid var(--border);
   font-weight: 400;
   cursor: pointer;
 }
@@ -375,13 +375,13 @@ async function trashSelection() {
   width: 1rem;
   height: 1rem;
   margin: 0.15rem 0 0;
-  accent-color: #176252;
+  accent-color: var(--accent);
 }
 
 .file-path,
 .file-meta,
 .selection-total {
-  color: #395d57;
+  color: var(--muted);
 }
 
 .file-meta {
@@ -394,20 +394,20 @@ async function trashSelection() {
   width: min(36rem, calc(100% - 2rem));
   max-height: calc(100% - 2rem);
   padding: clamp(1rem, 4vw, 1.5rem);
-  border: 1px solid #a6c4bb;
+  border: 1px solid var(--control-border);
   border-radius: 0.875rem;
   color: inherit;
 }
 
 .trash-dialog::backdrop {
-  background: rgb(15 36 32 / 55%);
+  background: var(--backdrop);
 }
 
 .trash-preview {
   max-height: 35vh;
   overflow: auto;
   overflow-wrap: anywhere;
-  border-block: 1px solid #c9d9d4;
+  border-block: 1px solid var(--border);
 }
 
 .trash-preview article {
@@ -415,7 +415,7 @@ async function trashSelection() {
 }
 
 .trash-preview article + article {
-  border-block-start: 1px solid #c9d9d4;
+  border-block-start: 1px solid var(--border);
 }
 
 .trash-preview ul {
@@ -428,6 +428,6 @@ async function trashSelection() {
 }
 
 .danger {
-  background: #9c2626;
+  background: var(--danger);
 }
 </style>

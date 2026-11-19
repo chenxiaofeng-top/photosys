@@ -94,16 +94,16 @@ function selectAll() { selected.value = results.value?.items.map(f => f.id) ?? [
 <style scoped>
 .face-editor { margin: 1rem 0; }
 .face-toolbar, .assign-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; margin: 1rem 0; }
-.assign-controls { border: 1px solid #d6e0d7; border-radius: .75rem; padding: 1rem; }
+.assign-controls { border: 1px solid var(--border); border-radius: .75rem; padding: 1rem; }
 .assign-controls label { min-width: 0; max-width: 100%; display: grid; gap: .4rem; margin: 0; font-size: .875rem; }
-.assign-controls input, .assign-controls select { max-width: 100%; min-height: 38px; padding: .4rem .6rem; border: 1px solid #bdcec3; border-radius: .4rem; background: white; color: #24352f; }
+.assign-controls input, .assign-controls select { max-width: 100%; min-height: 38px; padding: .4rem .6rem; border: 1px solid var(--control-border); border-radius: .4rem; background: var(--surface); color: var(--text); }
 .faces { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 1rem; list-style: none; margin: 0; padding: 0; }
-.faces li { min-width: 0; padding: .75rem; border: 1px solid #dde5dc; border-radius: .75rem; background: white; }
-.faces li.selected { border-color: #176252; background: #edf5ef; }
+.faces li { min-width: 0; padding: .75rem; border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); }
+.faces li.selected { border-color: var(--accent); background: var(--accent-soft); }
 .faces label { display: flex; gap: .4rem; align-items: start; margin: 0; cursor: pointer; }
 .faces img { width: min(112px, 100%); height: auto; aspect-ratio: 1; border-radius: .6rem; object-fit: cover; }
 .faces p { margin: .6rem 0; font-size: .85rem; overflow-wrap: anywhere; }
 .photo-link { padding: .35rem .5rem; font-size: .8rem; }
-.muted { color: #65736b; font-size: .875rem; }
-.review { color: #92531f; }
+.muted { color: var(--muted); font-size: .875rem; }
+.review { color: var(--warning); }
 </style>
