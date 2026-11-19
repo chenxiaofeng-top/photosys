@@ -194,6 +194,28 @@ function withSavedRotations(page: Page<Item>): Page<Item> {
   };
 }
 const itemsLoading = ref(false);
+const pageCount = computed(() => Math.ceil((results.value?.total ?? 0) / pageSize));
+const pageInput = ref("1");
+const pageInputError = ref("");
+const paginationDisabled = computed(() => busy.value || itemsLoading.value || searchPending.value || !results.value);
+watch(results, (page) => {
+  pageInput.value = String((page?.page ?? 0) + 1);
+  pageInputError.value = "";
+}, { immediate: true });
+
+function jumpToPage() {
+  if (paginationDisabled.value) return;
+  const input = pageInput.value.trim();
+  const page = Number(input);
+  if (!/^\d+$/.test(input) || !Number.isSafeInteger(page) || page < 1 || page > pageCount.value) {
+    pageInputError.value = `请输入 1 到 ${pageCount.value} 之间的整数页码`;
+    return;
+  }
+  pageInputError.value = "";
+  pageInput.value = String(page);
+  if (page - 1 !== results.value?.page) requestedPage.value = page - 1;
+}
+
 async function fetchPage(scanId: number, currentFilter: typeof filter.value, currentSort: Sort, page: number): Promise<Page<Item>> {
   if (albumsMode.value) {
     if (!selectedAlbum.value) return { page: 0, total: 0, items: [] };
@@ -912,11 +934,21 @@ async function performFileAction(action: FileAction) {
         </template>
       </ul>
       <nav v-if="results && results.total > pageSize" class="pagination" aria-label="媒体列表分页">
-        <button type="button" class="secondary" :disabled="busy || results.page === 0"
+        <button type="button" class="secondary" :disabled="paginationDisabled || results.page === 0"
           @click="requestedPage = results.page - 1">上一页</button>
-        <span>{{ results.page + 1 }} / {{ Math.ceil(results.total / pageSize) }}</span>
-        <button type="button" class="secondary" :disabled="busy || (results.page + 1) * pageSize >= results.total"
+        <span>{{ results.page + 1 }} / {{ pageCount }}</span>
+        <button type="button" class="secondary" :disabled="paginationDisabled || (results.page + 1) * pageSize >= results.total"
           @click="requestedPage = results.page + 1">下一页</button>
+        <form class="page-jump" novalidate @submit.prevent="jumpToPage">
+          <label class="page-jump-label">跳至第
+            <input v-model="pageInput" type="text" inputmode="numeric" aria-label="跳转页码" autocomplete="off"
+              :disabled="paginationDisabled" :aria-invalid="!!pageInputError"
+              :aria-describedby="pageInputError ? 'library-page-error' : undefined" @input="pageInputError = ''" />
+            页
+          </label>
+          <button type="submit" class="secondary" :disabled="paginationDisabled">跳转</button>
+        </form>
+        <p v-if="pageInputError" id="library-page-error" class="page-jump-error error" role="alert">{{ pageInputError }}</p>
       </nav>
 
       <details v-if="summary.issues" :open="issuesOpen" @toggle="issuesOpen = ($event.target as HTMLDetailsElement).open">
@@ -1059,6 +1091,10 @@ button.favorite[aria-pressed="true"] { color: var(--accent); }
 button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
 .pagination, .detail-navigation, .rotation-actions, .detail-actions, .detail-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .pagination { justify-content: center; margin-top: 28px; color: var(--muted); font-size: 13px; }
+.page-jump { display: flex; align-items: center; gap: 8px; }
+.page-jump .page-jump-label { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 400; white-space: nowrap; }
+.page-jump input { width: 76px; text-align: center; }
+.page-jump-error { flex-basis: 100%; margin: 0; text-align: center; }
 .timeline-months { display: flex; flex-wrap: wrap; gap: 8px; max-height: 160px; overflow-y: auto; margin: 20px 0; }
 .timeline-months button { font-size: 13px; }
 .timeline-months [aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
