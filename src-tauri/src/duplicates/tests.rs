@@ -66,7 +66,15 @@ fn reports_disappearing_files_and_keeps_valid_groups() {
     write(root.path(), "first", b"same");
     write(root.path(), "second", b"same");
     let (_, result) = scan(19, root.path(), |progress| {
-        if matches!(progress, ScanProgress::Hashing { checked: 0, .. }) {
+        if matches!(
+            progress,
+            ScanProgress {
+                phase: "hashing",
+                checked: 0,
+                ..
+            }
+        ) && vanishing.exists()
+        {
             fs::remove_file(&vanishing).unwrap();
         }
     })
@@ -348,4 +356,216 @@ fn moves_and_restores_a_file_with_the_linux_system_trash() {
     );
     assert_eq!(fs::read(target).unwrap(), fs::read(keeper).unwrap());
     assert!(!trashed.exists());
+}
+
+#[test]
+fn sampling_is_only_a_prefilter_and_does_not_miss_unsampled_differences() {
+    let root = tempdir().unwrap();
+    let a = vec![7; READ_BUFFER * 8];
+    let mut b = a.clone();
+    b[READ_BUFFER + 17] = 9;
+    write(root.path(), "a", &a);
+    write(root.path(), "a-copy", &a);
+    write(root.path(), "b", &b);
+    write(root.path(), "b-copy", &b);
+    let (scan, result) = scanned(&root);
+    assert_eq!(result.groups.len(), 2);
+    assert!(result.groups.iter().all(|g| g.files.len() == 2));
+    let first = &scan.groups[0].files[0];
+    let second = &scan.groups[1].files[0];
+    assert_eq!(
+        scan.root.sample(first, &mut |_| Ok(())).unwrap(),
+        scan.root.sample(second, &mut |_| Ok(())).unwrap()
+    );
+    assert_ne!(
+        scan.root.checksum(first, &mut |_| Ok(())).unwrap(),
+        scan.root.checksum(second, &mut |_| Ok(())).unwrap()
+    );
+}
+
+#[test]
+fn cancellation_is_observed_in_every_phase_and_at_read_boundaries() {
+    let root = tempdir().unwrap();
+    let data = vec![1; READ_BUFFER * 8];
+    write(root.path(), "a", &data);
+    write(root.path(), "b", &data);
+    for phase in ["scanning", "sampling", "hashing", "comparing"] {
+        let flag = AtomicBool::new(false);
+        let result = run_scan(
+            1,
+            root.path(),
+            &flag,
+            |p| {
+                if p.phase == phase {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            },
+            true,
+        );
+        assert!(result.is_err(), "phase {phase}");
+        let scan = run_scan(2, root.path(), &AtomicBool::new(false), |_| {}, true).unwrap();
+        assert_eq!(scan.groups.len(), 1);
+    }
+    let (scan, _) = scanned(&root);
+    let candidate = &scan.groups[0].files[0];
+    let mut bytes = 0;
+    assert!(
+        scan.root
+            .checksum(candidate, &mut |n| {
+                bytes += n;
+                if bytes >= READ_BUFFER {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(bytes, READ_BUFFER);
+    let mut bytes = 0;
+    assert!(
+        scan.root
+            .compare_with(candidate, &scan.groups[0].files[1], None, &mut |n| {
+                bytes += n;
+                if bytes > 0 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(bytes, READ_BUFFER * 2);
+    let mut bytes = 0;
+    assert!(
+        scan.root
+            .sample(candidate, &mut |n| {
+                bytes += n;
+                if bytes > 0 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(bytes, READ_BUFFER);
+}
+
+#[test]
+fn byte_updates_continue_inside_a_single_file_and_sample_detects_mutation() {
+    let root = tempdir().unwrap();
+    let data = vec![1; READ_BUFFER * 8];
+    let path = write(root.path(), "a", &data);
+    write(root.path(), "b", &data);
+    let (scan, _) = scanned(&root);
+    let candidate = scan.groups[0]
+        .files
+        .iter()
+        .find(|f| f.relative == Path::new("a"))
+        .unwrap();
+    let flag = AtomicBool::new(false);
+    let mut updates = Vec::new();
+    let mut callback = |p: ScanProgress| updates.push(p);
+    let mut reporter = Reporter {
+        update: ScanProgress {
+            phase: "hashing",
+            found: 2,
+            checked: 0,
+            total: 2,
+            bytes_read: 0,
+            current_file: "a".into(),
+            elapsed_ms: 0,
+        },
+        start: Instant::now(),
+        last: Instant::now(),
+        cancelled: &flag,
+        send: &mut callback,
+    };
+    scan.root
+        .checksum(candidate, &mut |n| {
+            reporter.last = Instant::now() - PROGRESS_INTERVAL;
+            reporter.tick(n, false)
+        })
+        .unwrap();
+    assert!(
+        updates
+            .iter()
+            .filter(|p| p.bytes_read > 0 && p.checked == 0)
+            .count()
+            > 1
+    );
+    let mut mutated = false;
+    assert!(
+        scan.root
+            .sample(candidate, &mut |n| {
+                if n > 0 && !mutated {
+                    mutated = true;
+                    fs::write(&path, b"changed").unwrap();
+                }
+                Ok(())
+            })
+            .is_err()
+    );
+}
+
+fn signature(scan: &Scan) -> Vec<Vec<String>> {
+    let mut groups: Vec<_> = scan
+        .groups
+        .iter()
+        .map(|g| {
+            let mut files: Vec<_> = g.files.iter().map(Candidate::path_label).collect();
+            files.sort();
+            files
+        })
+        .collect();
+    groups.sort();
+    groups
+}
+
+#[test]
+#[ignore = "disk benchmark; run explicitly with --ignored --nocapture"]
+fn benchmark_sampling_against_full_hash_pipeline() {
+    for (label, count, size, distinct) in [
+        ("small", 200, 1024, true),
+        ("same-size-distinct", 16, 2 * 1024 * 1024, true),
+        ("true-copies", 16, 1024 * 1024, false),
+    ] {
+        let root = tempdir().unwrap();
+        for i in 0..count {
+            let data = vec![if distinct { (i % 100) as u8 } else { 7 }; size];
+            write(root.path(), &format!("{i:05}.bin"), &data);
+        }
+        let baseline = run_scan(1, root.path(), &AtomicBool::new(false), |_| {}, false).unwrap();
+        let optimized = run_scan(2, root.path(), &AtomicBool::new(false), |_| {}, true).unwrap();
+        assert_eq!(signature(&baseline), signature(&optimized));
+        println!(
+            "{label}: full-hash {} bytes / {} ms; sampled {} bytes / {} ms; groups {}",
+            baseline.bytes_read,
+            baseline.elapsed_ms,
+            optimized.bytes_read,
+            optimized.elapsed_ms,
+            optimized.groups.len()
+        );
+        if label == "same-size-distinct" {
+            assert!(optimized.bytes_read < baseline.bytes_read / 4);
+        }
+    }
+}
+
+#[test]
+#[ignore = "creates and scans 100000 real files; run explicitly"]
+fn scans_100000_real_files_with_one_large_duplicate_group() {
+    let root = tempdir().unwrap();
+    for i in 0..100_000 {
+        write(root.path(), &format!("{i:06}.bin"), b"");
+    }
+    let scan = run_scan(1, root.path(), &AtomicBool::new(false), |_| {}, true).unwrap();
+    assert_eq!(scan.scanned, 100_000);
+    assert_eq!(scan.groups.len(), 1);
+    assert_eq!(scan.groups[0].files.len(), 100_000);
+    println!(
+        "100000 empty files: {} ms, {} content bytes read",
+        scan.elapsed_ms, scan.bytes_read
+    );
 }

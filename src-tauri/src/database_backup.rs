@@ -179,6 +179,7 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
             .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
     }
     if name == "library.sqlite" {
+        library::albums::validate_schema(&c)?;
         for (table, sql) in [
             ("rotations", "SELECT path,rotation FROM rotations LIMIT 0"),
             (

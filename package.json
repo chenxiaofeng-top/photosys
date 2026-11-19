@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "test:albums": "node --experimental-strip-types scripts/albums.test.mjs",
     "test:theme": "node --experimental-strip-types scripts/theme.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",

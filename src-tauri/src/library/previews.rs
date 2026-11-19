@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 
-use super::{Kind, STATE_ERROR, Scan, live};
+use super::{STATE_ERROR, Scan, live};
 use crate::{media_codec, similar::encode_preview};
 
 const MAX_ENTRIES: usize = 128;
@@ -12,13 +12,13 @@ pub(super) const CHANGED: &str = "媒体文件已变化或已移除，请重新�
 type Key = (usize, bool);
 
 #[derive(Default)]
-pub(super) struct Cache {
+pub(crate) struct Cache {
     entries: VecDeque<(Key, String)>,
     bytes: usize,
 }
 
 impl Cache {
-    fn get(&mut self, key: Key) -> Option<String> {
+    pub(crate) fn get(&mut self, key: Key) -> Option<String> {
         let index = self
             .entries
             .iter()
@@ -29,7 +29,7 @@ impl Cache {
         Some(image)
     }
 
-    fn insert(&mut self, key: Key, image: &str) {
+    pub(crate) fn insert(&mut self, key: Key, image: &str) {
         if image.len() > MAX_BYTES {
             return;
         }
@@ -61,15 +61,7 @@ impl Scan {
         if let Some(image) = self.previews.lock().map_err(|_| STATE_ERROR)?.get(key) {
             return Ok(image);
         }
-        let image = if item.is_live_photo {
-            live::cover(&mut file, detail)
-        } else if item.kind == Kind::Video {
-            let edge = if detail { 1600 } else { 240 };
-            media_codec::video_jpeg(&file, &item.file.relative, edge)
-                .map(|bytes| format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)))
-        } else {
-            encode_preview(&mut file, &item.file.relative, item.file.stamp.size, detail)
-        };
+        let image = render_open(&mut file, &item.file, detail);
         self.root
             .verify_read(&file, &item.file)
             .map_err(|_| CHANGED)?;
@@ -82,8 +74,35 @@ impl Scan {
     }
 }
 
+pub(super) fn render_candidate(
+    root: &crate::duplicates::Root,
+    candidate: &crate::duplicates::Candidate,
+    detail: bool,
+) -> Result<String, String> {
+    let mut file = root.open_matching(candidate).map_err(|_| CHANGED)?;
+    let image = render_open(&mut file, candidate, detail);
+    root.verify_read(&file, candidate).map_err(|_| CHANGED)?;
+    image
+}
+
+fn render_open(
+    file: &mut std::fs::File,
+    candidate: &crate::duplicates::Candidate,
+    detail: bool,
+) -> Result<String, String> {
+    match crate::media_date::Media::from_path(&candidate.relative) {
+        Some(crate::media_date::Media::LivePhoto) => live::cover(file, detail),
+        Some(crate::media_date::Media::Video) => {
+            media_codec::video_jpeg(file, &candidate.relative, if detail { 1600 } else { 240 })
+                .map(|bytes| format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)))
+        }
+        _ => encode_preview(file, &candidate.relative, candidate.stamp.size, detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::library::Kind;
     use std::fs::{self, File};
     use std::io::Write;
 

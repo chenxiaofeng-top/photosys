@@ -1,9 +1,10 @@
 pub(crate) mod ai_search;
+pub(crate) mod albums;
 mod favorites;
 mod live;
 pub(crate) mod locations;
 pub(crate) mod people;
-mod platform;
+pub(crate) mod platform;
 mod previews;
 
 use std::collections::{HashMap, HashSet};
@@ -26,6 +27,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::duplicates::{Candidate, FileStamp, Root, display_path, is_link};
 use crate::media_date::{self, Media};
+pub(crate) use previews::Cache as PreviewCache;
 
 const PAGE_SIZE: usize = 24;
 const MAX_THUMBNAIL_CONCURRENCY: usize = 3;
@@ -838,7 +840,7 @@ pub(crate) enum RevealResult {
     OpenedParent,
 }
 
-fn reveal_path(
+pub(crate) fn reveal_path(
     path: &Path,
     reveal: impl FnOnce(&Path) -> Result<(), String>,
     open: impl FnOnce(&Path) -> Result<(), String>,
@@ -870,7 +872,7 @@ pub(crate) async fn reveal_library_item(
     .map_err(|error| format!("无法定位文件。{error}"))?
 }
 
-fn clipboard_path(path: &Path) -> Result<String, String> {
+pub(crate) fn clipboard_path(path: &Path) -> Result<String, String> {
     #[cfg(windows)]
     let path = crate::duplicates::shell_path(path)?;
     path.to_str()
@@ -921,4 +923,13 @@ pub(crate) async fn library_item(scan_id: u64, file_id: usize) -> Result<ItemVie
 pub(crate) fn invalidate() -> Result<(), String> {
     *session()? = None;
     people::close_reader()
+}
+
+// Shared renderer accepts a validated candidate from any session, never a library ID.
+pub(crate) fn preview_candidate(
+    root: &Root,
+    candidate: &Candidate,
+    detail: bool,
+) -> Result<String, String> {
+    previews::render_candidate(root, candidate, detail)
 }

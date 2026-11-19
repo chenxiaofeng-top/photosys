@@ -479,3 +479,39 @@ fn read_only_album_can_be_exported_but_cannot_be_overwritten() {
     assert_eq!(raw_files(&data), original);
     assert!(!data.join(JOURNAL).exists());
 }
+
+#[test]
+fn named_albums_round_trip_and_invalid_album_schema_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = album(&temp.path().join("source"), false);
+    let source_db = source.path.join(".photosys/library.sqlite");
+    let c = Connection::open(&source_db).unwrap();
+    c.execute_batch("CREATE TABLE albums(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL);
+        CREATE TABLE album_members(album_id INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(album_id,path));
+        INSERT INTO albums VALUES(1,'周末露营');INSERT INTO albums VALUES(2,'家庭合影');
+        INSERT INTO album_members VALUES(1,x'612e6a7067');INSERT INTO album_members VALUES(2,x'612e6a7067');").unwrap();
+    drop(c);
+    let zip = temp.path().join("albums.zip");
+    export(&source, &zip, |_| {}).unwrap();
+    let info = inspect_file(&zip);
+    let target = album(&temp.path().join("target"), false);
+    restore(&target, &zip, &info.fingerprint, BACKUP, |_| {}, |_| Ok(())).unwrap();
+    let target_db = target.path.join(".photosys/library.sqlite");
+    assert_eq!(
+        same_sql(&target_db, "SELECT name FROM albums WHERE id=1"),
+        "周末露营"
+    );
+    assert_eq!(
+        same_sql(
+            &target_db,
+            "SELECT CAST(count(*) AS TEXT) FROM album_members"
+        ),
+        "2"
+    );
+    Connection::open(&source_db)
+        .unwrap()
+        .execute_batch("DROP TABLE album_members")
+        .unwrap();
+    assert!(validate_database(&source_db, "library.sqlite").is_err());
+    assert!(export(&source, &temp.path().join("invalid.zip"), |_| {}).is_err());
+}

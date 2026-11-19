@@ -13,22 +13,12 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use archive::{ArchiveProgress, ArchiveSummary};
-use duplicates::{Scan, ScanProgress, ScanResult, TrashResult};
+
 use tauri::WebviewWindow;
 use tauri::ipc::Channel;
 use tauri_plugin_dialog::DialogExt;
 
 static FILE_TASK: Mutex<()> = Mutex::new(());
-static DUPLICATE_SESSION: Mutex<DuplicateSession> = Mutex::new(DuplicateSession {
-    scan_id: 0,
-    current: None,
-});
-
-struct DuplicateSession {
-    scan_id: u64,
-    current: Option<Scan>,
-}
-
 fn file_task() -> Result<MutexGuard<'static, ()>, String> {
     FILE_TASK.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => "已有文件任务正在运行。".into(),
@@ -74,42 +64,6 @@ async fn archive_media(
     })
     .await
     .map_err(|error| format!("归档任务异常结束。{error}"))?
-}
-
-#[tauri::command]
-async fn scan_duplicates(
-    directory: String,
-    progress: Channel<ScanProgress>,
-) -> Result<ScanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _task = file_task()?;
-        let mut session = DUPLICATE_SESSION
-            .lock()
-            .map_err(|_| "查重任务异常结束，请重启应用后重试。")?;
-        session.scan_id += 1;
-        session.current = None;
-        let (scan, result) = duplicates::scan(session.scan_id, Path::new(&directory), |update| {
-            let _ = progress.send(update);
-        })?;
-        session.current = Some(scan);
-        Ok(result)
-    })
-    .await
-    .map_err(|error| format!("查重任务异常结束。{error}"))?
-}
-
-#[tauri::command]
-async fn trash_duplicates(scan_id: u64, file_ids: Vec<usize>) -> Result<TrashResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _task = file_task()?;
-        let mut session = DUPLICATE_SESSION
-            .lock()
-            .map_err(|_| "查重任务异常结束，请重启应用后重试。")?;
-        let scan = session.current.as_mut().ok_or("请先扫描重复文件。")?;
-        scan.recycle(scan_id, file_ids, duplicates::trash)
-    })
-    .await
-    .map_err(|error| format!("清理任务异常结束。{error}"))?
 }
 
 pub fn run() {
@@ -164,6 +118,9 @@ pub fn run() {
             library::scan_startup_library,
             library::scan_library,
             library::library_items,
+            library::albums::albums_list,
+            library::albums::album_items,
+            library::albums::albums_edit,
             library::library_issues,
             library::library_preview,
             library::library_live_video,
@@ -173,8 +130,18 @@ pub fn run() {
             library::reveal_library_item,
             library::copy_library_item_path,
             archive_media,
-            scan_duplicates,
-            trash_duplicates,
+            duplicates::session::scan_duplicates,
+            duplicates::session::cancel_duplicates,
+            duplicates::session::duplicate_groups,
+            duplicates::session::duplicate_members,
+            duplicates::session::duplicate_selection,
+            duplicates::session::duplicate_confirmation,
+            duplicates::session::duplicate_issues,
+            duplicates::session::duplicate_outcomes,
+            duplicates::session::duplicate_preview,
+            duplicates::session::reveal_duplicate,
+            duplicates::session::copy_duplicate_path,
+            duplicates::session::trash_duplicates,
             similar::scan_similar,
             similar::cancel_similar,
             similar::trash_similar,

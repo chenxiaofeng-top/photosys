@@ -3,7 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, ref } from "vue";
 import { ElConfigProvider, ElIcon } from "element-plus";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
-import { Picture, FolderOpened, CopyDocument, Connection, User, Sunny, Moon, Monitor, Menu, Close } from "@element-plus/icons-vue";
+import { Picture, FolderOpened, CopyDocument, Connection, User, Collection, Sunny, Moon, Monitor, Menu, Close } from "@element-plus/icons-vue";
 import "element-plus/es/components/icon/style/css";
 import DuplicatesPanel from "./DuplicatesPanel.vue";
 import MediaLibrary from "./MediaLibrary.vue";
@@ -42,14 +42,14 @@ const result = ref<ArchiveSummary>();
 const progress = ref<ArchiveProgress>();
 const error = ref("");
 const viewTitles = {
-  library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片", people: "人物",
+  library: "媒体库", archive: "照片与视频归档", duplicates: "重复文件", similar: "相似照片", people: "人物", albums: "相册",
 };
-const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection, people: User };
+const viewIcons = { library: Picture, archive: FolderOpened, duplicates: CopyDocument, similar: Connection, people: User, albums: Collection };
 type View = keyof typeof viewTitles;
 const view = ref<View>("library");
 const navigationOpen = ref(false);
 const navigationGroups: { title: string; views: View[] }[] = [
-  { title: "浏览", views: ["library", "people"] },
+  { title: "浏览", views: ["library", "people", "albums"] },
   { title: "整理", views: ["archive", "duplicates", "similar"] },
 ];
 const themeOptions = [
@@ -70,7 +70,7 @@ const fileTaskBusy = computed(() =>
 function navigate(target: View) {
   if (fileTaskBusy.value) return;
   const directory = libraryDirectory.value;
-  if ((view.value === "library" || view.value === "people") && directory) {
+  if (["library", "people", "albums"].includes(view.value) && directory) {
     if (target === "archive" && source.value !== directory) {
       source.value = directory;
       result.value = undefined;
@@ -177,15 +177,15 @@ async function startArchive() {
     </div>
   </aside>
 
-  <main id="workspace" tabindex="-1" :class="{ 'library-layout': view === 'library' || view === 'people' }">
-    <header v-if="view !== 'library' && view !== 'people'">
+  <main id="workspace" tabindex="-1" :class="{ 'library-layout': view === 'library' || view === 'people' || view === 'albums' }">
+    <header v-if="view !== 'library' && view !== 'people' && view !== 'albums'">
       <h1>{{ viewTitles[view] }}</h1>
       <p v-if="view === 'archive'" class="description">复制源目录及其子目录中的媒体，按年份和月份整理到目标目录。</p>
       <p v-else-if="view === 'duplicates'" class="description">找出相同文件，给珍贵回忆留出更多空间。</p>
       <p v-else-if="view === 'similar'" class="description">并排看看相似的瞬间，慢慢选出最喜欢的一张。</p>
     </header>
 
-    <MediaLibrary v-show="view === 'library' || view === 'people'" :people-mode="view === 'people'" @busy-change="libraryBusy = $event"
+    <MediaLibrary v-show="view === 'library' || view === 'people' || view === 'albums'" :active="view === 'library' || view === 'people' || view === 'albums'" :mode="view === 'people' ? 'people' : view === 'albums' ? 'albums' : 'library'" @mode-change="navigate($event)" @busy-change="libraryBusy = $event"
       @directory-change="libraryDirectory = $event" />
 
     <form v-if="view === 'archive'" @submit.prevent="startArchive">

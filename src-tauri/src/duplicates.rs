@@ -1,9 +1,11 @@
 mod platform;
+pub(crate) mod session;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -22,47 +24,69 @@ const READ_BUFFER: usize = 64 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 type Checksum = [u8; 32];
 
-#[derive(Serialize)]
-#[serde(
-    tag = "phase",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub(crate) enum ScanProgress {
-    Scanning {
-        found: usize,
-    },
-    Hashing {
-        checked: usize,
-        total: usize,
-        current_file: String,
-    },
-    Comparing {
-        checked: usize,
-        total: usize,
-    },
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanProgress {
+    phase: &'static str,
+    found: usize,
+    checked: usize,
+    total: usize,
+    bytes_read: u64,
+    current_file: String,
+    elapsed_ms: u64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ScanResult {
-    scan_id: u64,
+struct Reporter<'a> {
+    update: ScanProgress,
+    start: Instant,
+    last: Instant,
+    cancelled: &'a AtomicBool,
+    send: &'a mut dyn FnMut(ScanProgress),
+}
+
+impl Reporter<'_> {
+    fn tick(&mut self, bytes: usize, force: bool) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "扫描已取消。"));
+        }
+        self.update.bytes_read += bytes as u64;
+        if force || self.last.elapsed() >= PROGRESS_INTERVAL {
+            self.last = Instant::now();
+            self.update.elapsed_ms = self.start.elapsed().as_millis() as u64;
+            (self.send)(self.update.clone());
+        }
+        // A callback may request cancellation during this update.
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "扫描已取消。"));
+        }
+        Ok(())
+    }
+
+    fn phase(&mut self, phase: &'static str, total: usize) -> io::Result<()> {
+        self.update.phase = phase;
+        self.update.checked = 0;
+        self.update.total = total;
+        self.update.current_file.clear();
+        self.tick(0, true)
+    }
+}
+
+#[cfg(test)]
+struct ScanResult {
     scanned: usize,
     groups: Vec<GroupView>,
     issues: Vec<ScanIssue>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ScanIssue {
+pub(crate) struct ScanIssue {
     path: String,
     reason: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct GroupView {
-    id: usize,
     size: u64,
     needs_rescan: bool,
     files: Vec<FileView>,
@@ -78,14 +102,14 @@ struct FileView {
     hard_link: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Candidate {
     pub(crate) id: usize,
     pub(crate) relative: PathBuf,
     pub(crate) stamp: FileStamp,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     identity: FileIdentity,
     links: u64,
@@ -161,6 +185,7 @@ impl Candidate {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Root {
     pub(crate) path: PathBuf,
     identity: FileIdentity,
@@ -221,18 +246,48 @@ impl Root {
         Ok(())
     }
 
-    fn checksum(&self, candidate: &Candidate) -> io::Result<Checksum> {
+    fn checksum(
+        &self,
+        candidate: &Candidate,
+        tick: &mut dyn FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<Checksum> {
         let mut file = self.open_matching(candidate)?;
         let mut remaining = candidate.stamp.size;
         let mut buffer = [0; READ_BUFFER];
         let mut hash = Sha256::new();
         while remaining > 0 {
+            tick(0)?;
             let length = remaining.min(READ_BUFFER as u64) as usize;
             file.read_exact(&mut buffer[..length])?;
             hash.update(&buffer[..length]);
+            tick(length)?;
             remaining -= length as u64;
         }
         check_eof(&mut file)?;
+        self.verify_read(&file, candidate)?;
+        Ok(hash.finalize().into())
+    }
+
+    fn sample(
+        &self,
+        candidate: &Candidate,
+        tick: &mut dyn FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<Checksum> {
+        let mut file = self.open_matching(candidate)?;
+        let mut buffer = [0; READ_BUFFER];
+        let mut hash = Sha256::new();
+        let size = candidate.stamp.size;
+        for offset in [
+            0,
+            (size - READ_BUFFER as u64) / 2,
+            size - READ_BUFFER as u64,
+        ] {
+            tick(0)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buffer)?;
+            hash.update(buffer);
+            tick(READ_BUFFER)?;
+        }
         self.verify_read(&file, candidate)?;
         Ok(hash.finalize().into())
     }
@@ -243,6 +298,16 @@ impl Root {
         right: &Candidate,
         expected: Option<&Checksum>,
     ) -> Result<bool, CompareError> {
+        self.compare_with(left, right, expected, &mut |_| Ok(()))
+    }
+
+    fn compare_with(
+        &self,
+        left: &Candidate,
+        right: &Candidate,
+        expected: Option<&Checksum>,
+        tick: &mut dyn FnMut(usize) -> io::Result<()>,
+    ) -> Result<bool, CompareError> {
         let mut left_file = self.open_matching(left).map_err(CompareError::Left)?;
         let mut right_file = self.open_matching(right).map_err(CompareError::Right)?;
         let mut left_buffer = [0; READ_BUFFER];
@@ -251,6 +316,7 @@ impl Root {
         let mut equal = true;
         let mut hash = expected.map(|_| Sha256::new());
         while remaining > 0 {
+            tick(0).map_err(CompareError::Right)?;
             let length = remaining.min(READ_BUFFER as u64) as usize;
             let left_bytes = &mut left_buffer[..length];
             let right_bytes = &mut right_buffer[..length];
@@ -260,6 +326,7 @@ impl Root {
             right_file
                 .read_exact(right_bytes)
                 .map_err(CompareError::Right)?;
+            tick(length * 2).map_err(CompareError::Right)?;
             if let Some(hash) = &mut hash {
                 hash.update(&*left_bytes);
             }
@@ -334,14 +401,18 @@ pub(crate) struct Scan {
     id: u64,
     root: Root,
     groups: Vec<Group>,
+    issues: Vec<ScanIssue>,
+    scanned: usize,
+    bytes_read: u64,
+    elapsed_ms: u64,
 }
 
+#[cfg(test)]
 impl Scan {
     fn group_views(&self) -> Vec<GroupView> {
         self.groups
             .iter()
             .map(|group| GroupView {
-                id: group.id,
                 size: group.files[0].stamp.size,
                 needs_rescan: group.needs_rescan,
                 files: group.files.iter().map(Candidate::view).collect(),
@@ -357,32 +428,56 @@ fn issue(issues: &mut Vec<ScanIssue>, path: String, error: impl std::fmt::Displa
     });
 }
 
-pub(crate) fn scan(
+#[cfg(test)]
+fn scan(
     id: u64,
     path: &Path,
-    mut progress: impl FnMut(ScanProgress),
+    progress: impl FnMut(ScanProgress),
 ) -> Result<(Scan, ScanResult), String> {
+    let scan = run_scan(id, path, &AtomicBool::new(false), progress, true)?;
+    let result = ScanResult {
+        scanned: scan.scanned,
+        groups: scan.group_views(),
+        issues: scan.issues.clone(),
+    };
+    Ok((scan, result))
+}
+
+fn run_scan(
+    id: u64,
+    path: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(ScanProgress),
+    sampling: bool,
+) -> Result<Scan, String> {
     let root =
         Root::new(path).map_err(|error| format!("无法访问扫描目录 {}。{error}", path.display()))?;
     let mut by_size = BTreeMap::<u64, Vec<Candidate>>::new();
     let mut issues = Vec::new();
     let mut found = 0;
-    let mut last_update = Instant::now();
-    let mut due = |force| {
-        if force || last_update.elapsed() >= PROGRESS_INTERVAL {
-            last_update = Instant::now();
-            true
-        } else {
-            false
-        }
+    let mut reporter = Reporter {
+        update: ScanProgress {
+            phase: "scanning",
+            found: 0,
+            checked: 0,
+            total: 0,
+            bytes_read: 0,
+            current_file: String::new(),
+            elapsed_ms: 0,
+        },
+        start: Instant::now(),
+        last: Instant::now(),
+        cancelled,
+        send: &mut progress,
     };
-
-    progress(ScanProgress::Scanning { found });
+    let report_error = |error: io::Error| error.to_string();
+    reporter.phase("scanning", 0).map_err(report_error)?;
     let mut entries = WalkDir::new(&root.path)
         .follow_links(false)
         .min_depth(1)
         .into_iter();
     while let Some(entry) = entries.next() {
+        reporter.tick(0, false).map_err(report_error)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -434,94 +529,141 @@ pub(crate) fn scan(
                 Err(error) => issue(&mut issues, display_path(relative), error),
             }
         }
-        if due(false) {
-            progress(ScanProgress::Scanning { found });
-        }
+        reporter.update.found = found;
     }
-    progress(ScanProgress::Scanning { found });
+    reporter.update.found = found;
+    reporter.tick(0, true).map_err(report_error)?;
 
-    let total = by_size.values().map(Vec::len).sum();
-    let mut checked = 0;
-    let mut buckets = BTreeMap::<(u64, Checksum), Vec<Candidate>>::new();
+    let total = by_size
+        .values()
+        .filter(|files| files.len() > 1)
+        .map(Vec::len)
+        .sum();
+    reporter.phase("sampling", total).map_err(report_error)?;
+    let mut sampled = Vec::new();
     for (size, files) in by_size {
-        let needs_hash = files.len() > 1;
+        if files.len() < 2 {
+            continue;
+        }
+        if !sampling || size <= (READ_BUFFER * 3) as u64 {
+            reporter.update.checked += files.len();
+            sampled.push((size, files));
+            reporter.tick(0, false).map_err(report_error)?;
+            continue;
+        }
+        let mut samples = BTreeMap::<Checksum, Vec<Candidate>>::new();
         for file in files {
-            if due(checked == 0) {
-                progress(ScanProgress::Hashing {
-                    checked,
-                    total,
-                    current_file: file.path_label(),
-                });
+            reporter.update.current_file = file.path_label();
+            reporter.tick(0, false).map_err(report_error)?;
+            match root.sample(&file, &mut |bytes| reporter.tick(bytes, false)) {
+                Ok(hash) => samples.entry(hash).or_default().push(file),
+                Err(error) => issue(&mut issues, file.path_label(), error),
             }
-            if needs_hash {
-                match root.checksum(&file) {
-                    Ok(hash) => buckets.entry((size, hash)).or_default().push(file),
-                    Err(error) => issue(&mut issues, file.path_label(), error),
-                }
-            } else if let Err(error) = root.open_matching(&file) {
-                issue(&mut issues, file.path_label(), error);
+            reporter.update.checked += 1;
+            reporter.tick(0, false).map_err(report_error)?;
+        }
+        sampled.extend(
+            samples
+                .into_values()
+                .filter(|files| files.len() > 1)
+                .map(|files| (size, files)),
+        );
+    }
+    reporter.tick(0, true).map_err(report_error)?;
+    reporter
+        .phase(
+            "hashing",
+            sampled.iter().map(|(_, files)| files.len()).sum(),
+        )
+        .map_err(report_error)?;
+    let mut buckets = BTreeMap::<(u64, Checksum), Vec<Candidate>>::new();
+    for (size, files) in sampled {
+        for file in files {
+            reporter.update.current_file = file.path_label();
+            reporter
+                .tick(0, reporter.update.checked == 0)
+                .map_err(report_error)?;
+            match root.checksum(&file, &mut |bytes| reporter.tick(bytes, false)) {
+                Ok(hash) => buckets.entry((size, hash)).or_default().push(file),
+                Err(error) => issue(&mut issues, file.path_label(), error),
             }
-            checked += 1;
+            reporter.update.checked += 1;
+            reporter.tick(0, false).map_err(report_error)?;
         }
     }
-
-    let total = buckets.values().map(Vec::len).sum();
-    let mut checked = 0;
-    progress(ScanProgress::Comparing { checked, total });
+    reporter.tick(0, true).map_err(report_error)?;
+    reporter
+        .phase(
+            "comparing",
+            buckets
+                .values()
+                .filter(|files| files.len() > 1)
+                .map(Vec::len)
+                .sum(),
+        )
+        .map_err(report_error)?;
     let mut groups = Vec::new();
     for ((_, checksum), files) in buckets {
+        if files.len() < 2 {
+            continue;
+        }
         let mut partitions = Vec::<Vec<Candidate>>::new();
         for file in files {
-            if let Err((file, error)) = insert_by_content(&root, &mut partitions, file, &mut issues)
+            reporter.update.current_file = file.path_label();
+            reporter.tick(0, false).map_err(report_error)?;
+            if let Err((file, error)) =
+                insert_by_content(&root, &mut partitions, file, &mut issues, &mut |bytes| {
+                    reporter.tick(bytes, false)
+                })
             {
                 issue(&mut issues, file.path_label(), error);
             }
-            checked += 1;
-            if due(false) {
-                progress(ScanProgress::Comparing { checked, total });
-            }
+            reporter.update.checked += 1;
+            reporter.tick(0, false).map_err(report_error)?;
         }
         for mut files in partitions {
-            files.retain(|file| match root.open_matching(file) {
-                Ok(_) => true,
-                Err(error) => {
-                    issue(&mut issues, file.path_label(), error);
-                    false
+            let mut verified = Vec::new();
+            for file in files.drain(..) {
+                reporter.tick(0, false).map_err(report_error)?;
+                match root.open_matching(&file) {
+                    Ok(_) => verified.push(file),
+                    Err(error) => issue(&mut issues, file.path_label(), error),
                 }
-            });
-            if files.len() > 1 {
-                files.sort_by(|left, right| {
-                    left.relative
+            }
+            if verified.len() > 1 {
+                verified.sort_by(|a, b| {
+                    a.relative
                         .components()
                         .count()
-                        .cmp(&right.relative.components().count())
-                        .then_with(|| left.relative.cmp(&right.relative))
+                        .cmp(&b.relative.components().count())
+                        .then_with(|| a.relative.cmp(&b.relative))
                 });
                 groups.push(Group {
-                    id: files[0].id,
-                    files,
+                    id: verified[0].id,
+                    files: verified,
                     checksum,
                     needs_rescan: false,
                 });
             }
         }
     }
-    groups.sort_by(|left, right| {
-        right.files[0]
+    reporter.tick(0, true).map_err(report_error)?;
+    groups.sort_by(|a, b| {
+        b.files[0]
             .stamp
             .size
-            .cmp(&left.files[0].stamp.size)
-            .then_with(|| left.files[0].relative.cmp(&right.files[0].relative))
+            .cmp(&a.files[0].stamp.size)
+            .then_with(|| a.files[0].relative.cmp(&b.files[0].relative))
     });
-
-    let scan = Scan { id, root, groups };
-    let result = ScanResult {
-        scan_id: id,
-        scanned: found,
-        groups: scan.group_views(),
+    Ok(Scan {
+        id,
+        root,
+        groups,
         issues,
-    };
-    Ok((scan, result))
+        scanned: found,
+        bytes_read: reporter.update.bytes_read,
+        elapsed_ms: reporter.start.elapsed().as_millis() as u64,
+    })
 }
 
 fn insert_by_content(
@@ -529,10 +671,11 @@ fn insert_by_content(
     partitions: &mut Vec<Vec<Candidate>>,
     file: Candidate,
     issues: &mut Vec<ScanIssue>,
+    tick: &mut dyn FnMut(usize) -> io::Result<()>,
 ) -> Result<(), (Candidate, io::Error)> {
     for matches in partitions.iter_mut() {
         while let Some(representative) = matches.last() {
-            match root.compare(representative, &file, None) {
+            match root.compare_with(representative, &file, None, tick) {
                 Ok(true) => {
                     matches.push(file);
                     return Ok(());
@@ -554,7 +697,7 @@ fn insert_by_content(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum TrashStatus {
     Moved,
@@ -562,18 +705,17 @@ enum TrashStatus {
     Failed,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TrashOutcome {
+pub(crate) struct TrashOutcome {
     id: usize,
     relative_path: String,
     status: TrashStatus,
     reason: Option<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct TrashResult {
+    #[cfg(test)]
     groups: Vec<GroupView>,
     outcomes: Vec<TrashOutcome>,
 }
@@ -664,6 +806,7 @@ impl Scan {
         }
         self.groups.retain(|group| group.files.len() > 1);
         Ok(TrashResult {
+            #[cfg(test)]
             groups: self.group_views(),
             outcomes,
         })

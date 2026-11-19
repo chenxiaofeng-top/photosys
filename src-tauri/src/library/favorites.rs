@@ -23,7 +23,7 @@ pub(super) fn data_directory(root: &Root) -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn database(directory: &Path) -> Result<Option<PathBuf>, String> {
+pub(super) fn database(directory: &Path) -> Result<Option<PathBuf>, String> {
     let path = directory.join("library.sqlite");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !is_link(&metadata) => Ok(Some(path)),

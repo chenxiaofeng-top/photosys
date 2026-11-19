@@ -61,7 +61,7 @@ pub(super) fn open_default(path: &Path) -> Result<(), String> {
 // The opener plugin can silently fall back to opening a directory on Linux and
 // Windows. Use the strict reveal APIs there so the UI can report that fallback.
 #[cfg(target_os = "linux")]
-pub(super) fn reveal(path: &Path) -> Result<(), String> {
+pub(crate) fn reveal(path: &Path) -> Result<(), String> {
     use gio::glib::variant::ToVariant;
     use gio::prelude::FileExt;
 
@@ -85,12 +85,12 @@ pub(super) fn reveal(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn reveal(path: &Path) -> Result<(), String> {
+pub(crate) fn reveal(path: &Path) -> Result<(), String> {
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
-pub(super) fn reveal(path: &Path) -> Result<(), String> {
+pub(crate) fn reveal(path: &Path) -> Result<(), String> {
     use windows::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };

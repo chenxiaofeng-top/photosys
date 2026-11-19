@@ -15,37 +15,20 @@ import AiSearchSettings from "./AiSearchSettings.vue";
 import DatabaseBackup from "./DatabaseBackup.vue";
 import type { DatabaseRestoreResult, LibrarySummary } from "./databaseBackup";
 import PeoplePanel from "./PeoplePanel.vue";
+import AlbumsPanel from "./AlbumsPanel.vue";
+import AlbumPicker from "./AlbumPicker.vue";
+import type { Album, AlbumEditResult } from "./albums";
+import type { Item, Page, Kind, Sort, LibraryMode } from "./libraryTypes";
+import { useAlbumSelection } from "./albumSelection";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
 const LocationMap = defineAsyncComponent(() => import("./LocationMap.vue"));
-import { shortLocation, type Location, type Coordinates, type LocationMode, type Selection } from "./locations";
+import { shortLocation, type Coordinates, type LocationMode, type Selection } from "./locations";
 import type { Person, PeopleStatus, Month } from "./people";
 import type { IndexStatus } from "./aiSearch";
 import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
-type Kind = "photo" | "video";
-type Sort = "dateDesc" | "dateAsc" | "nameAsc" | "nameDesc" | "sizeDesc" | "sizeAsc";
 type FileAction = "open" | "reveal" | "copy";
-
-interface Item {
-  id: number;
-  name: string;
-  relativePath: string;
-  size: number;
-  kind: Kind;
-  capturedOn: string | null;
-  location: Location | null;
-  previewAvailable: boolean;
-  isLivePhoto: boolean;
-  favorite: boolean;
-  rotation: Rotation;
-}
-
-interface Page<T> {
-  page: number;
-  total: number;
-  items: T[];
-}
 
 interface Issue {
   path: string;
@@ -59,8 +42,10 @@ interface OpenedLibrary {
   summary: Summary;
 }
 
-const props = defineProps<{ peopleMode?: boolean }>();
-const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string] }>();
+const props = withDefaults(defineProps<{ mode?: LibraryMode; active?: boolean }>(), { mode: "library", active: true });
+const peopleMode = computed(() => props.mode === "people");
+const albumsMode = computed(() => props.mode === "albums");
+const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string]; modeChange: [mode: LibraryMode] }>();
 const pageSize = 24;
 const directory = ref("");
 const task = ref<"starting" | "choosing" | "scanning" | "saving" | "database" | undefined>("starting");
@@ -124,17 +109,6 @@ function selectMonth(month: string | null) {
 }
 function monthTitle(date: string | null) { return date ? `${date.slice(0, 4)} 年 ${Number(date.slice(5, 7))} 月` : "日期未知"; }
 let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateMode: typeof dateMode.value; from: string; to: string; favoritesOnly: boolean; input: string; query: string } | undefined;
-watch(() => props.peopleMode, (people) => {
-  if (people) {
-    peopleVisited.value = true;
-    libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateMode: dateMode.value, from: from.value, to: to.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
-    searchMode.value = "filename"; clearSearch(); kind.value = "photo"; dateMode.value = "all"; favoritesOnly.value = false; sort.value = "dateAsc";
-  } else if (libraryPreferences) {
-    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateMode.value = p.dateMode; from.value = p.from; to.value = p.to; favoritesOnly.value = p.favoritesOnly;
-    nextTick(() => { searchInput.value = p.input; query.value = p.query; });
-    libraryPreferences = undefined;
-  }
-}, { immediate: true });
 const composing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 const searchPending = computed(() => searchMode.value === "filename" && (composing.value || searchInput.value.trim() !== query.value));
@@ -178,12 +152,35 @@ const filter = computed(() => ({
   to: dateMode.value === "range" ? to.value || null : null,
   unknownDate: dateMode.value === "unknown",
   favoritesOnly: favoritesOnly.value,
-  locationMode: locationMode.value,
-  locationSelection: locationSelection.value,
+  locationMode: albumsMode.value ? "all" as const : locationMode.value,
+  locationSelection: albumsMode.value ? null : locationSelection.value,
 }));
 
+const selectedAlbum = shallowRef<Album>();
+const albumsRevision = ref(0);
+const albumsWritable = ref(false);
+const targetAlbum = shallowRef<Album>();
+const addedAlbum = shallowRef<Album>();
+const albumError = ref("");
+const albumPicker = ref<InstanceType<typeof AlbumPicker>>();
+const { selected: selectedFiles, selecting, clear: clearSelection, toggle: toggleSelection, selectPage, stop: stopSelection } = useAlbumSelection([
+  summary, filter, sort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
+]);
 const requestedPage = ref(0);
 const revision = ref(0);
+watch(() => props.mode, (mode, oldMode) => {
+  const people = mode === "people";
+  if (mode !== "library") {
+    if (people) peopleVisited.value = true;
+    if (oldMode === "library" || oldMode === undefined) libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateMode: dateMode.value, from: from.value, to: to.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
+    searchMode.value = "filename"; clearSearch(); kind.value = people ? "photo" : "all"; dateMode.value = "all"; favoritesOnly.value = false; sort.value = people ? "dateAsc" : "dateDesc";
+  } else if (libraryPreferences) {
+    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateMode.value = p.dateMode; from.value = p.from; to.value = p.to; favoritesOnly.value = p.favoritesOnly;
+    nextTick(() => { searchInput.value = p.input; query.value = p.query; });
+    libraryPreferences = undefined;
+  }
+}, { immediate: true });
+
 const results = shallowRef<Page<Item>>();
 // A page request may have started before a rotation was saved (for example when
 // closing a detail on another page). Keep its eventual response up to date.
@@ -198,7 +195,11 @@ function withSavedRotations(page: Page<Item>): Page<Item> {
 }
 const itemsLoading = ref(false);
 async function fetchPage(scanId: number, currentFilter: typeof filter.value, currentSort: Sort, page: number): Promise<Page<Item>> {
-  if (props.peopleMode) {
+  if (albumsMode.value) {
+    if (!selectedAlbum.value) return { page: 0, total: 0, items: [] };
+    return invoke<Page<Item>>("album_items", { scanId, albumId: selectedAlbum.value.id, filter: currentFilter, sort: currentSort, page });
+  }
+  if (peopleMode.value) {
     if (!selectedPerson.value) return { page: 0, total: 0, items: [] };
     return invoke<Page<Item>>("people_photos", { scanId, personId: selectedPerson.value.id, filter: currentFilter, sort: currentSort, page });
   }
@@ -209,7 +210,7 @@ async function fetchPage(scanId: number, currentFilter: typeof filter.value, cur
   return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
 }
 watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, () => props.peopleMode, selectedPerson], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
   let receiving = true;
   onCleanup(() => { receiving = false; });
@@ -231,11 +232,11 @@ watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, (
   }
 });
 
-watch([summary, selectedPerson, favoritesOnly, locationMode, locationSelection, sort, peopleRevision, () => props.peopleMode], async (_, __, cleanup) => {
+watch([summary, selectedPerson, favoritesOnly, locationMode, locationSelection, sort, peopleRevision, () => peopleMode.value], async (_, __, cleanup) => {
   let current = true; cleanup(() => { current = false; });
   const scanId = summary.value?.scanId; const personId = selectedPerson.value?.id;
   months.value = []; timelineError.value = "";
-  if (!props.peopleMode || scanId === undefined || personId === undefined) return;
+  if (!peopleMode.value || scanId === undefined || personId === undefined) return;
   try {
     const value = await invoke<Month[]>("people_months", { scanId, personId, filter: { query: "", kind: "photo", from: null, to: null, unknownDate: false, favoritesOnly: favoritesOnly.value, locationMode: locationMode.value, locationSelection: locationSelection.value }, sort: sort.value });
     if (current) months.value = value;
@@ -313,6 +314,41 @@ async function rotateDetail(delta: -90 | 90) {
   }
 }
 
+function selectAlbum(album: Album | undefined) {
+  selectedAlbum.value = album;
+  requestedPage.value = 0; clearSearch(); kind.value = "all"; dateMode.value = "all";
+  favoritesOnly.value = false; sort.value = "dateDesc"; stopSelection();
+}
+function addToAlbum(album: Album) {
+  targetAlbum.value = album; addedAlbum.value = undefined;
+  emit("modeChange", "library");
+  nextTick(() => { selecting.value = true; });
+}
+function albumAdded(album: Album) {
+  addedAlbum.value = album; targetAlbum.value = undefined;
+  clearSelection(); albumsRevision.value++;
+}
+function returnToAlbum(album: Album) {
+  selectAlbum(album); addedAlbum.value = undefined; targetAlbum.value = undefined;
+  emit("modeChange", "albums");
+}
+function albumBusy(value: boolean) { task.value = value ? "saving" : undefined; }
+async function removeFromAlbum() {
+  const scanId = summary.value?.scanId; const album = selectedAlbum.value;
+  if (scanId === undefined || !album || !selectedFiles.value.size || busy.value || !albumsWritable.value) return;
+  task.value = "saving"; albumError.value = "";
+  try {
+    await invoke<AlbumEditResult>("albums_edit", { scanId, edit: { kind: "remove", albumId: album.id, fileIds: [...selectedFiles.value] } });
+    if (summary.value?.scanId !== scanId) return;
+    clearSelection(); albumsRevision.value++;
+  } catch (cause) { if (summary.value?.scanId === scanId) albumError.value = String(cause); }
+  finally { task.value = undefined; }
+}
+watch(() => props.mode, () => { stopSelection(); albumError.value = ""; });
+watch(() => props.active, active => {
+  if (!active) { stopSelection(); albumPicker.value?.close(); targetAlbum.value = undefined; addedAlbum.value = undefined; }
+});
+
 onMounted(async () => {
   try {
     const initial = await invoke<OpenedLibrary | null>("scan_startup_library", { progress: scanProgress() });
@@ -348,6 +384,7 @@ function showScan(selected: string, scanned: Summary) {
   setLibraryThumbnailConcurrency(scanned.thumbnailConcurrency);
   if (selected !== directory.value) {
     selectedPerson.value = undefined;
+    selectedAlbum.value = undefined;
     peopleStatus.value = undefined;
     libraryPreferences = undefined;
     kind.value = "all";
@@ -368,11 +405,15 @@ function showScan(selected: string, scanned: Summary) {
   issuePage.value = 0;
   requestedPage.value = 0;
   summary.value = scanned;
+  targetAlbum.value = undefined; addedAlbum.value = undefined; albumError.value = "";
+  albumsWritable.value = false; albumsRevision.value++;
   peopleRevision.value++;
 }
 
 async function scanDirectory(selected: string, mode: "select" | "refresh") {
   if (mode === "refresh" && busy.value) return;
+  stopSelection();
+  albumPicker.value?.close();
   task.value = "scanning";
   scanError.value = "";
   favoriteError.value = "";
@@ -390,6 +431,9 @@ async function scanDirectory(selected: string, mode: "select" | "refresh") {
 
 function prepareDatabaseRestore() {
   closeDetails();
+  albumPicker.value?.close();
+  selectedAlbum.value = undefined; targetAlbum.value = undefined; addedAlbum.value = undefined; stopSelection();
+  albumsWritable.value = false;
   pendingFocus = undefined;
   selectedPerson.value = undefined;
   peopleStatus.value = undefined;
@@ -438,7 +482,7 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-watch([summary, filter, sort, revision, searchMode, selectedPerson, () => props.peopleMode], () => {
+watch([summary, filter, sort, revision, searchMode, selectedPerson, () => props.mode, selectedAlbum], () => {
   pendingFocus = undefined;
   dialog.value?.close();
   resetDetail();
@@ -678,7 +722,7 @@ async function performFileAction(action: FileAction) {
   <div class="media-library">
     <header class="library-header">
       <div class="library-heading">
-        <h1>{{ peopleMode ? "人物与家庭时间线" : "媒体库" }}</h1>
+        <h1>{{ peopleMode ? "人物与家庭时间线" : albumsMode ? "相册" : "媒体库" }}</h1>
         <p>把每一段回忆，好好珍藏。</p>
       </div>
       <div class="directory-toolbar">
@@ -694,7 +738,7 @@ async function performFileAction(action: FileAction) {
       </div>
     </header>
 
-    <AiSearchSettings v-show="!peopleMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
+    <AiSearchSettings v-show="!peopleMode && !albumsMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
       @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" @model-changed="results = undefined; requestedPage = 0; aiRevision++" />
 
     <div v-if="task === 'starting' || task === 'scanning'" class="scan-status" role="status">
@@ -718,7 +762,27 @@ async function performFileAction(action: FileAction) {
     <PeoplePanel v-if="summary && peopleVisited" v-show="peopleMode" :scan-id="summary.scanId" :library-busy="busy"
       :selected="selectedPerson" :revision="peopleRevision" @select="selectPerson" @changed="personChanged" @preview="showPersonPhoto" @status="peopleStatus = $event" />
 
-    <template v-if="summary && (!peopleMode || selectedPerson)">
+    <AlbumsPanel v-if="summary && albumsMode" :scan-id="summary.scanId" :library-busy="busy" :revision="albumsRevision"
+      :selected="selectedAlbum" @select="selectAlbum" @changed="albumsRevision++" @add="addToAlbum" @writable="albumsWritable = $event" @busy-change="albumBusy" />
+    <AlbumPicker v-if="summary" ref="albumPicker" :scan-id="summary.scanId" :file-ids="[...selectedFiles]" :library-busy="busy"
+      :revision="albumsRevision" @added="albumAdded" @busy-change="albumBusy" />
+
+    <template v-if="summary && (peopleMode ? selectedPerson : albumsMode ? selectedAlbum : true)">
+      <div v-if="!peopleMode" class="album-selection-tools" role="group" aria-label="批量归类">
+        <p v-if="targetAlbum && !albumsMode" role="status">正在为“{{ targetAlbum.name }}”选择照片和视频。 <button type="button" class="secondary" :disabled="busy" @click="targetAlbum = undefined">取消目标</button></p>
+        <p v-if="addedAlbum" role="status">已加入“{{ addedAlbum.name }}”。 <button type="button" class="secondary" :disabled="busy" @click="returnToAlbum(addedAlbum!)">返回该相册</button></p>
+        <div class="selection-actions">
+          <button type="button" class="secondary" :aria-pressed="selecting" :disabled="busy" @click="selecting ? stopSelection() : selecting = true">{{ selecting ? '退出批量选择' : '批量选择' }}</button>
+          <template v-if="selecting">
+            <span role="status">已选 {{ selectedFiles.size }} 项</span>
+            <button type="button" class="secondary" :disabled="busy || itemsLoading || searchPending || !results?.items.length" @click="selectPage(results?.items.map(item => item.id) ?? [])">全选当前页</button>
+            <button type="button" class="secondary" :disabled="busy || !selectedFiles.size" @click="clearSelection">清空</button>
+            <button type="button" :disabled="busy || itemsLoading || searchPending || !selectedFiles.size" @click="albumPicker?.open(targetAlbum)">加入相册</button>
+            <button v-if="albumsMode" type="button" class="secondary" :disabled="busy || !albumsWritable || !selectedFiles.size" @click="removeFromAlbum">从此相册移出</button>
+          </template>
+        </div>
+        <p v-if="albumError" class="error" role="alert">{{ albumError }}</p>
+      </div>
       <p v-if="peopleMode" class="timeline-intro">按拍摄日期浏览成长记录，未知日期单独列出。</p>
       <nav v-if="peopleMode && months?.length" class="timeline-months" aria-label="成长时间线年月导航">
         <button type="button" class="secondary" :aria-pressed="dateMode === 'all'" @click="dateMode = 'all'">全部日期</button>
@@ -728,7 +792,7 @@ async function performFileAction(action: FileAction) {
       <p v-if="timelineError" class="error" role="alert">{{ timelineError }}</p>
       <div class="library-tools" :class="{ 'people-tools': peopleMode }" role="search" aria-label="媒体搜索与筛选">
         <div v-if="!peopleMode" class="search-row">
-          <ElSelect v-model="searchMode" class="mode-select" aria-label="搜索方式">
+          <ElSelect v-if="!albumsMode" v-model="searchMode" class="mode-select" aria-label="搜索方式">
             <ElOption label="文件名" value="filename" />
             <ElOption label="照片内容" value="content" />
           </ElSelect>
@@ -757,13 +821,13 @@ async function performFileAction(action: FileAction) {
             <label>起始日期<input v-model="from" type="date" /></label>
             <label>结束日期<input v-model="to" type="date" /></label>
           </div>
-          <div class="filter-field">
+          <div v-if="!albumsMode" class="filter-field">
             <span>拍摄位置</span>
             <ElSelect v-model="locationMode" class="location-select" aria-label="拍摄位置">
               <ElOption label="全部位置" value="all" /><ElOption label="有位置" value="known" /><ElOption label="位置未知" value="unknown" />
             </ElSelect>
           </div>
-          <span v-if="locationLabel" class="location-selection">{{ locationLabel }} <button type="button" class="secondary" @click="locationSelection = null">清除</button></span>
+          <span v-if="!albumsMode && locationLabel" class="location-selection">{{ locationLabel }} <button type="button" class="secondary" @click="locationSelection = null">清除</button></span>
           <ElCheckbox v-model="favoritesOnly" class="favorite-filter">仅收藏</ElCheckbox>
           <div v-if="searchMode === 'filename'" class="filter-field sort-field">
             <span id="sort-label">排序</span>
@@ -777,7 +841,7 @@ async function performFileAction(action: FileAction) {
         </div>
       </div>
 
-      <LocationMap :scan-id="summary.scanId" :filter="filter" :person-id="peopleMode ? selectedPerson?.id ?? null : null"
+      <LocationMap v-if="!albumsMode" :scan-id="summary.scanId" :filter="filter" :person-id="peopleMode ? selectedPerson?.id ?? null : null"
         :content-query="!peopleMode && searchMode === 'content' ? query : null" :revision="revision + peopleRevision + aiRevision" :focus="mapFocus" @select="selectLocation" />
 
       <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
@@ -797,6 +861,7 @@ async function performFileAction(action: FileAction) {
         <template v-if="itemsLoading">正在加载媒体…</template>
         <template v-else-if="results?.total">
           <template v-if="peopleMode">共 {{ results.total }} 张人物照片</template>
+          <template v-else-if="albumsMode">共 {{ results.total }} 个媒体文件</template>
           <template v-else>{{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}</template>
         </template>
       </p>
@@ -804,6 +869,12 @@ async function performFileAction(action: FileAction) {
         <ElIcon class="empty-icon is-loading" aria-hidden="true"><Loading /></ElIcon>
         <h2>正在加载媒体…</h2>
         <p>精彩回忆，即将呈现。</p>
+      </div>
+      <div v-else-if="!itemsLoading && !itemsError && results?.total === 0 && albumsMode" class="library-empty" role="status">
+        <h2>{{ query || kind !== 'all' || dateMode !== 'all' || favoritesOnly ? '没有找到匹配的照片或视频' : '这个相册还没有照片或视频' }}</h2>
+        <p>到媒体库勾选同一次出游或情景里的照片和视频，加入这个相册。</p>
+        <button type="button" :disabled="busy || !albumsWritable" @click="selectedAlbum && addToAlbum(selectedAlbum)">去媒体库添加</button>
+        <button v-if="query || kind !== 'all' || dateMode !== 'all' || favoritesOnly" type="button" class="secondary" @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false">清除搜索与筛选</button>
       </div>
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0" class="library-empty" role="status">
         <ElIcon class="empty-icon" aria-hidden="true"><component :is="searchMode === 'content' && !query ? Search : Picture" /></ElIcon>
@@ -817,7 +888,8 @@ async function performFileAction(action: FileAction) {
       <ul v-if="results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
         <template v-for="(item, index) in results.items" :key="`${summary.scanId}:${item.id}`">
         <li v-if="peopleMode && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">{{ monthTitle(item.capturedOn) }}</li>
-        <li class="card">
+        <li class="card" :class="{ 'card-selected': selecting && selectedFiles.has(item.id) }">
+          <label v-if="selecting && !peopleMode" class="media-select"><input type="checkbox" :checked="selectedFiles.has(item.id)" :disabled="busy || itemsLoading || searchPending" :aria-label="`选择 ${item.name}`" @change="toggleSelection(item.id)" />选择</label>
           <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
             :aria-label="`查看 ${item.name}`" @click="showDetails(item, $event)">
             <LibraryThumbnail v-if="item.previewAvailable" :scan-id="summary.scanId"
@@ -903,7 +975,7 @@ async function performFileAction(action: FileAction) {
             <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
             <template v-if="detail.location">
               <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
-              <button type="button" class="secondary" @click="locateDetail">在地图中查看</button>
+              <button v-if="!albumsMode" type="button" class="secondary" @click="locateDetail">在地图中查看</button>
             </template>
           </div>
           <p class="detail-path">{{ detail.relativePath }}</p>
@@ -929,6 +1001,11 @@ async function performFileAction(action: FileAction) {
 </template>
 
 <style scoped>
+.album-selection-tools { margin-block: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.selection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.media-select { display: flex; align-items: center; gap: 6px; padding: 8px 2px; }
+.card-selected { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px; }
+
 .media-library { color: var(--text); --library-preview: var(--preview); }
 .library-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
 .library-heading { flex: 1 0 160px; }
