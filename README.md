@@ -158,20 +158,36 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ## 运行和打包
 
-首次构建、开发或运行 Rust 测试前，在项目根目录执行 `bash scripts/build-media-codec.sh`，生成随包提供的 FFmpeg。脚本会校验固定版本的源码并复用构建产物。macOS 先安装 `brew install pkgconf nasm`。Windows 在 MSYS2 的 UCRT64 终端安装下列工具，并在该终端运行脚本。
+首次启动前需要准备 FFmpeg、ONNX Runtime 和 PMTiles。准备脚本会校验下载内容并复用构建或下载缓存。
+
+**Windows x64** 安装 [MSYS2](https://www.msys2.org/) 和 Python 3.11 或更新版本。打开 **MSYS2 UCRT64** 终端，进入项目根目录，执行以下命令生成项目专用的 FFmpeg。
 
 ```sh
 pacman -S --needed curl diffutils make perl mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+bash scripts/build-media-codec.sh
 ```
 
-准备好 FFmpeg 后，安装 Python 3.11 或更新版本，并执行 `python3 scripts/prepare-ai-runtime.py`，下载固定版本、校验 SHA-256 的官方 ONNX Runtime CPU 库与许可文件。Python 只供开发和构建使用，最终用户无需安装。在项目根目录执行以下命令。`tauri dev` 启动 Vite 和桌面窗口，关闭开发进程后可以执行打包。
+回到 **PowerShell**，在项目根目录准备其余依赖并启动 Vite 和 PhotoSys 桌面窗口。
+
+```powershell
+npm.cmd ci
+python scripts/prepare-ai-runtime.py
+python scripts/prepare-offline-maps.py
+npm.cmd run tauri -- dev
+```
+
+**Linux 和 macOS** 安装 Python 3.11 或更新版本。macOS 另需执行 `brew install pkgconf nasm`。在项目根目录执行以下命令。
 
 ```sh
+bash scripts/build-media-codec.sh
+python3 scripts/prepare-ai-runtime.py
+python3 scripts/prepare-offline-maps.py
 npm ci
-npm run tauri dev
-npm run tauri build -- -- --locked
+npm run tauri -- dev
 ```
+
+关闭开发进程后，可运行 `npm run tauri -- build -- --locked` 构建本机安装包。Windows PowerShell 中使用 `npm.cmd`。
 
 单独检查前端类型和生产构建，以及 Rust 测试。
 

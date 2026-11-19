@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -222,7 +222,9 @@ fn snapshot(source: &Path, destination: &Path, mut tick: impl FnMut()) -> Result
     }
     drop(backup);
     target.close().map_err(|(_, e)| error(e))?;
-    File::open(destination)
+    OpenOptions::new()
+        .write(true)
+        .open(destination)
         .and_then(|f| f.sync_all())
         .map_err(error)
 }

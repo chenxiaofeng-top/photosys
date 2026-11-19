@@ -13,7 +13,7 @@
     "test:theme": "node --experimental-strip-types scripts/theme.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri dev": "run tauri dev"
+    "tauri dev": "tauri dev"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

@@ -195,9 +195,10 @@ bash scripts/build-media-codec.sh
 rustup default stable-msvc
 python scripts/prepare-ai-runtime.py
 python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
-npm ci
+python scripts/prepare-offline-maps.py
+npm.cmd ci
 cargo test --locked --manifest-path src-tauri/Cargo.toml
-npm run tauri build -- -- --locked
+npm.cmd run tauri -- build -- --locked
 ```
 
 产物位于 `src-tauri/target/release/bundle/nsis/`。FFmpeg 脚本内部使用 UCRT64 编译器；桌面应用使用 MSVC Rust 工具链。安装依赖后若命令不可用，重新打开对应终端。
