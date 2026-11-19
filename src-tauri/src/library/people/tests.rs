@@ -1525,3 +1525,95 @@ fn person_photos_months_and_map_share_geographic_filters() {
     query::close_for_test();
     *session().unwrap() = None;
 }
+
+#[test]
+fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader() {
+    use crate::database_backup;
+    let _session = TEST_SESSION.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    image::RgbImage::new(8, 8)
+        .save(source.join("a.jpg"))
+        .unwrap();
+    let id = open(&source);
+    let faces = save(id);
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: vec![faces[0]],
+            person_id: None,
+            name: Some("妈妈".into()),
+        })
+        .unwrap();
+    store
+        .edit(Edit::Ignore {
+            face_ids: vec![faces[1]],
+        })
+        .unwrap();
+    drop(store);
+    // Keep the reusable read connection alive just as the people UI does.
+    assert_eq!(query::people(id, "", 0).unwrap().items[0].name, "妈妈");
+    let zip = temp.path().join("backup.zip");
+    database_backup::export(&scan.root, &zip, |_| {}).unwrap();
+    let checked = tempfile::tempdir().unwrap();
+    let inspection = database_backup::inspect(&zip, checked.path(), &|_| {}).unwrap();
+    let original = fs::read(source.join("a.jpg")).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store
+        .edit(Edit::Rename {
+            person_id: 1,
+            name: "恢复前的名称".into(),
+        })
+        .unwrap();
+    drop(store);
+    close_reader().unwrap();
+    database_backup::restore(
+        &scan.root,
+        &zip,
+        &inspection.fingerprint,
+        "restore-backup-12345678-1234-1234-1234-123456789abc",
+        |_| {},
+        |_| Ok(()),
+    )
+    .unwrap();
+    library::invalidate().unwrap();
+    let new_id = open(&source);
+    assert_ne!(id, new_id);
+    assert!(query::people(id, "", 0).is_err());
+    assert_eq!(query::people(new_id, "", 0).unwrap().items[0].name, "妈妈");
+    let scan = super::scan(new_id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT manual FROM faces WHERE id=?1", [faces[0]], |r| r
+                .get::<_, bool>(
+                0
+            ))
+            .unwrap(),
+        true
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT ignored FROM faces WHERE id=?1", [faces[1]], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap(),
+        true
+    );
+    store.undo().unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT ignored FROM faces WHERE id=?1", [faces[1]], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap(),
+        false
+    );
+    assert_eq!(fs::read(source.join("a.jpg")).unwrap(), original);
+    query::close_for_test();
+}

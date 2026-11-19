@@ -246,9 +246,9 @@ impl Item {
     }
 }
 
-struct Scan {
+pub(crate) struct Scan {
     id: u64,
-    root: Root,
+    pub(crate) root: Root,
     items: Vec<Item>,
     issues: Vec<Issue>,
     previews: Mutex<previews::Cache>,
@@ -489,7 +489,7 @@ fn current(session: &Option<Session>, scan_id: u64) -> Result<&Session, String> 
         .ok_or_else(|| STALE_SCAN.into())
 }
 
-fn scan(scan_id: u64) -> Result<Arc<Scan>, String> {
+pub(crate) fn scan(scan_id: u64) -> Result<Arc<Scan>, String> {
     Ok(current(&*session()?, scan_id)?.scan.clone())
 }
 
@@ -515,7 +515,7 @@ fn portable_directory() -> Option<PathBuf> {
     }
 }
 
-fn directory_preference(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn directory_preference(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|path| path.join("library-directory"))
@@ -533,7 +533,7 @@ fn read_preference(path: &Path) -> io::Result<Option<PathBuf>> {
     }
 }
 
-fn save_preference(path: &Path, directory: &str) -> io::Result<()> {
+pub(crate) fn save_preference(path: &Path, directory: &str) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("缺少应用配置目录。"))?;
@@ -561,6 +561,7 @@ fn startup_candidate(directory: &Path) -> Result<Option<StartupLibrary>, String>
             ));
         }
     };
+    crate::database_backup::recover(&root)?;
     let Some(keys) = favorites::read(&root)
         .map_err(|error| format!("无法读取 {} 的收藏数据库。{error}", directory.display()))?
     else {
@@ -631,13 +632,14 @@ fn open_library(
     Ok(summary)
 }
 
-fn open_directory(
+pub(crate) fn open_directory(
     directory: &str,
     mode: OpenMode,
     progress: impl FnMut(Progress),
 ) -> Result<Summary, String> {
     let root =
         Root::new(Path::new(directory)).map_err(|error| format!("无法打开媒体库目录。{error}"))?;
+    crate::database_backup::recover(&root)?;
     let keys =
         match favorites::read(&root).map_err(|error| format!("无法读取收藏数据库。{error}"))?
         {
@@ -656,6 +658,8 @@ pub(crate) async fn scan_startup_library(
 ) -> Result<Option<OpenedLibrary>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
+        let _database = crate::database_access::maintenance()?;
+        people::close_reader()?;
         let portable = portable_directory();
         let preference = directory_preference(&app);
         let Some(StartupLibrary {
@@ -687,6 +691,8 @@ pub(crate) async fn scan_library(
 ) -> Result<Summary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
+        let _database = crate::database_access::maintenance()?;
+        people::close_reader()?;
         let mut summary = open_directory(&directory, mode, |update| {
             let _ = progress.send(update);
         })?;
@@ -772,6 +778,7 @@ pub(crate) async fn set_library_rotation(
 ) -> Result<u16, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
+        let _database = crate::database_access::read()?;
         session()?
             .as_mut()
             .ok_or(STALE_SCAN)?
@@ -789,6 +796,7 @@ pub(crate) async fn set_library_favorite(
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
+        let _database = crate::database_access::read()?;
         let scan = scan(scan_id)?;
         let item = scan.item(file_id)?;
         scan.root
@@ -907,4 +915,10 @@ pub(crate) async fn library_item(scan_id: u64, file_id: usize) -> Result<ItemVie
     })
     .await
     .map_err(crate::ai::error)?
+}
+
+/// Called under exclusive database access before replacing any database files.
+pub(crate) fn invalidate() -> Result<(), String> {
+    *session()? = None;
+    people::close_reader()
 }

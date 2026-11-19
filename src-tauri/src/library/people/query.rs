@@ -17,6 +17,11 @@ pub(super) fn close_for_test() {
     *READER.lock().unwrap() = None;
 }
 
+pub(super) fn close() -> Result<(), String> {
+    *READER.lock().map_err(error)? = None;
+    Ok(())
+}
+
 struct Reader {
     scan_id: u64,
     store: Store,

@@ -12,6 +12,8 @@ import "element-plus/es/components/select/style/css";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
+import DatabaseBackup from "./DatabaseBackup.vue";
+import type { DatabaseRestoreResult, LibrarySummary } from "./databaseBackup";
 import PeoplePanel from "./PeoplePanel.vue";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
 const LocationMap = defineAsyncComponent(() => import("./LocationMap.vue"));
@@ -50,13 +52,7 @@ interface Issue {
   reason: string;
 }
 
-interface Summary {
-  scanId: number;
-  total: number;
-  issues: number;
-  thumbnailConcurrency: number;
-  preferenceWarning: string | null;
-}
+type Summary = LibrarySummary;
 
 interface OpenedLibrary {
   directory: string;
@@ -67,7 +63,7 @@ const props = defineProps<{ peopleMode?: boolean }>();
 const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string] }>();
 const pageSize = 24;
 const directory = ref("");
-const task = ref<"starting" | "choosing" | "scanning" | "saving" | undefined>("starting");
+const task = ref<"starting" | "choosing" | "scanning" | "saving" | "database" | undefined>("starting");
 const busy = computed(() => task.value !== undefined);
 watch(busy, (value) => emit("busyChange", value), { flush: "sync", immediate: true });
 
@@ -392,6 +388,34 @@ async function scanDirectory(selected: string, mode: "select" | "refresh") {
   }
 }
 
+function prepareDatabaseRestore() {
+  closeDetails();
+  pendingFocus = undefined;
+  selectedPerson.value = undefined;
+  peopleStatus.value = undefined;
+  aiIndex.value = undefined;
+  summary.value = undefined;
+  results.value = undefined;
+  issues.value = undefined;
+  months.value = [];
+}
+function databaseRestored(result: DatabaseRestoreResult) {
+  scanError.value = "";
+  favoriteError.value = "";
+  rotationError.value = "";
+  if (result.summary) showScan(result.directory, result.summary);
+  else {
+    directory.value = result.directory;
+    emit("directoryChange", result.directory);
+    scanError.value = result.reopenError ?? "请重新打开恢复后的相册。";
+  }
+}
+function reloadAfterRestoreFailure() {
+  if (directory.value) void scanDirectory(directory.value, "refresh");
+}
+function databaseBusy(value: boolean) { task.value = value ? "database" : undefined; }
+function databaseExported() { peopleRevision.value++; void aiPanel.value?.refreshIndex(); }
+
 async function toggleFavorite(item: Item) {
   const scanId = summary.value?.scanId;
   if (scanId === undefined || busy.value) return;
@@ -657,13 +681,16 @@ async function performFileAction(action: FileAction) {
         <h1>{{ peopleMode ? "人物与家庭时间线" : "媒体库" }}</h1>
         <p>把每一段回忆，好好珍藏。</p>
       </div>
-      <div v-if="directory" class="directory-toolbar">
-        <div class="directory-field">
+      <div class="directory-toolbar">
+        <div v-if="directory" class="directory-field">
           <label for="library-directory">当前目录</label>
           <ElInput id="library-directory" :model-value="directory" :title="directory" readonly :prefix-icon="FolderOpened" />
         </div>
-        <ElButton :icon="FolderOpened" :disabled="busy" @click="chooseDirectory">更换目录</ElButton>
-        <ElButton :icon="Refresh" :loading="task === 'scanning'" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</ElButton>
+        <ElButton v-if="directory" :icon="FolderOpened" :disabled="busy" @click="chooseDirectory">更换目录</ElButton>
+        <ElButton v-if="directory" :icon="Refresh" :loading="task === 'scanning'" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新</ElButton>
+        <DatabaseBackup :scan-id="summary?.scanId" :directory="directory" :library-busy="busy"
+          @busy-change="databaseBusy" @restoring="prepareDatabaseRestore" @restored="databaseRestored"
+          @restore-failed="reloadAfterRestoreFailure" @exported="databaseExported" />
       </div>
     </header>
 
@@ -915,8 +942,8 @@ async function performFileAction(action: FileAction) {
 .library-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1.5rem 2rem; margin: 0 0 1.5rem; }
 .library-heading h1 { font-size: clamp(1.8rem, 2.2vw, 2.5rem); line-height: 1.3; letter-spacing: -0.03em; }
 .library-heading p { margin: 0.4rem 0 0; color: var(--library-muted); }
-.directory-toolbar { display: flex; flex: 0 1 43rem; align-items: end; gap: 0.625rem; min-width: 0; max-width: 100%; }
-.directory-field { flex: 1; min-width: 0; }
+.directory-toolbar { display: flex; flex-wrap: wrap; flex: 0 1 52rem; align-items: end; gap: 0.625rem; min-width: 0; max-width: 100%; }
+.directory-field { flex: 1 1 13rem; min-width: 0; }
 .directory-field label { margin: 0 0 0.375rem; color: var(--library-muted); font-size: 0.8125rem; font-weight: 500; }
 .directory-field :deep(input:not(:focus)) { text-overflow: ellipsis; }
 .library-tools { padding: 1.25rem; border: 1px solid var(--library-border); border-radius: 1rem; background: #fff; }

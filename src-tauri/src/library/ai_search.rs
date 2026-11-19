@@ -28,7 +28,7 @@ pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, Stri
 
 static ACTIVE: Mutex<Option<(u64, Arc<AtomicBool>)>> = Mutex::new(None);
 
-pub(super) fn cancel_all() {
+pub(crate) fn cancel_all() {
     if let Ok(active) = ACTIVE.lock()
         && let Some((_, cancel)) = active.as_ref()
     {
@@ -305,9 +305,12 @@ pub(crate) fn model_impact(scan_id: u64, spec: &ai::catalog::ModelSpec) -> Resul
 
 #[tauri::command]
 pub(crate) async fn ai_index_status(scan_id: u64) -> Result<IndexStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || status(scan_id))
-        .await
-        .map_err(error)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        status(scan_id)
+    })
+    .await
+    .map_err(error)?
 }
 
 pub(super) fn decode(
@@ -465,6 +468,7 @@ pub(crate) async fn ai_update_index(
     progress: Channel<IndexStatus>,
 ) -> Result<IndexStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         update(scan_id, automatic, &progress, || ai::runtime(&app))
     })
     .await
@@ -474,6 +478,7 @@ pub(crate) async fn ai_update_index(
 #[tauri::command]
 pub(crate) async fn ai_index_issues(scan_id: u64, page: usize) -> Result<Page<Issue>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         let scan = scan(scan_id)?;
         let rotations = rotations(scan_id)?;
         let records = Cache::open(&scan, false)?
@@ -664,6 +669,7 @@ pub(crate) async fn ai_search(
     page: usize,
 ) -> Result<SearchPage, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         let scan = scan(scan_id)?;
         let generation = MODEL_GENERATION.load(Ordering::Relaxed);
         let (favorites, rotations) = {

@@ -628,6 +628,7 @@ pub(crate) async fn ai_model_change_impact(
     let kind = kind.unwrap_or_default();
     let spec = super::catalog::find(kind, &model_id)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         if kind == ModelKind::People {
             crate::library::people::model_impact(scan_id, spec)
         } else {

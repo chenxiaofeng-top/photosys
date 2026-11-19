@@ -1,5 +1,7 @@
 mod ai;
 mod archive;
+mod database_access;
+mod database_backup;
 mod duplicates;
 mod library;
 mod maps;
@@ -120,6 +122,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            database_backup::database_backup_file,
+            database_backup::database_export,
+            database_backup::database_inspect,
+            database_backup::database_restore,
             library::locations::library_map_points,
             library::locations::location_regions,
             maps::offline_map_state,

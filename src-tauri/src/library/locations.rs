@@ -432,6 +432,7 @@ pub(crate) async fn library_map_points(
     content_query: Option<String>,
 ) -> Result<MapPoints, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         filter.validate_location()?;
         let views = if let Some(query) = content_query {
             if query.trim().is_empty() {

@@ -51,7 +51,7 @@ pub(crate) struct IndexStatus {
     pub needs_rebuild: bool,
     pub rebuild_reason: Option<String>,
 }
-pub(super) fn cancel_all() {
+pub(crate) fn cancel_all() {
     if let Ok(a) = ACTIVE.lock()
         && let Some((_, c)) = a.as_ref()
     {
@@ -160,9 +160,12 @@ pub(crate) fn model_impact(scan_id: u64, spec: &ai::catalog::ModelSpec) -> Resul
 
 #[tauri::command]
 pub(crate) async fn people_index_status(scan_id: u64) -> Result<IndexStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || status(scan_id))
-        .await
-        .map_err(error)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        status(scan_id)
+    })
+    .await
+    .map_err(error)?
 }
 fn update(
     scan_id: u64,
@@ -334,6 +337,7 @@ pub(crate) async fn people_update_index(
     progress: Channel<IndexStatus>,
 ) -> Result<IndexStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         update(scan_id, automatic, &progress, || {
             ai::people_model::runtime(&app)
         })
@@ -347,9 +351,12 @@ pub(crate) async fn people_list(
     query: String,
     page: usize,
 ) -> Result<Page<PersonView>, String> {
-    tauri::async_runtime::spawn_blocking(move || query::people(scan_id, &query, page))
-        .await
-        .map_err(error)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        query::people(scan_id, &query, page)
+    })
+    .await
+    .map_err(error)?
 }
 #[tauri::command]
 pub(crate) async fn people_faces(
@@ -360,6 +367,7 @@ pub(crate) async fn people_faces(
     page: usize,
 ) -> Result<Page<FaceView>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         query::faces(scan_id, scope, person_id, file_id, page)
     })
     .await
@@ -374,6 +382,7 @@ pub(crate) async fn people_photos(
     page: usize,
 ) -> Result<Page<ItemView>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         query::photos(scan_id, person_id, &filter, sort, page)
     })
     .await
@@ -386,13 +395,17 @@ pub(crate) async fn people_months(
     filter: Filter,
     sort: Sort,
 ) -> Result<Vec<Month>, String> {
-    tauri::async_runtime::spawn_blocking(move || query::months(scan_id, person_id, &filter, sort))
-        .await
-        .map_err(error)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        query::months(scan_id, person_id, &filter, sort)
+    })
+    .await
+    .map_err(error)?
 }
 #[tauri::command]
 pub(crate) async fn people_edit(scan_id: u64, edit: Edit) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         let _edit = MUTATION.lock().map_err(error)?;
         match &edit {
             Edit::Assign { face_ids, .. }
@@ -418,6 +431,7 @@ pub(crate) async fn people_edit(scan_id: u64, edit: Edit) -> Result<(), String> 
 #[tauri::command]
 pub(crate) async fn people_undo(scan_id: u64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         let _edit = MUTATION.lock().map_err(error)?;
         let s = session()?;
         let scan = &current(&s, scan_id)?.scan;
@@ -431,6 +445,7 @@ pub(crate) async fn people_undo(scan_id: u64) -> Result<(), String> {
 #[tauri::command]
 pub(crate) async fn people_index_issues(scan_id: u64, page: usize) -> Result<Page<Issue>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
         let scan = scan(scan_id)?;
         let rotations = current(&*session()?, scan_id)?.rotations.clone();
         let records = Store::open(&scan, false)?
@@ -469,9 +484,12 @@ pub(crate) async fn people_photo_people(
     scan_id: u64,
     file_id: usize,
 ) -> Result<Vec<query::Identity>, String> {
-    tauri::async_runtime::spawn_blocking(move || query::photo_people(scan_id, file_id))
-        .await
-        .map_err(error)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        query::photo_people(scan_id, file_id)
+    })
+    .await
+    .map_err(error)?
 }
 
 pub(super) fn map_photo_ids(
@@ -480,4 +498,8 @@ pub(super) fn map_photo_ids(
     filter: &super::Filter,
 ) -> Result<Vec<usize>, String> {
     query::photo_ids(scan_id, person_id, filter)
+}
+
+pub(crate) fn close_reader() -> Result<(), String> {
+    query::close()
 }

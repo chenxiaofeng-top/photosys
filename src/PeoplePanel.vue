@@ -31,13 +31,14 @@ const running = computed(() => indexTask.value || !!state.value?.running);
 const editDisabled = computed(() => props.libraryBusy || saving.value || !state.value?.writable);
 function setState(value: PeopleStatus) { if (value.scanId === props.scanId && mounted) { state.value = value; emit("status", value); } }
 async function refresh(automatic = false) {
+  if (props.libraryBusy) return;
   const scanId = props.scanId; const token = request;
   try {
     const value = await invoke<PeopleStatus>("people_index_status", { scanId });
-    if (!mounted || token !== request || scanId !== props.scanId) return;
+    if (!mounted || props.libraryBusy || token !== request || scanId !== props.scanId) return;
     setState(value);
     if (automatic && value.enabled && !value.needsRebuild && value.writable && ready.value && !running.value) void updateIndex(true);
-  } catch (cause) { if (mounted && token === request && scanId === props.scanId) error.value = String(cause); }
+  } catch (cause) { if (!props.libraryBusy && mounted && token === request && scanId === props.scanId) error.value = String(cause); }
 }
 async function updateIndex(automatic = false) {
   if (running.value || props.libraryBusy || !ready.value) return;
@@ -49,6 +50,7 @@ async function updateIndex(automatic = false) {
   finally { if (mounted && token === request) { indexTask.value = false; cancelling.value = false; void refresh(); } }
 }
 async function cancel() { cancelling.value = true; try { await invoke("people_cancel_index", { scanId: props.scanId }); } catch (cause) { error.value = String(cause); cancelling.value = false; } }
+watch(() => props.libraryBusy, busy => { if (!busy) void refresh(true); });
 watch(() => props.scanId, (id, old) => {
   request++; indexTask.value = false; state.value = undefined; error.value = ""; page.value = 0; scope.value = "people"; search.value = ""; committedSearch.value = ""; issuesOpen.value = false; issuePage.value = 0; cancelling.value = false;
   if (old !== undefined) void invoke("people_cancel_index", { scanId: old }).catch(() => {});
@@ -60,7 +62,7 @@ watch(search, (_, __, cleanup) => { const timer = setTimeout(() => { committedSe
 watch([() => props.scanId, () => props.revision, committedSearch, page], async (_, __, cleanup) => {
   let current = true; cleanup(() => { current = false; }); loading.value = true;
   try { const value = await invoke<Page<Person>>("people_list", { scanId: props.scanId, query: committedSearch.value, page: page.value }); if (current) people.value = value; }
-  catch (cause) { if (current) error.value = String(cause); }
+  catch (cause) { if (current && !props.libraryBusy) error.value = String(cause); }
   finally { if (current) loading.value = false; }
 }, { immediate: true });
 watch(() => props.selected, person => { rename.value = person?.name ?? ""; mergeTarget.value = ""; mergeSearch.value = ""; });
@@ -68,13 +70,13 @@ watch([() => props.scanId, mergeSearch, () => props.revision], (_, __, cleanup) 
   let current = true; mergeTarget.value = "";
   const timer = setTimeout(async () => {
     try { const value = await invoke<Page<Person>>("people_list", { scanId: props.scanId, query: mergeSearch.value, page: 0 }); if (current) mergeTargets.value = value; }
-    catch (cause) { if (current) error.value = String(cause); }
+    catch (cause) { if (current && !props.libraryBusy) error.value = String(cause); }
   }, 200); cleanup(() => { current = false; clearTimeout(timer); });
 }, { immediate: true });
 watch([() => props.scanId, () => props.revision, issuesOpen, issuePage], async (_, __, cleanup) => {
   if (!issuesOpen.value) return; let current = true; cleanup(() => { current = false; });
   try { const value = await invoke<typeof issues.value>("people_index_issues", { scanId: props.scanId, page: issuePage.value }); if (current) issues.value = value; }
-  catch (cause) { if (current) error.value = String(cause); }
+  catch (cause) { if (current && !props.libraryBusy) error.value = String(cause); }
 });
 async function mutate(kind: "rename" | "merge" | "undo") {
   if (editDisabled.value || (kind !== "undo" && !props.selected)) return;

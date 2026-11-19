@@ -134,21 +134,21 @@ async function cancelInstall() {
 }
 
 async function refreshIndex(automatic = false) {
-  if (peopleModel.value) return;
+  if (peopleModel.value || props.libraryBusy) return;
   const scanId = props.scanId;
   if (scanId === undefined) return;
   const request = indexRequest;
   try {
     const value = await invoke<IndexStatus>("ai_index_status", { scanId });
-    if (!mounted || request !== indexRequest || scanId !== props.scanId) return;
+    if (!mounted || props.libraryBusy || request !== indexRequest || scanId !== props.scanId) return;
     setIndex(value);
-    if (automatic && value.enabled && !value.needsRebuild && value.writable && model.value?.activeReady && !indexTask.value) await updateIndex(true);
-  } catch (cause) { if (request === indexRequest && scanId === props.scanId) indexError.value = String(cause); }
+    if (automatic && !props.libraryBusy && value.enabled && !value.needsRebuild && value.writable && model.value?.activeReady && !indexTask.value) await updateIndex(true);
+  } catch (cause) { if (!props.libraryBusy && request === indexRequest && scanId === props.scanId) indexError.value = String(cause); }
 }
 
 async function updateIndex(automatic = false) {
   const scanId = props.scanId;
-  if (scanId === undefined || indexTask.value || modelTask.value || !model.value?.activeReady) return;
+  if (props.libraryBusy || scanId === undefined || indexTask.value || modelTask.value || !model.value?.activeReady) return;
   const request = ++indexRequest;
   indexTask.value = true;
   indexError.value = "";
@@ -173,6 +173,8 @@ async function cancelIndex() {
   try { if (props.scanId !== undefined) await invoke(peopleModel.value ? "people_cancel_index" : "ai_cancel_index", { scanId: props.scanId }); }
   catch (cause) { indexError.value = String(cause); }
 }
+
+watch(() => props.libraryBusy, busy => { if (!busy) void refreshIndex(true); });
 
 watch(() => props.scanId, (id, oldId) => {
   indexRequest++;
