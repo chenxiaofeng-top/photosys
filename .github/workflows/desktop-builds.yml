@@ -69,6 +69,10 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Prepare app-local Windows C++ runtime
+        if: runner.os == 'Windows'
+        run: python scripts/prepare-windows-runtime.py
+
       - name: Prepare bundled AI CPU runtime
         shell: bash
         run: |
@@ -77,7 +81,11 @@ jobs:
           else
             python scripts/prepare-ai-runtime.py
           fi
-          python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64
+          else
+            python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
+          fi
 
       - name: Prepare bundled offline map tool
         shell: bash
@@ -197,7 +205,7 @@ jobs:
           lipo "$app/Contents/Resources/onnxruntime/x86_64/libonnxruntime.dylib" -verify_arch x86_64
           python scripts/check-ai-runtime.py "$app/Contents/Resources/onnxruntime"
 
-      - name: Verify FFmpeg in the Windows installer
+      - name: Verify bundled Windows installer dependencies
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -206,11 +214,18 @@ jobs:
           $unpacked = Join-Path $env:RUNNER_TEMP photosys-installer
           & "$env:ProgramFiles/7-Zip/7z.exe" x $installer.FullName "-o$unpacked" -y
           if ($LASTEXITCODE -ne 0) { throw "Could not extract the PhotoSys installer" }
-          $codec = Get-ChildItem $unpacked -Recurse -Filter photosys-ffmpeg.exe | Select-Object -First 1
-          if (-not $codec) { throw "Bundled FFmpeg is missing" }
-          & $codec.FullName -version
+          foreach ($name in @('photosys.exe', 'photosys-ffmpeg.exe', 'photosys-pmtiles.exe',
+                              'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            $file = Get-Item -LiteralPath (Join-Path $unpacked $name) -ErrorAction SilentlyContinue
+            if (-not $file -or $file.PSIsContainer -or $file.Length -eq 0) {
+              throw "Missing or empty file next to the installed application: $name"
+            }
+          }
+          & (Join-Path $unpacked 'photosys-ffmpeg.exe') -version
           if ($LASTEXITCODE -ne 0) { throw "Bundled FFmpeg failed to start" }
-          python scripts/check-ai-runtime.py $unpacked
+          & (Join-Path $unpacked 'photosys-pmtiles.exe') version
+          if ($LASTEXITCODE -ne 0) { throw "Bundled PMTiles failed to start" }
+          python scripts/check-ai-runtime.py $unpacked --dll-directory $unpacked
           if ($LASTEXITCODE -ne 0) { throw "Bundled AI runtime failed to load" }
 
       - name: Check expected packages

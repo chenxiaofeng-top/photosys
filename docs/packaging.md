@@ -50,7 +50,7 @@ Artifacts 下载得到 ZIP，先解压，再按扩展名找到安装包。ZIP �
 | `PhotoSys-linux-x64` | Linux x64 | Debian/Ubuntu 的 `.deb`，以及便携 `.AppImage` |
 | `PhotoSys-macos-universal` | Apple Silicon、Intel Mac | 通用 `.dmg` |
 
-**Windows：** 双击 `.exe`，按安装向导操作。未签名程序可能出现 SmartScreen 提示；确认来源和版本后按系统提供的选项处理。应用依赖 Microsoft Edge WebView2 Runtime，缺失时安装程序可能需要联网安装它。
+**Windows** 双击 `.exe`，按安装向导操作。未签名程序可能出现 SmartScreen 提示，确认来源和版本后按系统提供的选项处理。缺少 Microsoft Edge WebView2 Runtime 时，安装程序会联网安装它。AI 功能所需的 Visual C++ DLL 随包安装，用户无需另外安装 VC++ 运行库。AI 模型仍需在应用内下载或导入离线模型包。
 
 **Linux deb：** 在安装包目录执行，文件名替换成实际文件名：
 
@@ -180,7 +180,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri build -- -- --locked
 
 ### Windows x64
 
-1. 安装 Visual Studio Build Tools 的「使用 C++ 的桌面开发」，包含 MSVC x64/x86 工具及 Windows SDK；安装 Microsoft Edge WebView2 Runtime。
+1. 安装 Visual Studio Build Tools 的「使用 C++ 的桌面开发」，包含 MSVC x64/x86 工具、Windows SDK 和 Visual C++ Redistributable 最新组件（`Microsoft.VisualStudio.Component.VC.Redist.14.Latest`）。安装 Microsoft Edge WebView2 Runtime。
 2. 安装 [MSYS2](https://www.msys2.org/)，打开 **MSYS2 UCRT64** 终端，进入项目目录（例如 `cd /c/code/photosys`），运行：
 
 ```sh
@@ -193,8 +193,9 @@ bash scripts/build-media-codec.sh
 
 ```powershell
 rustup default stable-msvc
+python scripts/prepare-windows-runtime.py
 python scripts/prepare-ai-runtime.py
-python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
+python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64
 python scripts/prepare-offline-maps.py
 npm.cmd ci
 cargo test --locked --manifest-path src-tauri/Cargo.toml

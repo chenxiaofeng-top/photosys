@@ -1,3 +1,11 @@
 {
-  "bundle": { "targets": ["nsis"] }
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "target/windows-runtime/x64/msvcp140.dll": "msvcp140.dll",
+      "target/windows-runtime/x64/msvcp140_1.dll": "msvcp140_1.dll",
+      "target/windows-runtime/x64/vcruntime140.dll": "vcruntime140.dll",
+      "target/windows-runtime/x64/vcruntime140_1.dll": "vcruntime140_1.dll"
+    }
+  }
 }

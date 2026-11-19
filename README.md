@@ -136,7 +136,7 @@ python3 scripts/package-ai-model.py --kind people /path/to/yunet-sface-fp32-v1 /
 
 安装 Node.js 24 LTS 和 npm，再通过 [rustup](https://rustup.rs/) 安装 Rust stable。安装后重新打开终端，确认 `node --version`、`npm --version` 和 `rustc --version` 可用。
 
-**Windows** 安装 Microsoft Edge WebView2 Runtime 和 Visual Studio Build Tools 的「使用 C++ 的桌面开发」工作负载，包含 MSVC x64/x86 工具和 Windows SDK。用 `rustup default stable-msvc` 选择 Rust 工具链，安装后重新打开终端。
+**Windows** 安装 Microsoft Edge WebView2 Runtime 和 Visual Studio Build Tools 的「使用 C++ 的桌面开发」工作负载，包含 MSVC x64/x86 工具、Windows SDK 和 Visual C++ Redistributable 最新组件。用 `rustup default stable-msvc` 选择 Rust 工具链，安装后重新打开终端。
 
 **Debian 13 / Ubuntu 24.04** 在宿主机安装 Tauri 开发和打包依赖。
 
@@ -172,6 +172,7 @@ bash scripts/build-media-codec.sh
 
 ```powershell
 npm.cmd ci
+python scripts/prepare-windows-runtime.py
 python scripts/prepare-ai-runtime.py
 python scripts/prepare-offline-maps.py
 npm.cmd run tauri -- dev
