@@ -73,7 +73,7 @@ jobs:
         if: runner.os == 'Windows'
         run: python scripts/prepare-windows-runtime.py
 
-      - name: Prepare bundled AI CPU runtime
+      - name: Prepare bundled AI runtimes
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -82,7 +82,7 @@ jobs:
             python scripts/prepare-ai-runtime.py
           fi
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64
+            python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64 --require-directml
           else
             python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime
           fi
@@ -148,6 +148,12 @@ jobs:
           # Avoid macOS /var aliases in SQLite NOFOLLOW tests.
           TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Exercise Windows CPU inference and DirectML fallback
+        if: runner.os == 'Windows'
+        run: |
+          Copy-Item src-tauri/target/windows-runtime/x64/*.dll -Destination src-tauri/target/debug/deps
+          cargo test --locked --manifest-path src-tauri/Cargo.toml bundled_cpu_inference_and_directml_fallback -- --ignored --nocapture
 
       - name: Verify native local face inference and offline installation
         if: github.event_name == 'workflow_dispatch' && inputs.full_ai_validation
@@ -225,7 +231,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Bundled FFmpeg failed to start" }
           & (Join-Path $unpacked 'photosys-pmtiles.exe') version
           if ($LASTEXITCODE -ne 0) { throw "Bundled PMTiles failed to start" }
-          python scripts/check-ai-runtime.py $unpacked --dll-directory $unpacked
+          python scripts/check-ai-runtime.py $unpacked --dll-directory $unpacked --require-directml
           if ($LASTEXITCODE -ne 0) { throw "Bundled AI runtime failed to load" }
 
       - name: Check expected packages

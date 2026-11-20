@@ -892,6 +892,72 @@ mod tests {
         *session().unwrap() = None;
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires real models, an OpenCV test portrait, and a Windows hardware GPU"]
+    fn real_directml_search_reuses_cpu_index() {
+        let _session = super::super::TEST_SESSION.lock().unwrap();
+        use ai::device_tests::{assert_directml_profiles, benchmark_indexes, directml_test_device};
+        use ai::inference::Runtime;
+        let models =
+            std::path::PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_DIR").unwrap());
+        let portrait =
+            std::path::PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_PORTRAIT").unwrap());
+        let spec = ai::catalog::default_model(ai::ModelKind::Search);
+        let model = models.join(spec.id);
+        let profiles = tempfile::tempdir().unwrap();
+        let device = directml_test_device(profiles.path());
+        let cpu = Arc::new(Runtime::load_spec(&model, spec).unwrap());
+        let album = tempfile::tempdir().unwrap();
+        let directory = album.path().to_str().unwrap();
+        let open = || {
+            super::super::open_directory(directory, super::super::OpenMode::Refresh, |_| {})
+                .unwrap()
+                .scan_id
+        };
+        fs::copy(&portrait, album.path().join("portrait.jpg")).unwrap();
+        favorites::initialize(&crate::duplicates::Root::new(album.path()).unwrap()).unwrap();
+        let id = open();
+        let progress = Channel::new(|_| Ok(()));
+        assert_eq!(
+            update(id, false, &progress, || Ok(cpu.clone()))
+                .unwrap()
+                .indexed,
+            1
+        );
+
+        let gpu = Arc::new(Runtime::load_with_device(&model, spec, &device).unwrap());
+        let query = gpu.encode_text("人像照片").unwrap();
+        let scan = super::super::scan(id).unwrap();
+        let page = rank(&scan, &query, &all(), &HashSet::new(), &HashMap::new(), 0).unwrap();
+        assert_eq!(page.items[0].name, "portrait.jpg");
+        image::RgbImage::from_pixel(256, 256, image::Rgb([0, 0, 255]))
+            .save(album.path().join("blue.png"))
+            .unwrap();
+        let id = open();
+        let added = update(id, true, &progress, || Ok(gpu.clone())).unwrap();
+        assert_eq!((added.indexed, added.reused, added.failed), (2, 1, 0));
+        assert!(!added.needs_rebuild);
+
+        let same = update(id, true, &progress, || Ok(cpu.clone())).unwrap();
+        assert_eq!(same.reused, 2);
+        let query = cpu.encode_text("人像照片").unwrap();
+        let scan = super::super::scan(id).unwrap();
+        let page = rank(&scan, &query, &all(), &HashSet::new(), &HashMap::new(), 0).unwrap();
+        assert_eq!(page.items[0].name, "portrait.jpg");
+        benchmark_indexes(&portrait, |path, use_gpu| {
+            favorites::initialize(&crate::duplicates::Root::new(path).unwrap()).unwrap();
+            let opened = super::super::open_directory(
+                path.to_str().unwrap(), super::super::OpenMode::Refresh, |_| {},
+            ).unwrap();
+            let runtime = if use_gpu { &gpu } else { &cpu };
+            let result = update(opened.scan_id, false, &progress, || Ok(runtime.clone())).unwrap();
+            (result.indexed, result.failed)
+        });
+        assert_directml_profiles(gpu.end_profiles());
+        *session().unwrap() = None;
+    }
+
     #[test]
     #[ignore = "requires PHOTOSYS_AI_REFERENCE and downloaded real models"]
     fn real_album_incremental_cancel_and_search() {

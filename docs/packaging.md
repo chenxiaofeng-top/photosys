@@ -20,7 +20,7 @@
 5. 等待配置校验、三个平台构建和 Intel macOS 运行时检查完成。构建任务可能排队；FFmpeg 编译和 Rust 首次编译也需要时间，以实际运行结果为准。
 6. 在运行详情页下方 **Artifacts** 下载需要的平台包。每个平台成功后，摘要也会显示它的下载链接；Artifacts 保留 30 天。
 
-默认打包仍会执行常规 Rust 测试、前端类型检查和生产构建，检查包内 FFmpeg、ONNX Runtime，以及 macOS 通用架构。**关闭完整 AI 验证不会删除应用的 AI 功能。** 安装包包含 CPU 运行时，模型权重由用户在应用中另行安装。
+默认打包会执行常规 Rust 测试、前端类型检查和生产构建，检查包内 FFmpeg、ONNX Runtime，以及 macOS 通用架构。Windows x64 安装包同时包含 CPU 和 DirectML 运行库，默认 CI 会运行 CPU 推理和回退测试。模型权重由用户在应用中另行安装。
 
 手动运行只生成 Artifacts。即使手动选择了版本标签，也不会发布 Release；自动发布要求通过 `git push` 推送版本标签触发。
 
@@ -155,8 +155,8 @@ Windows PowerShell 可用 `Get-FileHash .\实际安装包.exe -Algorithm SHA256`
 ### 共同依赖
 
 - Node.js 24、npm、Rust stable（通过 [rustup](https://rustup.rs/) 安装）。
-- Python 3.11+，用于构建时准备原生 CPU 运行时；最终用户无需 Python。
-- 从网络下载 npm/Rust 依赖、固定版本的媒体解码器源码和 CPU 运行时。
+- Python 3.11+，用于构建时准备原生 ONNX Runtime。
+- 从网络下载 npm/Rust 依赖、固定版本的媒体解码器源码和原生运行库。
 
 完整平台依赖可参考 [Tauri 官方说明](https://v2.tauri.app/start/prerequisites/)。以下命令均在项目根目录执行。
 
@@ -195,7 +195,7 @@ bash scripts/build-media-codec.sh
 rustup default stable-msvc
 python scripts/prepare-windows-runtime.py
 python scripts/prepare-ai-runtime.py
-python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64
+python scripts/check-ai-runtime.py src-tauri/binaries/onnxruntime --dll-directory src-tauri/target/windows-runtime/x64 --require-directml
 python scripts/prepare-offline-maps.py
 npm.cmd ci
 cargo test --locked --manifest-path src-tauri/Cargo.toml
@@ -203,6 +203,33 @@ npm.cmd run tauri -- build -- --locked
 ```
 
 产物位于 `src-tauri/target/release/bundle/nsis/`。FFmpeg 脚本内部使用 UCRT64 编译器；桌面应用使用 MSVC Rust 工具链。安装依赖后若命令不可用，重新打开对应终端。
+
+#### Windows GPU 真机验收
+
+在 NVIDIA、AMD 和 Intel 显卡上分别运行以下检查。用干净的 Windows 环境验证 NSIS 安装、断网推理和「仅 CPU」切换。
+
+```powershell
+$validation = Join-Path $PWD 'src-tauri/target/gpu-validation'
+python -X utf8 scripts/prepare-people-test.py "$validation/portrait"
+python scripts/prepare-model-options-test.py "$validation/models"
+$env:PHOTOSYS_MODEL_OPTIONS_DIR = "$validation/models"
+$env:PHOTOSYS_MODEL_OPTIONS_PORTRAIT = "$validation/portrait/lena.jpg"
+cargo test --locked --manifest-path src-tauri/Cargo.toml bundled_cpu_inference_and_directml_fallback -- --ignored --nocapture
+cargo test --locked --manifest-path src-tauri/Cargo.toml bundled_directml_inference_smoke -- --ignored --nocapture
+cargo test --locked --manifest-path src-tauri/Cargo.toml real_directml_ -- --ignored --nocapture --test-threads=1
+```
+
+真机测试读取 ONNX Runtime 性能记录，验证实际执行的 DirectML 节点。测试还对比同一组样例的向量、排序、人脸结果，并用临时相册验证 CPU 和 GPU 可混用同一份索引。发布验收记录显卡型号、驱动版本、相同相册的索引吞吐量、查询延迟和峰值显存。
+
+2026-11-20，本机 GTX 1650（4 GiB，驱动 592.82）上，五套模型均执行了 DirectML 节点并通过 CPU/GPU 结果比对。下表为开发构建的单次小样本，索引使用 8 张同一公开肖像的副本，查询为会话预热后的 3 条文本平均值。整套测试的设备显存采样峰值为 1692 MiB（100 ms 间隔）。
+
+| 测量项 | CPU | DirectML |
+| --- | ---: | ---: |
+| B/16 内容索引 | 3.61 张/秒 | 5.18 张/秒 |
+| YuNet + SFace 人物索引 | 3.06 张/秒 | 3.12 张/秒 |
+| B/16 文本推理 | 49.6 ms | 12.3 ms |
+| L/14 文本推理 | 584 ms | 168 ms |
+| L/14@336px 文本推理 | 1588 ms | 305 ms |
 
 ### macOS 通用包
 
@@ -233,7 +260,7 @@ npm run tauri build -- --target universal-apple-darwin -- --locked
 | 看不到 Run workflow | 检查 Actions 是否启用、账号是否有写权限、工作流是否已合入默认分支。 |
 | 任务未启动，提示 recent account payments / spending limit | 打开仓库所属账号或组织的 Settings → Billing & plans，检查付款状态、Actions 使用额度和支出限制。账户限制解除后再重跑；重复触发工作流不能解决计费限制。 |
 | Check release tag and application versions | 核对标签和五个版本文件；错误中会列出不一致项。尚未发布时可以在正确提交上使用新的版本标签，不要移动已发布标签。 |
-| 下载失败、超时、HTTP 404 | 看清具体 URL 和步骤。暂时性网络故障可重跑；404 需要核对固定源地址，持续失败不能靠跳过依赖解决。CPU 运行时使用官方 NuGet 固定版本包并校验 SHA-256。 |
+| 下载失败、超时、HTTP 404 | 看清具体 URL 和步骤。暂时性网络故障可重跑；404 需要核对固定源地址。CPU 和 DirectML 运行库均使用官方 NuGet 固定版本包并校验 SHA-256。 |
 | SHA-256 mismatch | 不要删除校验或随意改哈希。先确认上游来源和实际文件；本地可删掉对应缓存文件后重新下载。运行时缓存为 `src-tauri/target/ai-runtime/`，解码器缓存为 `src-tauri/target/media-codec/sources/`。 |
 | 完整 AI 验证下载或推理失败 | 只有手动勾选时才运行。网络问题可重跑；功能错误需修复后重新验证。日常打包可在新的手动运行中取消勾选，不代表完整 AI 验证已经通过。 |
 | FFmpeg、WebKitGTK、MSVC 或 pkg-config 缺失 | 核对对应平台的依赖安装步骤；本地优先按第 5 节准备，Windows 特别注意 UCRT64 与 PowerShell 的区别。 |

@@ -1,9 +1,11 @@
-use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use image::{DynamicImage, RgbImage};
-use ort::{session::Session, value::Tensor};
-use tauri::{AppHandle, Manager};
+use ort::{
+    session::{OutputSelector, RunOptions, Session, SessionOutputs},
+    value::{DynValue, Tensor},
+};
 use tokenizers::{
     Tokenizer, TruncationParams, models::wordpiece::WordPiece, normalizers::bert::BertNormalizer,
     pre_tokenizers::bert::BertPreTokenizer, processors::bert::BertProcessing,
@@ -11,37 +13,17 @@ use tokenizers::{
 
 #[cfg(test)]
 use super::DIM;
-use super::{catalog::ModelSpec, error};
-
-static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
-
-pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
-    INITIALIZED.get_or_init(|| {
-        let directory = format!("onnxruntime/{}", std::env::consts::ARCH);
-        let name = if cfg!(target_os = "windows") { "onnxruntime.dll" }
-            else if cfg!(target_os = "macos") { "libonnxruntime.dylib" }
-            else { "libonnxruntime.so" };
-        let resource = app.path().resource_dir().map_err(error)?.join(&directory).join(name);
-        let path = if resource.is_file() { resource } else {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").join(directory).join(name)
-        };
-        if !path.is_file() { return Err("缺少随软件提供的 AI 运行时，请重新安装 PhotoSys。开发环境请先执行 python3 scripts/prepare-ai-runtime.py。".into()); }
-        initialize_from(&path)
-    }).clone()
-}
-
-pub(crate) fn initialize_from(path: &Path) -> Result<(), String> {
-    ort::init_from(path)
-        .map_err(error)?
-        .with_telemetry(false)
-        .with_name("PhotoSys local search")
-        .commit();
-    Ok(())
-}
+#[cfg(test)]
+pub(crate) use super::device::initialize_from;
+use super::{
+    catalog::ModelSpec,
+    device::{SessionDevice, SessionStatus},
+    error,
+};
 
 pub(crate) struct Runtime {
-    vision: Mutex<Session>,
-    text: Option<Mutex<Session>>,
+    vision: InferenceSession,
+    text: Option<InferenceSession>,
     pub(crate) spec: &'static ModelSpec,
     tokenizer: Tokenizer,
 }
@@ -67,19 +49,189 @@ pub(crate) fn tokenizer(vocab: &Path) -> Result<Tokenizer, String> {
     Ok(tokenizer)
 }
 
-pub(crate) fn session(path: &Path) -> Result<Session, String> {
+fn session(path: &Path, device: &SessionDevice, directml: bool) -> Result<Session, String> {
     let threads = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .saturating_div(2)
         .clamp(1, 4);
-    Session::builder()
+    let builder = Session::builder()
         .map_err(error)?
         .with_intra_threads(threads)
         .map_err(error)?
         .with_inter_threads(1)
-        .map_err(error)?
-        .commit_from_file(path)
-        .map_err(error)
+        .map_err(error)?;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let builder = if directml {
+        use ort::ep::{DirectML, directml::PerformancePreference};
+        builder
+            .with_parallel_execution(false)
+            .map_err(error)?
+            .with_memory_pattern(false)
+            .map_err(error)?
+            // The app always feeds one sample. Resolve B/16's symbolic batch for DirectML Reshape.
+            .with_dimension_override("batch", 1)
+            .map_err(error)?
+            .with_execution_providers([DirectML::default()
+                .with_performance_preference(PerformancePreference::HighPerformance)
+                .build()
+                .error_on_failure()])
+            .map_err(error)?
+    } else {
+        builder
+    };
+    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+    let builder = if let Some(dir) = &device.profile_dir {
+        builder
+            .with_profiling(dir.join(path.file_stem().ok_or("缺少模型文件名。")?))
+            .map_err(error)?
+    } else {
+        builder
+    };
+    let _ = (device, directml);
+    let mut builder = builder;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    if directml {
+        let attributes = match path.file_name().and_then(|name| name.to_str()) {
+            Some("cn_clip_text.onnx") => 48,
+            Some("cn_clip_vision.onnx") => 49,
+            _ => 0,
+        };
+        if attributes != 0 {
+            let model = directml_clip_model(path, attributes)?;
+            return builder.commit_from_memory(&model).map_err(error);
+        }
+    }
+    builder.commit_from_file(path).map_err(error)
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn directml_clip_model(path: &Path, expected_attributes: usize) -> Result<Vec<u8>, String> {
+    // DirectML 1.24.2 rejects the pinned B/16 graphs' Reshape allowzero=1 attribute.
+    // B/16 derives these shapes from fixed image/token sizes and batch=1, with no zero dimensions.
+    // Normalize the encoded attributes in memory. The pinned asset files and weights stay intact.
+    const ALLOW_ZERO: &[u8] = b"\x2a\x10\x0a\x09allowzero\x18\x01\xa0\x01\x02";
+    const VALUE_OFFSET: usize = 14;
+    let mut model = std::fs::read(path).map_err(error)?;
+    // The nodes in both pinned files precede the weights and fit in the first 2 MiB.
+    let offsets: Vec<_> = model[..model.len().min(2 * 1024 * 1024)]
+        .windows(ALLOW_ZERO.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == ALLOW_ZERO).then_some(offset + VALUE_OFFSET))
+        .collect();
+    if offsets.len() != expected_attributes {
+        return Err("B/16 模型的 Reshape 属性与固定版本不匹配。".into());
+    }
+    for offset in offsets {
+        model[offset] = 0;
+    }
+    Ok(model)
+}
+
+struct ActiveSession {
+    session: Option<Session>,
+    status: SessionStatus,
+}
+
+pub(super) struct InferenceSession {
+    path: PathBuf,
+    device: SessionDevice,
+    active: Mutex<ActiveSession>,
+    inputs: Vec<String>,
+}
+
+impl InferenceSession {
+    pub(super) fn open(path: PathBuf, device: &SessionDevice) -> Result<Self, String> {
+        let mut status = device.status.clone();
+        let session = match session(&path, device, status.directml) {
+            Err(e) if status.directml => {
+                status.directml = false;
+                status.fallback = Some(format!("DirectML 会话初始化失败。{e}"));
+                session(&path, device, false)?
+            }
+            result => result?,
+        };
+        let inputs = session
+            .inputs()
+            .iter()
+            .map(|input| input.name().into())
+            .collect();
+        Ok(Self {
+            path,
+            device: device.clone(),
+            active: Mutex::new(ActiveSession {
+                session: Some(session),
+                status,
+            }),
+            inputs,
+        })
+    }
+
+    pub(super) fn inputs(&self) -> &[String] {
+        &self.inputs
+    }
+
+    pub(super) fn status(&self) -> Result<SessionStatus, String> {
+        Ok(self.active.lock().map_err(error)?.status.clone())
+    }
+
+    pub(super) fn run<T>(
+        &self,
+        inputs: Vec<(String, DynValue)>,
+        output: Option<&str>,
+        read: impl Fn(SessionOutputs<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let options = output
+            .map(|name| {
+                RunOptions::new()
+                    .map(|options| options.with_outputs(OutputSelector::no_default().with(name)))
+            })
+            .transpose()
+            .map_err(error)?;
+        // Borrow the input tensors so the CPU can retry the same tensors after a GPU failure.
+        let execute = |session: &mut Session| {
+            let inputs: Vec<_> = inputs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value))
+                .collect();
+            match &options {
+                Some(options) => session.run_with_options(inputs, options),
+                None => session.run(inputs),
+            }
+            .map_err(error)
+            .and_then(&read)
+        };
+
+        let mut active = self.active.lock().map_err(error)?;
+        if active.session.is_none() {
+            active.session = Some(session(&self.path, &self.device, false)?);
+        }
+        match execute(active.session.as_mut().unwrap()) {
+            Err(e) if active.status.directml => {
+                active.status.directml = false;
+                active.status.fallback = Some(format!("DirectML 推理失败。{e}"));
+                // Drop the GPU session before loading CPU weights.
+                active.session = None;
+                self.device.notify_fallback();
+                let mut cpu = session(&self.path, &self.device, false)?;
+                let result = execute(&mut cpu);
+                active.session = Some(cpu);
+                result
+            }
+            result => result,
+        }
+    }
+
+    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+    pub(super) fn end_profile(&self) -> String {
+        self.active
+            .lock()
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap()
+            .end_profiling()
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -140,17 +292,30 @@ impl Runtime {
         )
     }
     pub(crate) fn load_spec(directory: &Path, spec: &'static ModelSpec) -> Result<Self, String> {
+        Self::load_with_device(directory, spec, &SessionDevice::cpu())
+    }
+    pub(crate) fn load_with_device(
+        directory: &Path,
+        spec: &'static ModelSpec,
+        device: &SessionDevice,
+    ) -> Result<Self, String> {
         let combined = spec.backend == "combined";
         let runtime = Self {
-            vision: Mutex::new(session(&directory.join(if combined {
-                "model.onnx"
-            } else {
-                "cn_clip_vision.onnx"
-            }))?),
+            vision: InferenceSession::open(
+                directory.join(if combined {
+                    "model.onnx"
+                } else {
+                    "cn_clip_vision.onnx"
+                }),
+                device,
+            )?,
             text: if combined {
                 None
             } else {
-                Some(Mutex::new(session(&directory.join("cn_clip_text.onnx"))?))
+                Some(InferenceSession::open(
+                    directory.join("cn_clip_text.onnx"),
+                    device,
+                )?)
             },
             tokenizer: tokenizer(&directory.join("vocab.txt"))?,
             spec,
@@ -166,6 +331,21 @@ impl Runtime {
         )?;
         Ok(runtime)
     }
+    pub(super) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
+        let mut sessions = vec![self.vision.status()?];
+        if let Some(text) = &self.text {
+            sessions.push(text.status()?);
+        }
+        Ok(sessions)
+    }
+    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+    pub(crate) fn end_profiles(&self) -> Vec<String> {
+        let mut paths = vec![self.vision.end_profile()];
+        if let Some(text) = &self.text {
+            paths.push(text.end_profile());
+        }
+        paths
+    }
     pub(crate) fn encode_text(&self, query: &str) -> Result<Vec<f32>, String> {
         if query.trim().is_empty() || query.len() > 4096 {
             return Err("请输入不超过 4096 字节的照片描述。".into());
@@ -177,23 +357,13 @@ impl Runtime {
             ids[i] = i64::from(*id);
             mask[i] = 1;
         }
-        let mut session = self
-            .text
-            .as_ref()
-            .unwrap_or(&self.vision)
-            .lock()
-            .map_err(error)?;
-        let names: Vec<_> = session
-            .inputs()
-            .iter()
-            .map(|v| v.name().to_owned())
-            .collect();
+        let session = self.text.as_ref().unwrap_or(&self.vision);
         let mut inputs = Vec::new();
-        for name in names {
+        for name in session.inputs() {
             if name == "pixel_values" {
                 let e = self.spec.image_size;
                 inputs.push((
-                    name,
+                    name.clone(),
                     Tensor::from_array(([1, 3, e, e], vec![0_f32; 3 * e * e]))
                         .map_err(error)?
                         .into_dyn(),
@@ -206,35 +376,30 @@ impl Runtime {
                     _ => return Err(format!("不兼容的文字模型输入：{name}")),
                 };
                 inputs.push((
-                    name,
+                    name.clone(),
                     Tensor::from_array(([1_usize, 52], values))
                         .map_err(error)?
                         .into_dyn(),
                 ));
             }
         }
-        let options = ort::session::RunOptions::new()
-            .map_err(error)?
-            .with_outputs(if self.text.is_none() {
-                ort::session::OutputSelector::no_default().with("text_embeds")
-            } else {
-                ort::session::OutputSelector::default()
-            });
-        let outputs = session.run_with_options(inputs, &options).map_err(error)?;
-        normalize_dim(
-            outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(error)?
-                .1
-                .to_vec(),
-            self.spec.dimension,
-        )
+        let output = self.text.is_none().then_some("text_embeds");
+        session.run(inputs, output, |outputs| {
+            normalize_dim(
+                outputs[0]
+                    .try_extract_tensor::<f32>()
+                    .map_err(error)?
+                    .1
+                    .to_vec(),
+                self.spec.dimension,
+            )
+        })
     }
     pub(crate) fn encode_image(&self, image: RgbImage, rotation: u16) -> Result<Vec<f32>, String> {
         self.encode_pixels(pixels_at(image, rotation, self.spec.image_size))
     }
     pub(crate) fn encode_pixels(&self, pixels: Vec<f32>) -> Result<Vec<f32>, String> {
-        let mut session = self.vision.lock().map_err(error)?;
+        let session = &self.vision;
         let e = self.spec.image_size;
         let mut inputs = vec![(
             "pixel_values".to_owned(),
@@ -244,40 +409,35 @@ impl Runtime {
         )];
         if self.text.is_none() {
             for input in session.inputs() {
-                if input.name() == "pixel_values" {
+                if input == "pixel_values" {
                     continue;
                 }
-                let values = if input.name() == "attention_mask" {
+                let values = if input == "attention_mask" {
                     vec![1_i64; 52]
                 } else {
                     vec![0_i64; 52]
                 };
                 inputs.push((
-                    input.name().to_owned(),
+                    input.clone(),
                     Tensor::from_array(([1_usize, 52], values))
                         .map_err(error)?
                         .into_dyn(),
                 ));
             }
         } else {
-            inputs[0].0 = session.inputs()[0].name().to_owned();
+            inputs[0].0 = session.inputs()[0].clone();
         }
-        let options = ort::session::RunOptions::new()
-            .map_err(error)?
-            .with_outputs(if self.text.is_none() {
-                ort::session::OutputSelector::no_default().with("image_embeds")
-            } else {
-                ort::session::OutputSelector::default()
-            });
-        let outputs = session.run_with_options(inputs, &options).map_err(error)?;
-        normalize_dim(
-            outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(error)?
-                .1
-                .to_vec(),
-            self.spec.dimension,
-        )
+        let output = self.text.is_none().then_some("image_embeds");
+        session.run(inputs, output, |outputs| {
+            normalize_dim(
+                outputs[0]
+                    .try_extract_tensor::<f32>()
+                    .map_err(error)?
+                    .1
+                    .to_vec(),
+                self.spec.dimension,
+            )
+        })
     }
 }
 
@@ -292,6 +452,119 @@ pub(crate) fn decode_rgb(bytes: &[u8]) -> Result<RgbImage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    mod windows {
+        use super::*;
+        use crate::ai::device;
+        use std::fs;
+
+        // ONNX IR 8, opset 13: x: float[3] -> Relu -> y: float[3].
+        const RELU: &[u8] = b"\x08\x08\x3a\x37\x0a\x0c\x0a\x01\x78\x12\x01\x79\x22\x04\x52\x65\x6c\x75\x12\x05\x73\x6d\x6f\x6b\x65\x5a\x0f\x0a\x01\x78\x12\x0a\x0a\x08\x08\x01\x12\x04\x0a\x02\x08\x03\x62\x0f\x0a\x01\x79\x12\x0a\x0a\x08\x08\x01\x12\x04\x0a\x02\x08\x03\x42\x02\x10\x0d";
+
+        fn smoke_input() -> Vec<(String, DynValue)> {
+            vec![(
+                "x".into(),
+                Tensor::from_array(([3], vec![-2.0_f32, 0.0, 3.0]))
+                    .unwrap()
+                    .into_dyn(),
+            )]
+        }
+
+        fn smoke_output(outputs: SessionOutputs<'_>) -> Result<Vec<f32>, String> {
+            Ok(outputs["y"]
+                .try_extract_tensor::<f32>()
+                .map_err(error)?
+                .1
+                .to_vec())
+        }
+
+        #[test]
+        #[ignore = "requires prepared Windows CPU runtime and its native DLL dependencies"]
+        fn bundled_cpu_inference_and_directml_fallback() {
+            let directory = tempfile::tempdir().unwrap();
+            let model = directory.path().join("relu.onnx");
+            fs::write(&model, RELU).unwrap();
+
+            assert!(device::load_directml(&directory.path().join("onnxruntime.dll")).is_err());
+            initialize_from(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("binaries/onnxruntime/x86_64/onnxruntime.dll"),
+            )
+            .unwrap();
+            let mut device = SessionDevice::cpu();
+            device.status.directml = true;
+            let session = InferenceSession::open(model, &device).unwrap();
+            assert!(!session.status().unwrap().directml);
+            assert!(
+                session
+                    .status()
+                    .unwrap()
+                    .fallback
+                    .unwrap()
+                    .contains("初始化失败")
+            );
+            assert_eq!(
+                session.run(smoke_input(), None, smoke_output).unwrap(),
+                [0., 0., 3.]
+            );
+
+            // Simulate an execution failure with a session whose graph expects a different input.
+            let mut wrong_input = RELU.to_vec();
+            for byte in &mut wrong_input {
+                if *byte == b'x' {
+                    *byte = b'a';
+                }
+            }
+            let wrong_model = directory.path().join("other-input.onnx");
+            fs::write(&wrong_model, wrong_input).unwrap();
+            {
+                let mut active = session.active.lock().unwrap();
+                active.session = Some(super::super::session(&wrong_model, &device, false).unwrap());
+                active.status.directml = true;
+            }
+            assert_eq!(
+                session.run(smoke_input(), None, smoke_output).unwrap(),
+                [0., 0., 3.]
+            );
+            assert!(!session.status().unwrap().directml);
+            assert!(
+                session
+                    .status()
+                    .unwrap()
+                    .fallback
+                    .unwrap()
+                    .contains("推理失败")
+            );
+            assert_eq!(
+                session.run(smoke_input(), None, smoke_output).unwrap(),
+                [0., 0., 3.]
+            );
+        }
+
+        #[test]
+        #[ignore = "requires Windows hardware GPU and prepared DirectML runtime"]
+        fn bundled_directml_inference_smoke() {
+            let directory = tempfile::tempdir().unwrap();
+            let model = directory.path().join("relu.onnx");
+            fs::write(&model, RELU).unwrap();
+            device::load_directml(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("binaries/onnxruntime/directml/x86_64/onnxruntime.dll"),
+            )
+            .unwrap();
+            let mut device = SessionDevice::cpu();
+            device.status.directml = true;
+            device.profile_dir = Some(directory.path().to_path_buf());
+            let session = InferenceSession::open(model, &device).unwrap();
+            assert_eq!(
+                session.run(smoke_input(), None, smoke_output).unwrap(),
+                [0., 0., 3.]
+            );
+            super::super::super::device_tests::assert_directml_profile(&session.end_profile());
+        }
+    }
+
     #[test]
     fn rejects_invalid_vectors() {
         assert!(normalize(vec![0.0; DIM]).is_err());

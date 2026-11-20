@@ -71,6 +71,23 @@ class RuntimeTests(unittest.TestCase):
                 runtime.prepare("Linux", "x86_64")
         self.assertFalse((self.archive.parent / "src-tauri/binaries/onnxruntime").exists())
 
+    def test_directml_installs_only_the_x64_windows_redistributable_and_licenses(self):
+        with zipfile.ZipFile(self.archive, "w") as source:
+            for name in ("bin/x64-win/DirectML.dll", "bin/arm64-win/DirectML.dll",
+                         "bin/x64-win/DirectML.Debug.dll", "LICENSE.txt", "LICENSE-CODE.txt",
+                         "ThirdPartyNotices.txt"):
+                source.writestr(name, name)
+        self.assertEqual(runtime.extract_directml(self.archive), {
+            "DirectML.dll": b"bin/x64-win/DirectML.dll",
+            "DirectML-LICENSE.txt": b"LICENSE.txt",
+            "DirectML-LICENSE-CODE.txt": b"LICENSE-CODE.txt",
+            "DirectML-ThirdPartyNotices.txt": b"ThirdPartyNotices.txt",
+        })
+        with zipfile.ZipFile(self.archive, "w") as source:
+            source.writestr("bin/x64-win/DirectML.dll", b"native")
+        with self.assertRaisesRegex(RuntimeError, "Incomplete DirectML"):
+            runtime.extract_directml(self.archive)
+
 
 class WindowsRuntimeTests(unittest.TestCase):
     def test_staging_rejects_missing_dll_and_copies_only_installer_resources(self):

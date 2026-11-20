@@ -1,5 +1,6 @@
 //! Local-only Chinese photo search. Network access is confined to model installation.
 pub(crate) mod catalog;
+pub(crate) mod device;
 pub(crate) mod download;
 pub(crate) mod inference;
 mod model;
@@ -9,7 +10,7 @@ pub(crate) mod index_policy;
 mod packages;
 pub(crate) mod people_model;
 
-// CPU-heavy indexing jobs share one slot; browsing remains independent.
+// Indexing jobs share one slot; browsing remains independent.
 pub(crate) static ANALYSIS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) use model::*;
@@ -25,7 +26,7 @@ pub(crate) fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// Wait without blocking cancellation while another indexer uses the CPU.
+/// Wait without blocking cancellation while another indexer is running.
 pub(crate) fn analysis_slot(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<std::sync::MutexGuard<'static, ()>>, String> {
@@ -56,3 +57,6 @@ mod scheduling_tests {
 
 #[cfg(test)]
 mod model_options_tests;
+
+#[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+pub(crate) mod device_tests;

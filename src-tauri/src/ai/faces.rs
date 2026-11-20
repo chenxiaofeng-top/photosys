@@ -1,17 +1,18 @@
-//! YuNet (BGR 640 square) and SFace (aligned RGB 112 square) CPU inference.
-use super::{error, inference};
+//! YuNet face detection and SFace or AuraFace recognition.
+use super::{
+    device::{SessionDevice, SessionStatus},
+    error,
+    inference::InferenceSession,
+};
 use image::{
     RgbImage,
     codecs::jpeg::JpegEncoder,
     imageops::{self, FilterType},
 };
-use ort::{session::Session, value::Tensor};
+use ort::{session::SessionOutputs, value::Tensor};
 use std::{
     path::Path,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 #[cfg(test)]
 pub(crate) const DIM: usize = 128;
@@ -39,8 +40,8 @@ pub(crate) struct Detection {
     pub score: f32,
 }
 pub(crate) struct FaceRuntime {
-    detector: Mutex<Session>,
-    recognizer: Mutex<Session>,
+    detector: InferenceSession,
+    recognizer: InferenceSession,
     pub(crate) spec: &'static super::catalog::ModelSpec,
 }
 #[cfg(test)]
@@ -152,22 +153,38 @@ impl FaceRuntime {
         directory: &Path,
         spec: &'static super::catalog::ModelSpec,
     ) -> Result<Self, String> {
+        Self::load_with_device(directory, spec, &SessionDevice::cpu())
+    }
+    pub(crate) fn load_with_device(
+        directory: &Path,
+        spec: &'static super::catalog::ModelSpec,
+        device: &SessionDevice,
+    ) -> Result<Self, String> {
         let runtime = Self {
             spec,
-            detector: Mutex::new(inference::session(
-                &directory.join("face_detection_yunet_2023mar.onnx"),
-            )?),
-            recognizer: Mutex::new(inference::session(&directory.join(
-                if spec.backend == "auraface" {
+            detector: InferenceSession::open(
+                directory.join("face_detection_yunet_2023mar.onnx"),
+                device,
+            )?,
+            recognizer: InferenceSession::open(
+                directory.join(if spec.backend == "auraface" {
                     "glintr100.onnx"
                 } else {
                     "face_recognition_sface_2021dec.onnx"
-                },
-            ))?),
+                }),
+                device,
+            )?,
         };
         runtime.detect(&RgbImage::new(640, 640))?;
         runtime.encode(&RgbImage::from_pixel(112, 112, image::Rgb([127, 127, 127])))?;
         Ok(runtime)
+    }
+    pub(super) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
+        Ok(vec![self.detector.status()?, self.recognizer.status()?])
+    }
+    #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+    pub(crate) fn end_profiles(&self) -> Vec<String> {
+        vec![self.detector.end_profile(), self.recognizer.end_profile()]
     }
     pub(crate) fn detect(&self, image: &RgbImage) -> Result<Vec<Detection>, String> {
         let scale = (EDGE as f32 / image.width() as f32).min(EDGE as f32 / image.height() as f32);
@@ -184,9 +201,20 @@ impl FaceRuntime {
                 pixels[c * EDGE * EDGE + y as usize * EDGE + x as usize] = p[2 - c] as f32;
             }
         }
-        let mut session = self.detector.lock().map_err(error)?;
-        let input = Tensor::from_array(([1, 3, EDGE, EDGE], pixels)).map_err(error)?;
-        let out = session.run(ort::inputs!["input"=>input]).map_err(error)?;
+        let input = Tensor::from_array(([1, 3, EDGE, EDGE], pixels))
+            .map_err(error)?
+            .into_dyn();
+        self.detector
+            .run(vec![("input".into(), input)], None, |out| {
+                Self::decode_detections(out, w, h, scale)
+            })
+    }
+    fn decode_detections(
+        out: SessionOutputs<'_>,
+        w: u32,
+        h: u32,
+        scale: f32,
+    ) -> Result<Vec<Detection>, String> {
         let mut detections = Vec::new();
         for stride in [8usize, 16, 32] {
             let cls = out[format!("cls_{stride}")]
@@ -279,18 +307,20 @@ impl FaceRuntime {
                 };
             }
         }
-        let mut session = self.recognizer.lock().map_err(error)?;
-        let input = Tensor::from_array(([1usize, 3, 112, 112], pixels)).map_err(error)?;
-        let name = session.inputs()[0].name().to_owned();
-        let out = session.run(vec![(name, input)]).map_err(error)?;
-        normalize_dim(
-            out[0]
-                .try_extract_tensor::<f32>()
-                .map_err(error)?
-                .1
-                .to_vec(),
-            self.spec.dimension,
-        )
+        let input = Tensor::from_array(([1usize, 3, 112, 112], pixels))
+            .map_err(error)?
+            .into_dyn();
+        let name = self.recognizer.inputs()[0].clone();
+        self.recognizer.run(vec![(name, input)], None, |out| {
+            normalize_dim(
+                out[0]
+                    .try_extract_tensor::<f32>()
+                    .map_err(error)?
+                    .1
+                    .to_vec(),
+                self.spec.dimension,
+            )
+        })
     }
     pub(crate) fn analyze(
         &self,
@@ -367,6 +397,7 @@ mod tests {
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+    use crate::ai::inference;
     #[test]
     #[ignore = "requires PHOTOSYS_PEOPLE_REFERENCE from verify-people-reference.py"]
     fn real_model_face_reference() {

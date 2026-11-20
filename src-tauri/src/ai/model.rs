@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, ipc::Channel};
 use tauri_plugin_dialog::DialogExt;
 
+#[cfg(test)]
+use super::inference;
 use super::{
+    device::{self, SessionDevice, SessionStatus},
     download, error,
-    inference::{self, Runtime},
+    inference::Runtime,
 };
 
 pub(crate) static PEOPLE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -152,11 +155,23 @@ fn stamps(directory: &Path) -> Result<Vec<(u64, std::time::SystemTime)>, String>
 }
 
 pub(crate) fn runtime(app: &AppHandle) -> Result<Arc<Runtime>, String> {
-    runtime_for(app, super::catalog::active(ModelKind::Search))
+    runtime_for(app, super::catalog::active(ModelKind::Search), true)
 }
+
+pub(super) fn inference_status() -> Result<Vec<SessionStatus>, String> {
+    let loaded = LOADED.lock().map_err(error)?;
+    match loaded.as_ref() {
+        Some(model) if model.runtime.spec.id == super::catalog::active(ModelKind::Search).id => {
+            model.runtime.inference_status()
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 fn runtime_for(
     app: &AppHandle,
     spec: &'static super::catalog::ModelSpec,
+    prefer_device: bool,
 ) -> Result<Arc<Runtime>, String> {
     let base = selected_directory(app)?.ok_or("请先选择模型目录并安装模型。")?;
     regular_directory(&base)?;
@@ -164,15 +179,20 @@ fn runtime_for(
     regular_directory(&directory)?;
     let current = super::packages::stamps(&directory, &spec.assets)?;
     let mut loaded = LOADED.lock().map_err(error)?;
-    if let Some(model) = loaded.as_ref()
+    if prefer_device
+        && let Some(model) = loaded.as_ref()
         && model.directory == directory
         && model.stamps == current
     {
         return Ok(model.runtime.clone());
     }
     verify_spec(&directory, spec)?;
-    inference::initialize(app)?;
-    let runtime = Arc::new(Runtime::load_spec(&directory, spec)?);
+    let runtime = Arc::new(if prefer_device {
+        Runtime::load_with_device(&directory, spec, &SessionDevice::preferred(app)?)?
+    } else {
+        device::initialize(app)?;
+        Runtime::load_spec(&directory, spec)?
+    });
     // Inspecting an inactive model must not evict the active model or keep both resident.
     if spec.id == super::catalog::active(ModelKind::Search).id {
         *loaded = Some(Loaded {
@@ -180,6 +200,7 @@ fn runtime_for(
             stamps: current,
             runtime: runtime.clone(),
         });
+        device::notify(app);
     }
     Ok(runtime)
 }
@@ -226,7 +247,7 @@ fn status_for(
             value.message = Some("正在安装模型…".into());
         } else {
             if base.join(spec.id).exists() {
-                match runtime_for(app, spec) {
+                match runtime_for(app, spec, spec.id == active.id) {
                     Ok(_) => value.ready = true,
                     Err(e) => value.message = Some(e),
                 }
@@ -299,6 +320,7 @@ pub(crate) async fn ai_set_model_directory(
         temp.persist(&config).map_err(error)?;
         MODEL_GENERATION.fetch_add(1, Ordering::Relaxed);
         *LOADED.lock().map_err(|_| "模型状态异常。")? = None;
+        device::notify(&app);
         status(&app, true)
     })
     .await
@@ -365,12 +387,13 @@ fn install_spec(
         channel,
         include_str!("../../../scripts/AI-MODEL-NOTICES.md"),
         || {
-            inference::initialize(app)?;
+            device::initialize(app)?;
             Runtime::load_spec(&base.join(format!(".{}.partial", spec.id)), spec)
         },
         || {
             if spec.id == super::catalog::active(ModelKind::Search).id {
                 *LOADED.lock().map_err(error)? = None;
+                device::notify(app);
             }
             Ok(())
         },
@@ -474,7 +497,7 @@ pub(crate) async fn ai_activate_model(
         let _task = TASK.try_lock().map_err(|_| "请等待模型安装结束。")?;
         let _index = crate::library::ai_search::stop_and_wait()?;
         // Validate before committing. On failure the selection and old cache survive.
-        let runtime = runtime_for(&app, spec)?;
+        let runtime = runtime_for(&app, spec, true)?;
         let base = selected_directory(&app)?.ok_or("缺少模型目录。")?;
         let directory = base.join(spec.id);
         let stamps = super::packages::stamps(&directory, &spec.assets)?;
@@ -485,6 +508,7 @@ pub(crate) async fn ai_activate_model(
             directory,
             runtime,
         });
+        device::notify(&app);
         status_for(&app, true, spec)
     })
     .await

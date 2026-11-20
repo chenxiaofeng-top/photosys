@@ -72,6 +72,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             ai::initialize_choices(app.handle()).map_err(std::io::Error::other)?;
+            ai::device::initialize_settings(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -90,6 +91,8 @@ pub fn run() {
             maps::offline_map_delete,
             maps::offline_map_read,
             ai::catalog::ai_model_catalog,
+            ai::device::ai_inference_status,
+            ai::device::ai_set_inference_preference,
             ai::ai_activate_model,
             ai::ai_model_change_impact,
             ai::ai_open_model_source,

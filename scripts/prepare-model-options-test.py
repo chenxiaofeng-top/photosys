@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and verify all five pinned CPU model packages for opt-in native tests.
+"""Download and verify all five pinned ONNX model packages for opt-in native tests.
 No user photos are accessed. Python is a developer/CI dependency only.
 """
 import argparse
@@ -14,7 +14,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("directory", type=Path)
 parser.add_argument("--model-id", action="append", help="download selected IDs instead of all five")
 args = parser.parse_args()
-catalog = json.loads((Path(__file__).parent / "ai-model-catalog.json").read_text())
+catalog = json.loads((Path(__file__).parent / "ai-model-catalog.json").read_text(encoding="utf-8"))
 if args.model_id and set(args.model_id) - {m["id"] for m in catalog}:
     parser.error("Unknown model ID")
 

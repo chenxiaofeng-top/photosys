@@ -1,9 +1,9 @@
 //! Independent face model selection and verified installation.
 use super::{
     catalog::{self, ModelSpec},
+    device::{self, SessionDevice, SessionStatus},
     error,
     faces::FaceRuntime,
-    inference,
     model::{
         self, InstallProgress, ModelKind, ModelStatus, PEOPLE_GENERATION, Source,
         regular_directory, regular_file,
@@ -43,30 +43,51 @@ fn selected(app: &AppHandle) -> Result<Option<PathBuf>, String> {
     }
 }
 pub(crate) fn runtime(app: &AppHandle) -> Result<Arc<FaceRuntime>, String> {
-    runtime_for(app, catalog::active(ModelKind::People))
+    runtime_for(app, catalog::active(ModelKind::People), true)
 }
-fn runtime_for(app: &AppHandle, spec: &'static ModelSpec) -> Result<Arc<FaceRuntime>, String> {
+
+pub(super) fn inference_status() -> Result<Vec<SessionStatus>, String> {
+    let loaded = LOADED.lock().map_err(error)?;
+    match loaded.as_ref() {
+        Some(model) if model.runtime.spec.id == catalog::active(ModelKind::People).id => {
+            model.runtime.inference_status()
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn runtime_for(
+    app: &AppHandle,
+    spec: &'static ModelSpec,
+    prefer_device: bool,
+) -> Result<Arc<FaceRuntime>, String> {
     let base = selected(app)?.ok_or("请先选择人物模型目录并安装模型。")?;
     regular_directory(&base)?;
     let directory = base.join(spec.id);
     regular_directory(&directory)?;
     let stamps = packages::stamps(&directory, &spec.assets)?;
     let mut loaded = LOADED.lock().map_err(error)?;
-    if let Some(l) = loaded.as_ref()
+    if prefer_device
+        && let Some(l) = loaded.as_ref()
         && l.directory == directory
         && l.stamps == stamps
     {
         return Ok(l.runtime.clone());
     }
     model::verify_spec(&directory, spec)?;
-    inference::initialize(app)?;
-    let runtime = Arc::new(FaceRuntime::load_spec(&directory, spec)?);
+    let runtime = Arc::new(if prefer_device {
+        FaceRuntime::load_with_device(&directory, spec, &SessionDevice::preferred(app)?)?
+    } else {
+        device::initialize(app)?;
+        FaceRuntime::load_spec(&directory, spec)?
+    });
     if spec.id == catalog::active(ModelKind::People).id {
         *loaded = Some(Loaded {
             directory,
             stamps,
             runtime: runtime.clone(),
         });
+        device::notify(app);
     }
     Ok(runtime)
 }
@@ -92,7 +113,7 @@ pub(crate) fn status_for(app: &AppHandle, spec: &'static ModelSpec) -> Result<Mo
             .sum();
         if let Ok(_task) = TASK.try_lock() {
             if base.join(spec.id).exists() {
-                match runtime_for(app, spec) {
+                match runtime_for(app, spec, spec.id == active.id) {
                     Ok(_) => value.ready = true,
                     Err(e) => value.message = Some(e),
                 }
@@ -126,6 +147,7 @@ pub(crate) fn set_directory(app: &AppHandle, directory: &str) -> Result<ModelSta
     temp.persist(config).map_err(error)?;
     PEOPLE_GENERATION.fetch_add(1, Ordering::Relaxed);
     *LOADED.lock().map_err(error)? = None;
+    device::notify(app);
     drop(task);
     status_for(app, catalog::active(ModelKind::People))
 }
@@ -157,12 +179,13 @@ pub(crate) fn install_spec(
         channel,
         include_str!("../../../scripts/PEOPLE-MODEL-NOTICES.md"),
         || {
-            inference::initialize(app)?;
+            device::initialize(app)?;
             FaceRuntime::load_spec(&base.join(format!(".{}.partial", spec.id)), spec)
         },
         || {
             if spec.id == catalog::active(ModelKind::People).id {
                 *LOADED.lock().map_err(error)? = None;
+                device::notify(app);
             }
             Ok(())
         },
@@ -174,7 +197,7 @@ pub(crate) fn install_spec(
 pub(crate) fn activate(app: &AppHandle, spec: &'static ModelSpec) -> Result<ModelStatus, String> {
     let task = TASK.try_lock().map_err(|_| "请等待人物模型安装结束。")?;
     let _index = crate::library::people::stop_and_wait()?;
-    let runtime = runtime_for(app, spec)?;
+    let runtime = runtime_for(app, spec, true)?;
     let directory = selected(app)?.ok_or("缺少模型目录。")?.join(spec.id);
     let stamps = packages::stamps(&directory, &spec.assets)?;
     model::persist_choice(app, spec)?;
@@ -184,6 +207,7 @@ pub(crate) fn activate(app: &AppHandle, spec: &'static ModelSpec) -> Result<Mode
         stamps,
         runtime,
     });
+    device::notify(app);
     drop(task);
     status_for(app, spec)
 }

@@ -663,6 +663,73 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires real models, an OpenCV test portrait, and a Windows hardware GPU"]
+fn real_directml_people_reuses_cpu_index_and_manual_identity() {
+    use ai::device_tests::{assert_directml_profiles, benchmark_indexes, directml_test_device};
+    let _session = TEST_SESSION.lock().unwrap();
+    let models = std::path::PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_DIR").unwrap());
+    let portrait =
+        std::path::PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_PORTRAIT").unwrap());
+    let spec = ai::catalog::default_model(ai::ModelKind::People);
+    let model = models.join(spec.id);
+    let profiles = tempfile::tempdir().unwrap();
+    let device = directml_test_device(profiles.path());
+    let cpu = Arc::new(FaceRuntime::load_spec(&model, spec).unwrap());
+    let album = tempfile::tempdir().unwrap();
+    fs::copy(&portrait, album.path().join("a.jpg")).unwrap();
+    let id = open(album.path());
+    let progress = Channel::new(|_| Ok(()));
+    assert_eq!(
+        update(id, false, &progress, || Ok(cpu.clone()))
+            .unwrap()
+            .indexed,
+        1
+    );
+    let person = query::people(id, "", 0).unwrap().items[0].id;
+    let face = query::faces(id, FaceScope::Person, Some(person), None, 0)
+        .unwrap()
+        .items[0]
+        .id;
+    Store::open(&scan(id).unwrap(), true)
+        .unwrap()
+        .unwrap()
+        .edit(Edit::Assign {
+            face_ids: vec![face],
+            person_id: None,
+            name: Some("样例人物".into()),
+        })
+        .unwrap();
+    let named = query::people(id, "样例人物", 0).unwrap().items[0].id;
+
+    let gpu = Arc::new(FaceRuntime::load_with_device(&model, spec, &device).unwrap());
+    fs::copy(&portrait, album.path().join("b.jpg")).unwrap();
+    let id = open(album.path());
+    let added = update(id, true, &progress, || Ok(gpu.clone())).unwrap();
+    assert_eq!((added.indexed, added.reused, added.failed), (2, 1, 0));
+    assert!(!added.needs_rebuild);
+    let same = update(id, true, &progress, || Ok(cpu.clone())).unwrap();
+    assert_eq!(same.reused, 2);
+    let person = &query::people(id, "样例人物", 0).unwrap().items[0];
+    assert_eq!(person.id, named);
+    assert_eq!(person.photo_count, 2);
+    assert!(
+        query::faces(id, FaceScope::Person, Some(named), None, 0)
+            .unwrap()
+            .items
+            .iter()
+            .any(|entry| entry.id == face)
+    );
+    benchmark_indexes(&portrait, |path, use_gpu| {
+        let runtime = if use_gpu { &gpu } else { &cpu };
+        let result = update(open(path), false, &progress, || Ok(runtime.clone())).unwrap();
+        (result.indexed, result.failed)
+    });
+    assert_directml_profiles(gpu.end_profiles());
+    *session().unwrap() = None;
+}
+
 #[test]
 #[ignore = "requires PHOTOSYS_PEOPLE_MODEL_DIR and PHOTOSYS_PEOPLE_PACKAGE"]
 fn real_faces_install_incremental_cancel_and_restore() {
