@@ -10,10 +10,10 @@ use std::{fs, path::Path, time::Duration};
 pub(super) struct Store {
     pub connection: Connection,
 }
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 const SCHEMA:&str="
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0,important INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS media(path BLOB PRIMARY KEY,stamp BLOB NOT NULL,rotation INTEGER NOT NULL,version TEXT NOT NULL,error TEXT);
 CREATE TABLE IF NOT EXISTS faces(id INTEGER PRIMARY KEY AUTOINCREMENT,path BLOB NOT NULL,bbox TEXT NOT NULL,confidence REAL NOT NULL,vector BLOB,thumbnail BLOB NOT NULL,person_id INTEGER REFERENCES people(id),manual INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,review INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS faces_path ON faces(path,active);
@@ -36,6 +36,8 @@ struct PersonState {
     archived: bool,
     #[serde(default)]
     ignored: bool,
+    #[serde(default)]
+    important: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct FaceState {
@@ -64,6 +66,10 @@ pub(crate) enum Edit {
     Rename {
         person_id: i64,
         name: String,
+    },
+    SetImportant {
+        person_id: i64,
+        important: bool,
     },
     Merge {
         source_id: i64,
@@ -168,6 +174,12 @@ impl Store {
                 if !Self::has_column(c, "people", "ignored")? {
                     c.execute_batch(
                         "ALTER TABLE people ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;",
+                    )
+                    .map_err(error)?;
+                }
+                if !Self::has_column(c, "people", "important")? {
+                    c.execute_batch(
+                        "ALTER TABLE people ADD COLUMN important INTEGER NOT NULL DEFAULT 0;",
                     )
                     .map_err(error)?;
                 }
@@ -379,7 +391,7 @@ impl Store {
     fn person(&self, id: i64) -> Result<PersonState, String> {
         self.connection
             .query_row(
-                "SELECT id,name,archived,ignored FROM people WHERE id=?1 AND archived=0",
+                "SELECT id,name,archived,ignored,important FROM people WHERE id=?1 AND archived=0",
                 [id],
                 |r| {
                     Ok(PersonState {
@@ -387,6 +399,7 @@ impl Store {
                         name: r.get(1)?,
                         archived: r.get(2)?,
                         ignored: r.get(3)?,
+                        important: r.get(4)?,
                     })
                 },
             )
@@ -424,17 +437,17 @@ impl Store {
     pub fn edit(&mut self, edit: Edit) -> Result<(), String> {
         self.edit_checked(edit, |_| Ok(()))
     }
-    pub fn edit_checked(
+    pub fn edit_checked<T>(
         &mut self,
         edit: Edit,
-        check: impl FnOnce(&Self) -> Result<(), String>,
+        check: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<(), String> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(error)?;
-        check(self)?;
+        let _validated = check(self)?;
         self.apply(edit)?;
         tx.commit().map_err(error)
     }
@@ -453,6 +466,30 @@ impl Store {
                     .map_err(error)?;
                 description = "修改人物名称";
             }
+            Edit::SetImportant {
+                person_id,
+                important,
+            } => {
+                let previous = self.person(person_id)?;
+                if previous.ignored {
+                    return Err("请先恢复该人物。".into());
+                }
+                if previous.important == important {
+                    return Ok(());
+                }
+                undo.people.push(previous);
+                self.connection
+                    .execute(
+                        "UPDATE people SET important=?2 WHERE id=?1",
+                        params![person_id, important],
+                    )
+                    .map_err(error)?;
+                description = if important {
+                    "标记重要人物"
+                } else {
+                    "取消重要人物标记"
+                };
+            }
             Edit::Merge {
                 source_id,
                 target_id,
@@ -464,6 +501,11 @@ impl Store {
                 let target = self.person(target_id)?;
                 if source.ignored || target.ignored {
                     return Err("请先恢复已忽略的人物再合并。".into());
+                }
+                if source.important && !target.important {
+                    self.connection
+                        .execute("UPDATE people SET important=1 WHERE id=?1", [target_id])
+                        .map_err(error)?;
                 }
                 undo.people.extend([source, target]);
                 let mut q = self
@@ -666,8 +708,8 @@ impl Store {
         let u: Undo = serde_json::from_str(&json).map_err(error)?;
         for p in u.people {
             tx.execute(
-                "UPDATE people SET name=?2,archived=?3,ignored=?4 WHERE id=?1",
-                params![p.id, p.name, p.archived, p.ignored],
+                "UPDATE people SET name=?2,archived=?3,ignored=?4,important=?5 WHERE id=?1",
+                params![p.id, p.name, p.archived, p.ignored, p.important],
             )
             .map_err(error)?;
         }

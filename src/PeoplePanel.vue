@@ -4,6 +4,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
 import PeopleGroupingSettings from "./PeopleGroupingSettings.vue";
+import PeopleSimilaritySearch from "./PeopleSimilaritySearch.vue";
 import { personName, type Page, type Person, type PeopleStatus } from "./people";
 const props = defineProps<{ scanId: number; libraryBusy: boolean; selected?: Person; revision: number }>();
 const emit = defineEmits<{ select: [person: Person | undefined]; changed: []; preview: [fileId: number]; status: [status: PeopleStatus] }>();
@@ -18,6 +19,10 @@ const indexTask = ref(false);
 const cancelling = ref(false);
 const saving = ref(false);
 const groupingBusy = ref(false);
+const similarityBusy = ref(false);
+const similarityPerson = shallowRef<Person>();
+const selectedDetails = shallowRef<Person>();
+const activePerson = computed(() => selectedDetails.value?.id === props.selected?.id ? selectedDetails.value : props.selected);
 const loading = ref(false);
 const scope = ref<"people" | "pending" | "ignoredPeople" | "ignoredFaces">("people");
 const unnamedOnly = ref(false);
@@ -35,7 +40,7 @@ const issues = shallowRef<Page<{ path: string; reason: string }>>();
 let request = 0;
 let mounted = true;
 const running = computed(() => indexTask.value || !!state.value?.running);
-const editDisabled = computed(() => props.libraryBusy || saving.value || groupingBusy.value || !state.value?.writable);
+const editDisabled = computed(() => props.libraryBusy || saving.value || groupingBusy.value || similarityBusy.value || !state.value?.writable);
 const ignoredScope = computed(() => scope.value === "ignoredPeople" || scope.value === "ignoredFaces");
 const listScope = computed(() => scope.value === "people" || scope.value === "ignoredPeople");
 function setState(value: PeopleStatus) { if (value.scanId === props.scanId && mounted) { state.value = value; emit("status", value); } }
@@ -63,6 +68,7 @@ watch(() => props.libraryBusy, busy => { if (!busy) void refresh(true); });
 watch(() => props.scanId, (id, old) => {
   request++; indexTask.value = false; state.value = undefined; error.value = ""; page.value = 0; scope.value = "people"; search.value = ""; committedSearch.value = ""; issuesOpen.value = false; issuePage.value = 0; cancelling.value = false;
   unnamedOnly.value = false; singlePhotoOnly.value = false; managedHidden.value = undefined; dispositionMessage.value = "";
+  selectedDetails.value = undefined; similarityPerson.value = undefined;
   if (old !== undefined) void invoke("people_cancel_index", { scanId: old }).catch(() => {});
   if (id !== undefined) void refresh(true);
 }, { immediate: true });
@@ -71,23 +77,49 @@ watch(() => props.revision, () => { void refresh(); });
 watch(search, (_, __, cleanup) => { const timer = setTimeout(() => { committedSearch.value = search.value; page.value = 0; }, 250); cleanup(() => clearTimeout(timer)); });
 watch(scope, () => { search.value = ""; committedSearch.value = ""; managedHidden.value = undefined; dispositionMessage.value = ""; }, { flush: "sync" });
 watch([scope, unnamedOnly, singlePhotoOnly], () => { page.value = 0; }, { flush: "sync" });
-watch([() => props.scanId, () => props.revision, scope, unnamedOnly, singlePhotoOnly, committedSearch, page], async (_, __, cleanup) => {
+const listQuery = computed(() => {
+  const ignored = scope.value === "ignoredPeople";
+  return {
+    scanId: props.scanId, query: committedSearch.value, page: page.value,
+    filter: { ignored, unnamedOnly: !ignored && unnamedOnly.value, singlePhotoOnly: !ignored && singlePhotoOnly.value, importantFirst: !ignored },
+  };
+});
+watch([listQuery, () => props.revision], async ([query], [previous], cleanup) => {
   let current = true; cleanup(() => { current = false; });
-  selectedIds.value = []; people.value = undefined;
+  selectedIds.value = [];
+  if (query !== previous) people.value = undefined;
   if (!listScope.value) { loading.value = false; return; }
   loading.value = true;
-  const hidden = scope.value === "ignoredPeople";
   try {
-    const value = await invoke<Page<Person>>("people_list", {
-      scanId: props.scanId, query: committedSearch.value, page: page.value,
-      filter: { ignored: hidden, unnamedOnly: !hidden && unnamedOnly.value, singlePhotoOnly: !hidden && singlePhotoOnly.value },
-    });
+    const value = await invoke<Page<Person>>("people_list", query);
     if (current) people.value = value;
   }
   catch (cause) { if (current && !props.libraryBusy) error.value = String(cause); }
   finally { if (current) loading.value = false; }
 }, { immediate: true });
-watch(() => props.selected, person => { rename.value = person?.name ?? ""; mergeTarget.value = ""; mergeSearch.value = ""; });
+watch(() => props.selected?.id, () => {
+  selectedDetails.value = undefined;
+  similarityPerson.value = undefined;
+  rename.value = props.selected?.name ?? "";
+  mergeTarget.value = "";
+  mergeSearch.value = "";
+});
+watch([() => props.selected?.id, () => props.scanId, () => props.revision], async ([personId, scanId], _, cleanup) => {
+  if (personId === undefined) return;
+  let current = true;
+  cleanup(() => { current = false; });
+  try {
+    const result = await invoke<Page<Person>>("people_list", {
+      scanId, query: "", page: 0, filter: { personId },
+    });
+    if (!current) return;
+    if (!result.items.length) emit("select", undefined);
+    else selectedDetails.value = result.items[0];
+  } catch (cause) {
+    if (current && !props.libraryBusy) error.value = String(cause);
+  }
+});
+watch(() => activePerson.value?.name, name => { rename.value = name ?? ""; });
 watch([() => props.scanId, mergeSearch, () => props.revision], (_, __, cleanup) => {
   let current = true; mergeTarget.value = "";
   const timer = setTimeout(async () => {
@@ -107,13 +139,28 @@ async function mutate(kind: "rename" | "merge" | "undo") {
     if (kind === "undo") await invoke("people_undo", { scanId });
     else await invoke("people_edit", { scanId, edit: kind === "rename" ? { kind, personId: person!.id, name: rename.value } : { kind, sourceId: person!.id, targetId: Number(mergeTarget.value) } });
     if (scanId === props.scanId) {
-      if (kind === "rename") emit("select", { ...person!, name: rename.value.trim() });
-      else emit("select", undefined);
+      if (kind === "merge") emit("select", undefined);
       if (kind === "undo") managedHidden.value = undefined;
       emit("changed");
     }
   } catch (cause) { if (scanId === props.scanId) error.value = String(cause); }
   finally { saving.value = false; }
+}
+async function setImportant(person: Person) {
+  if (editDisabled.value) return;
+  const scanId = props.scanId;
+  saving.value = true;
+  error.value = "";
+  try {
+    await invoke("people_edit", {
+      scanId, edit: { kind: "setImportant", personId: person.id, important: !person.important },
+    });
+    if (mounted && scanId === props.scanId) emit("changed");
+  } catch (cause) {
+    if (mounted && scanId === props.scanId) error.value = String(cause);
+  } finally {
+    saving.value = false;
+  }
 }
 async function setPeopleIgnored(personIds: number[], ignored: boolean) {
   if (editDisabled.value || !personIds.length) return;
@@ -141,11 +188,11 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
 <template>
   <section class="people-panel" aria-label="人物相册">
     <section class="analysis-settings" aria-label="人物分析与模型设置">
-    <AiSearchSettings model-kind="people" :scan-id="scanId" :library-busy="libraryBusy" :people-status="state" :analysis-busy="running || groupingBusy" @model-ready="ready = $event" @model-changed="request++; indexTask = false; cancelling = false; refresh(false); emit('changed')" @rebuild="updateIndex(false)" />
+    <AiSearchSettings model-kind="people" :scan-id="scanId" :library-busy="libraryBusy" :people-status="state" :analysis-busy="running || groupingBusy || similarityBusy" @model-ready="ready = $event" @model-changed="request++; indexTask = false; cancelling = false; similarityPerson = undefined; refresh(false); emit('changed')" @rebuild="updateIndex(false)" />
     <div class="people-actions">
       <span role="status">{{ state?.queued ? '排队中 · ' : running ? '正在分析 · ' : '' }}已分析 {{ state?.indexed ?? 0 }} / {{ state?.total ?? 0 }} 张照片<span v-if="state?.pending"> · 待处理 {{ state.pending }} 张</span><span v-if="state?.failed"> · 失败 {{ state.failed }} 张</span></span>
       <button v-if="running" type="button" class="secondary" :disabled="cancelling" @click="cancel">{{ cancelling ? '正在停止…' : '停止分析' }}</button>
-      <button v-else type="button" :disabled="!ready || libraryBusy || groupingBusy || !state?.writable" @click="updateIndex(false)">{{ state?.needsRebuild ? '重建人物索引' : state?.enabled ? '更新分析 / 重试失败项' : '建立人物索引' }}</button>
+      <button v-else type="button" :disabled="!ready || libraryBusy || groupingBusy || similarityBusy || !state?.writable" @click="updateIndex(false)">{{ state?.needsRebuild ? '重建人物索引' : state?.enabled ? '更新分析 / 重试失败项' : '建立人物索引' }}</button>
       <button v-if="!selected" type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>
     </div>
     <progress v-if="running && state?.total" :value="state.indexed + state.failed" :max="state.total" aria-label="人物分析进度"></progress>
@@ -153,19 +200,33 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
     <p v-if="state?.message" class="notice" role="status">{{ state.message }}</p>
     <p v-if="state && !state.writable" class="notice">此相册只读，可以浏览已有的人物和时间线。</p>
     <PeopleGroupingSettings v-if="state?.groupingSettings" :scan-id="scanId" :settings="state.groupingSettings"
-      :pending="state.pendingFaces" :revision="revision" :writable="state.writable" :busy="running || libraryBusy || saving"
+      :pending="state.pendingFaces" :revision="revision" :writable="state.writable" :busy="running || libraryBusy || saving || similarityBusy"
       @changed="emit('changed')" @working="groupingBusy = $event" @preview="emit('preview', $event)" />
     </section>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="dispositionMessage" role="status">{{ dispositionMessage }}</p>
-    <template v-if="selected">
-      <div class="people-actions detail-title"><button type="button" class="secondary" @click="emit('select', undefined)">返回人物列表</button><h2>{{ personName(selected) }}</h2><button type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button></div>
+    <template v-if="activePerson">
+      <div class="people-actions detail-title">
+        <button type="button" class="secondary" :disabled="similarityBusy" @click="emit('select', undefined)">返回人物列表</button>
+        <h2>{{ personName(activePerson) }}</h2>
+        <button type="button" class="secondary" :aria-pressed="!!activePerson.important" :disabled="editDisabled" @click="setImportant(activePerson)">
+          {{ activePerson.important ? '取消重要人物标记' : '标记为重要人物' }}
+        </button>
+        <button type="button" class="secondary" :aria-expanded="!!similarityPerson" :disabled="!state || libraryBusy || groupingBusy || similarityBusy"
+          @click="similarityPerson = similarityPerson ? undefined : activePerson">
+          {{ similarityPerson ? '关闭相似人脸' : '找相似人脸' }}
+        </button>
+        <button type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>
+      </div>
+      <PeopleSimilaritySearch v-if="similarityPerson" :scan-id="scanId" :person="similarityPerson" :revision="revision"
+        :default-threshold="state?.groupingSettings?.parameters.threshold ?? 0.65" :writable="state?.writable ?? false"
+        :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @working="similarityBusy = $event" @preview="emit('preview', $event)" />
       <details class="person-management"><summary>修改分组 / 管理人物与人脸</summary>
         <form class="people-actions" @submit.prevent="mutate('rename')"><label>人物名称 <input v-model="rename" maxlength="80" placeholder="例如：妈妈" :disabled="editDisabled" /></label><button type="submit" :disabled="editDisabled">保存名称</button></form>
-        <button type="button" class="secondary" :disabled="editDisabled" @click="setPeopleIgnored([selected.id], true)">忽略此人</button>
-        <div class="people-actions"><label>查找合并目标 <input v-model="mergeSearch" maxlength="80" placeholder="输入另一人物的名称" /></label><label>合并到 <select v-model="mergeTarget" :disabled="editDisabled"><option value="">选择人物</option><option v-for="p in mergeTargets?.items.filter(p => p.id !== selected!.id)" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option></select></label><button type="button" class="secondary" :disabled="editDisabled || !mergeTarget" @click="mutate('merge')">合并人物</button></div>
+        <button type="button" class="secondary" :disabled="editDisabled" @click="setPeopleIgnored([activePerson.id], true)">忽略此人</button>
+        <div class="people-actions"><label>查找合并目标 <input v-model="mergeSearch" maxlength="80" placeholder="输入另一人物的名称" /></label><label>合并到 <select v-model="mergeTarget" :disabled="editDisabled"><option value="">选择人物</option><option v-for="p in mergeTargets?.items.filter(p => p.id !== activePerson!.id)" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option></select></label><button type="button" class="secondary" :disabled="editDisabled || !mergeTarget" @click="mutate('merge')">合并人物</button></div>
         <p class="muted">勾选误分的人脸，可移入已有人物或拆成新人物；同一人的重复分组可合并。人工修改优先，后续自动分析不会覆盖，可撤销。</p>
-        <PeopleFaceEditor :scan-id="scanId" :person-id="selected.id" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
+        <PeopleFaceEditor :scan-id="scanId" :person-id="activePerson.id" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy || similarityBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
       </details>
     </template>
     <template v-else>
@@ -208,6 +269,11 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
             <img v-if="person.thumbnail" :src="person.thumbnail" :alt="personName(person)" width="112" height="112" loading="lazy" /><span v-else class="avatar-placeholder" aria-hidden="true">人</span>
             <strong>{{ personName(person) }}</strong><span>{{ person.photoCount }} 张照片</span>
             </button>
+            <button v-if="scope === 'people' && (state?.writable || person.important)" type="button" class="secondary important-action"
+              :aria-label="`${person.important ? '取消重要人物标记' : '标记为重要人物'} ${personName(person)}`"
+              :aria-pressed="!!person.important" :disabled="editDisabled" @click="setImportant(person)">
+              {{ person.important ? '★ 重要人物' : '☆ 标记重要' }}
+            </button>
           </li>
         </ul>
         <nav v-if="people && people.total > 24" class="people-actions" aria-label="人物分页"><button type="button" class="secondary" :disabled="loading || people.page === 0" @click="page = people!.page - 1">上一页</button><span>{{ people.page + 1 }} / {{ Math.ceil(people.total / 24) }}</span><button type="button" class="secondary" :disabled="loading || (people.page + 1) * 24 >= people.total" @click="page = people!.page + 1">下一页</button></nav>
@@ -227,7 +293,9 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
 .people-panel input:not([type=checkbox]), .people-panel select { min-height: 40px; max-width: 100%; box-sizing: border-box; padding: .5rem .75rem; border: 1px solid var(--control-border); border-radius: .5rem; background: var(--surface); color: var(--text); font: inherit; }
 .people-search input { width: min(24rem, 100%); }
 .person-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 170px),1fr)); gap: 12px; padding: 0; margin: 24px 0; list-style: none; }
-.person-item { position: relative; border-radius: 12px; }
+.person-item { position: relative; border-radius: 12px; text-align: center; }
+.important-action { max-width: 100%; padding-inline: .75rem; font-size: .875rem; }
+.important-action[aria-pressed=true] { color: var(--accent); font-weight: 600; }
 .person-item.checked { background: var(--accent-soft); }
 .person-checkbox { position: absolute; z-index: 1; inset-block-start: .625rem; inset-inline-start: .625rem; width: 1.125rem; height: 1.125rem; accent-color: var(--accent); }
 .person-card { display: flex; width: 100%; flex-direction: column; align-items: center; gap: 12px; padding: 24px 12px; background: transparent; border: 1px solid transparent; border-radius: 12px; color: var(--text); }

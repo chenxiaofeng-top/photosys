@@ -81,13 +81,14 @@ pub(super) fn with<T>(
                 .map_err(error)?;
             let geometry = store.geometry_expression()?;
             let schema_version = store.schema_version()?;
-            let ignored = if schema_version >= super::SCHEMA_VERSION {
-                "ignored"
+            let ignored = if schema_version >= 3 { "ignored" } else { "0" };
+            let important = if schema_version >= 4 {
+                "important"
             } else {
                 "0"
             };
             store.connection.execute_batch(&format!(
-                "CREATE TEMP VIEW person_groups AS SELECT id,name,archived,{ignored} AS ignored FROM main.people;"
+                "CREATE TEMP VIEW person_groups AS SELECT id,name,archived,{ignored} AS ignored,{important} AS important FROM main.people;"
             )).map_err(error)?;
             store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND ({geometry})='{GEOMETRY_VERSION}';")).map_err(error)?;
             store.connection.execute_batch(&format!("
@@ -157,6 +158,8 @@ pub(crate) struct PersonView {
     pub photo_count: usize,
     pub face_count: usize,
     pub thumbnail: Option<String>,
+    pub avatar_face_id: Option<i64>,
+    pub important: bool,
 }
 #[derive(Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -197,6 +200,8 @@ pub(crate) struct PeopleFilter {
     ignored: bool,
     unnamed_only: bool,
     single_photo_only: bool,
+    important_first: bool,
+    person_id: Option<i64>,
 }
 
 pub(super) fn people(
@@ -219,12 +224,14 @@ pub(super) fn people(
         const MATCH: &str = "FROM person_groups g WHERE g.archived=0 AND g.ignored=?2
             AND (?1='' OR instr(lower(g.name),lower(?1))>0) AND (?3=0 OR g.name='')
             AND (?4=0 OR (SELECT COUNT(*) FROM (SELECT DISTINCT path FROM visible_faces
-                WHERE person_id=g.id AND ignored=0 LIMIT 2))=1)";
+                WHERE person_id=g.id AND ignored=0 LIMIT 2))=1)
+            AND (?5 IS NULL OR g.id=?5)";
         let args = params![
             query.trim(),
             filter.ignored,
             filter.unnamed_only,
-            filter.single_photo_only
+            filter.single_photo_only,
+            filter.person_id
         ];
         let total = s
             .connection
@@ -233,7 +240,23 @@ pub(super) fn people(
             })
             .map_err(error)?;
         let (page, offset) = Page::<PersonView>::bounds(page, total);
-        let mut q=s.connection.prepare(&format!("WITH selected AS (SELECT g.id,g.name {MATCH} ORDER BY g.name='',g.name,g.id LIMIT 24 OFFSET ?5) SELECT p.id,p.name,(SELECT COUNT(DISTINCT path) FROM visible_faces WHERE person_id=p.id AND ignored=0),(SELECT COUNT(*) FROM visible_faces WHERE person_id=p.id AND ignored=0),(SELECT thumbnail FROM visible_faces WHERE person_id=p.id AND ignored=0 ORDER BY id LIMIT 1) FROM selected p ORDER BY p.name='',p.name,p.id")).map_err(error)?;
+        let mut q = s
+            .connection
+            .prepare(&format!(
+                "WITH selected AS (
+                SELECT g.id,g.name,g.important {MATCH}
+                ORDER BY (?7 AND g.important) DESC,g.name='',g.name,g.id LIMIT 24 OFFSET ?6
+             )
+             SELECT p.id,p.name,
+               (SELECT COUNT(DISTINCT path) FROM visible_faces WHERE person_id=p.id AND ignored=0),
+               (SELECT COUNT(*) FROM visible_faces WHERE person_id=p.id AND ignored=0),
+               avatar.thumbnail,avatar.id,p.important
+             FROM selected p LEFT JOIN faces avatar ON avatar.id=(
+                SELECT id FROM visible_faces WHERE person_id=p.id AND ignored=0 ORDER BY id LIMIT 1
+             )
+             ORDER BY (?7 AND p.important) DESC,p.name='',p.name,p.id"
+            ))
+            .map_err(error)?;
         let rows = q
             .query_map(
                 params![
@@ -241,7 +264,9 @@ pub(super) fn people(
                     filter.ignored,
                     filter.unnamed_only,
                     filter.single_photo_only,
-                    offset as i64
+                    filter.person_id,
+                    offset as i64,
+                    filter.important_first
                 ],
                 |r| {
                     Ok(PersonView {
@@ -250,6 +275,8 @@ pub(super) fn people(
                         photo_count: r.get::<_, i64>(2)? as usize,
                         face_count: r.get::<_, i64>(3)? as usize,
                         thumbnail: r.get::<_, Option<Vec<u8>>>(4)?.map(image),
+                        avatar_face_id: r.get(5)?,
+                        important: r.get(6)?,
                     })
                 },
             )

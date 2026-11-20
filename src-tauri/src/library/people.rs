@@ -1,6 +1,7 @@
 //! Local person metadata and resumable face analysis. Original media is never changed.
 mod grouping;
 mod query;
+mod similarity;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -563,6 +564,38 @@ pub(crate) async fn people_face_suggestions(
         validate_suggestion_selection(&face_ids)?;
         let _edit = lock_edits()?;
         grouping::suggestions(scan_id, &face_ids)
+    })
+    .await
+    .map_err(error)?
+}
+
+#[tauri::command]
+pub(crate) async fn people_similar_faces(
+    scan_id: u64,
+    criteria: similarity::Criteria,
+    page: usize,
+) -> Result<similarity::Results, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        similarity::search(scan_id, criteria, page)
+    })
+    .await
+    .map_err(error)?
+}
+
+#[tauri::command]
+pub(crate) async fn people_confirm_similar_faces(
+    scan_id: u64,
+    criteria: similarity::Criteria,
+    anchor_token: String,
+    selected: Vec<similarity::Selection>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        let _edit = lock_edits()?;
+        similarity::confirm(scan_id, criteria, &anchor_token, &selected)?;
+        EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     })
     .await
     .map_err(error)?

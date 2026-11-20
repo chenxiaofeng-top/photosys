@@ -184,8 +184,13 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
         c.prepare(sql)
             .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
     }
-    if name == "people.sqlite" && version == library::people::SCHEMA_VERSION {
-        c.prepare("SELECT ignored FROM people LIMIT 0")
+    if name == "people.sqlite" && version >= 3 {
+        let sql = if version >= 4 {
+            "SELECT ignored,important FROM people LIMIT 0"
+        } else {
+            "SELECT ignored FROM people LIMIT 0"
+        };
+        c.prepare(sql)
             .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
     }
     if name == "library.sqlite" {

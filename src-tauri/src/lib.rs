@@ -115,6 +115,8 @@ pub fn run() {
             library::people::people_list,
             library::people::people_faces,
             library::people::people_face_suggestions,
+            library::people::people_similar_faces,
+            library::people::people_confirm_similar_faces,
             library::people::people_photos,
             library::people::people_photo_people,
             library::people::people_months,

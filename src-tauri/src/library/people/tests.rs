@@ -473,6 +473,310 @@ fn assigned(store: &Store, id: i64) -> Option<i64> {
         .unwrap()
 }
 
+#[test]
+fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let _restore = RestorePeopleModel(ai::catalog::active(ai::ModelKind::People));
+    let spec = ai::catalog::default_model(ai::ModelKind::People);
+    ai::catalog::select(spec);
+    let album = tempfile::tempdir().unwrap();
+    for n in 0..10 {
+        RgbImage::new(2, 2)
+            .save(album.path().join(format!("{n}.png")))
+            .unwrap();
+    }
+    let id = open(album.path());
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    let mut ids = Vec::new();
+    for (item, similarities) in scan.items.iter().zip([
+        vec![1., 1.],
+        vec![0.90],
+        vec![0.80],
+        vec![0.64],
+        vec![1.],
+        vec![1.],
+        vec![1.],
+        vec![1.],
+        vec![0.7, 0.7],
+        vec![0.2],
+    ]) {
+        let found = similarities
+            .into_iter()
+            .map(|score: f32| model_face(spec, &[score, (1. - score * score).sqrt()]))
+            .collect();
+        ids.push(
+            store
+                .save(
+                    &favorites::path_key(&item.file.relative),
+                    &item.file.stamp.portable_key(),
+                    0,
+                    &Ok(found),
+                )
+                .unwrap(),
+        );
+    }
+    for (faces, name) in [
+        (vec![ids[0][0]], "目标"),
+        (vec![ids[2][0], ids[9][0]], "另一个分组"),
+        (vec![ids[6][0]], "已忽略人物"),
+    ] {
+        store
+            .edit(Edit::Assign {
+                face_ids: faces,
+                person_id: None,
+                name: Some(name.into()),
+            })
+            .unwrap();
+    }
+    let target = assigned(&store, ids[0][0]).unwrap();
+    let other = assigned(&store, ids[2][0]).unwrap();
+    store
+        .edit(Edit::Ignore {
+            face_ids: vec![ids[5][0]],
+        })
+        .unwrap();
+    store
+        .edit(Edit::IgnorePeople {
+            person_ids: vec![assigned(&store, ids[6][0]).unwrap()],
+        })
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO rejections VALUES(?1,?2)",
+            params![ids[4][0], target],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE media SET version='old' WHERE path=(SELECT path FROM faces WHERE id=?1)",
+            [ids[7][0]],
+        )
+        .unwrap();
+
+    let target_view = query::people(id, "目标", 0, Default::default())
+        .unwrap()
+        .items
+        .remove(0);
+    assert_eq!(target_view.avatar_face_id, Some(ids[0][0]));
+    let mut criteria = similarity::Criteria {
+        target_person_id: target,
+        anchor_face_id: ids[0][0],
+        threshold: 0.85,
+    };
+    let search = |criteria| tauri::async_runtime::block_on(people_similar_faces(id, criteria, 0));
+    let results = search(criteria).unwrap();
+    assert_eq!(results.faces.total, 1);
+    assert_eq!(results.faces.items[0].face_id, ids[1][0]);
+
+    criteria.threshold = 0.60;
+    let results = search(criteria).unwrap();
+    let found: Vec<_> = results
+        .faces
+        .items
+        .iter()
+        .map(|face| face.face_id)
+        .collect();
+    assert_eq!(
+        found,
+        [ids[1][0], ids[2][0], ids[8][0], ids[8][1], ids[3][0]]
+    );
+    assert_eq!(results.faces.items[1].source_person_id, Some(other));
+    assert!((results.faces.items[1].score - 0.8).abs() < 0.001);
+    assert!(
+        query::with(id, |store| store
+            .unwrap()
+            .connection
+            .is_readonly("main")
+            .map_err(error))
+        .unwrap()
+    );
+
+    let confirm = |positions: &[usize]| {
+        let selected = positions
+            .iter()
+            .map(|&position| {
+                let face = &results.faces.items[position];
+                similarity::Selection {
+                    face_id: face.face_id,
+                    token: face.token.clone(),
+                }
+            })
+            .collect();
+        tauri::async_runtime::block_on(people_confirm_similar_faces(
+            id,
+            criteria,
+            results.anchor_token.clone(),
+            selected,
+        ))
+    };
+    assert!(confirm(&[2, 3]).is_err());
+    store
+        .edit(Edit::Assign {
+            face_ids: vec![ids[2][0]],
+            person_id: None,
+            name: None,
+        })
+        .unwrap();
+    assert!(confirm(&[0, 1]).is_err());
+    assert_eq!(assigned(&store, ids[1][0]), None);
+    store.undo().unwrap();
+
+    confirm(&[0, 1]).unwrap();
+    assert_eq!(assigned(&store, ids[1][0]), Some(target));
+    assert_eq!(assigned(&store, ids[2][0]), Some(target));
+    assert_eq!(assigned(&store, ids[9][0]), Some(other));
+    assert_eq!(assigned(&store, ids[3][0]), None);
+    assert!(
+        store
+            .connection
+            .query_row("SELECT manual FROM faces WHERE id=?1", [ids[1][0]], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        query::photos(id, target, &all(), Sort::DateAsc, 0)
+            .unwrap()
+            .total,
+        3
+    );
+    tauri::async_runtime::block_on(people_undo(id)).unwrap();
+    assert_eq!(
+        query::photos(id, target, &all(), Sort::DateAsc, 0)
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(assigned(&store, ids[2][0]), Some(other));
+
+    #[cfg(windows)]
+    {
+        let path = album.path().join(".photosys/people.sqlite");
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        let visible = search(criteria);
+        let write = confirm(&[0]);
+        fs::set_permissions(&path, original).unwrap();
+        assert_eq!(visible.unwrap().faces.total, 5);
+        assert!(write.is_err());
+        assert_eq!(assigned(&store, ids[1][0]), None);
+    }
+
+    session()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_rotation(id, results.faces.items[0].file_id, 90)
+        .unwrap();
+    assert!(confirm(&[0]).is_err());
+    assert!(
+        search(criteria)
+            .unwrap()
+            .faces
+            .items
+            .iter()
+            .all(|face| face.face_id != ids[1][0])
+    );
+
+    let alternative = ai::catalog::find(ai::ModelKind::People, "yunet-auraface-fp32-v1").unwrap();
+    ai::catalog::select(alternative);
+    assert!(confirm(&[1]).is_err());
+    assert!(search(criteria).is_err());
+    ai::catalog::select(spec);
+
+    let reopened = open(album.path());
+    assert_ne!(id, reopened);
+    let old = &results.faces.items[1];
+    assert!(
+        tauri::async_runtime::block_on(people_confirm_similar_faces(
+            reopened,
+            criteria,
+            results.anchor_token.clone(),
+            vec![similarity::Selection {
+                face_id: old.face_id,
+                token: old.token.clone()
+            }],
+        ))
+        .is_err()
+    );
+    assert_eq!(assigned(&store, ids[2][0]), Some(other));
+
+    let second_album = tempfile::tempdir().unwrap();
+    open(second_album.path());
+    assert!(confirm(&[1]).is_err());
+}
+
+#[test]
+fn important_people_are_prioritized_and_survive_migration_merge_and_undo() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let album = tempfile::tempdir().unwrap();
+    RgbImage::new(2, 2)
+        .save(album.path().join("portrait.png"))
+        .unwrap();
+    let id = open(album.path());
+    let ids = save(id);
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    for (face_id, name) in [(ids[0], "A"), (ids[1], "Z")] {
+        store
+            .edit(Edit::Assign {
+                face_ids: vec![face_id],
+                person_id: None,
+                name: Some(name.into()),
+            })
+            .unwrap();
+    }
+    let first = assigned(&store, ids[0]).unwrap();
+    let second = assigned(&store, ids[1]).unwrap();
+    store
+        .connection
+        .execute_batch("ALTER TABLE people DROP COLUMN important; PRAGMA user_version=3;")
+        .unwrap();
+    drop(store);
+    let list = || {
+        let filter = serde_json::from_value(serde_json::json!({ "importantFirst": true })).unwrap();
+        query::people(id, "", 0, filter).unwrap().items
+    };
+    assert_eq!(list()[0].id, first);
+    assert!(!list()[1].important);
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    assert_eq!(store.schema_version().unwrap(), 4);
+    store
+        .edit(Edit::SetImportant {
+            person_id: second,
+            important: true,
+        })
+        .unwrap();
+    drop(store);
+    query::close_for_test();
+    assert_eq!(list()[0].id, second);
+    assert!(list()[0].important);
+    let exact = serde_json::from_value(serde_json::json!({ "personId": first })).unwrap();
+    assert_eq!(query::people(id, "", 0, exact).unwrap().items[0].id, first);
+
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store
+        .edit(Edit::Merge {
+            source_id: second,
+            target_id: first,
+        })
+        .unwrap();
+    assert_eq!(list().len(), 1);
+    assert!(list()[0].important);
+    store.undo().unwrap();
+    assert_eq!(list()[0].id, second);
+    assert!(!list()[1].important);
+    store.undo().unwrap();
+    assert_eq!(list()[0].id, first);
+    assert!(!list()[1].important);
+    *session().unwrap() = None;
+}
+
 fn suggested_people(scan_id: u64, ids: &[i64]) -> std::collections::HashMap<i64, Vec<i64>> {
     let result =
         tauri::async_runtime::block_on(people_face_suggestions(scan_id, ids.to_vec())).unwrap();

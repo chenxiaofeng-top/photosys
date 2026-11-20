@@ -45,7 +45,16 @@ fn same_sql(path: &Path, sql: &str) -> String {
 #[test]
 fn all_databases_round_trip_and_media_and_unknown_files_are_unchanged() {
     let temp = tempfile::tempdir().unwrap();
-    let source = album(&temp.path().join("原相册"), true);
+    let source_path = temp.path().join("原相册");
+    let source = album(&source_path, true);
+    Connection::open(source_path.join(".photosys/people.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE people ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE people ADD COLUMN important INTEGER NOT NULL DEFAULT 0;
+            UPDATE people SET important=1; PRAGMA user_version=4;",
+        )
+        .unwrap();
     let zip = temp.path().join("数据库备份.zip");
     export(&source, &zip, |_| {}).unwrap();
     let info = inspect_file(&zip);
@@ -86,6 +95,13 @@ fn all_databases_round_trip_and_media_and_unknown_files_are_unchanged() {
     assert_eq!(
         same_sql(&data.join("people.sqlite"), "SELECT name FROM people"),
         "妈妈"
+    );
+    assert_eq!(
+        same_sql(
+            &data.join("people.sqlite"),
+            "SELECT CAST(important AS TEXT) FROM people"
+        ),
+        "1"
     );
     assert_eq!(
         same_sql(
