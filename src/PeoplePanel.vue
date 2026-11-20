@@ -95,7 +95,7 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
     <section class="analysis-settings" aria-label="人物分析与模型设置">
     <AiSearchSettings model-kind="people" :scan-id="scanId" :library-busy="libraryBusy" :people-status="state" :analysis-busy="running" @model-ready="ready = $event" @model-changed="request++; indexTask = false; cancelling = false; refresh(false); emit('changed')" @rebuild="updateIndex(false)" />
     <div class="people-actions">
-      <span role="status">{{ running ? '正在分析 / 等待其他 AI 任务 · ' : '' }}已分析 {{ state?.indexed ?? 0 }} / {{ state?.total ?? 0 }} 张照片<span v-if="state?.pending"> · 待处理 {{ state.pending }} 张</span><span v-if="state?.failed"> · 失败 {{ state.failed }} 张</span></span>
+      <span role="status">{{ state?.queued ? '排队中 · ' : running ? '正在分析 · ' : '' }}已分析 {{ state?.indexed ?? 0 }} / {{ state?.total ?? 0 }} 张照片<span v-if="state?.pending"> · 待处理 {{ state.pending }} 张</span><span v-if="state?.failed"> · 失败 {{ state.failed }} 张</span></span>
       <button v-if="running" type="button" class="secondary" :disabled="cancelling" @click="cancel">{{ cancelling ? '正在停止…' : '停止分析' }}</button>
       <button v-else type="button" :disabled="!ready || libraryBusy || !state?.writable" @click="updateIndex(false)">{{ state?.needsRebuild ? '重建人物索引' : state?.enabled ? '更新分析 / 重试失败项' : '建立人物索引' }}</button>
       <button v-if="!selected" type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>

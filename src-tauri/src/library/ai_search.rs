@@ -18,6 +18,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::ai::DIM;
+use crate::ai::indexing::{Active, Mode, Permit, Run, Stage};
 use crate::ai::{self, FEATURE_VERSION, MODEL_GENERATION, error};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -26,24 +27,15 @@ pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, Stri
     SERIAL.lock().map_err(error)
 }
 
-static ACTIVE: Mutex<Option<(u64, Arc<AtomicBool>)>> = Mutex::new(None);
+static ACTIVE: Active = Active::new();
 
 pub(crate) fn cancel_all() {
-    if let Ok(active) = ACTIVE.lock()
-        && let Some((_, cancel)) = active.as_ref()
-    {
-        cancel.store(true, Ordering::Relaxed);
-    }
+    ACTIVE.cancel(None);
 }
 
 #[tauri::command]
 pub(crate) fn ai_cancel_index(scan_id: u64) {
-    if let Ok(active) = ACTIVE.lock()
-        && let Some((id, cancel)) = active.as_ref()
-        && *id == scan_id
-    {
-        cancel.store(true, Ordering::Relaxed);
-    }
+    ACTIVE.cancel(Some(scan_id));
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -52,17 +44,20 @@ pub(crate) struct IndexStatus {
     scan_id: u64,
     enabled: bool,
     running: bool,
+    queued: bool,
     total: usize,
-    indexed: usize,
-    failed: usize,
+    pub(super) indexed: usize,
+    pub(super) failed: usize,
     pending: usize,
-    reused: usize,
+    pub(super) reused: usize,
     writable: bool,
     message: Option<String>,
     model_id: &'static str,
     needs_rebuild: bool,
     rebuild_reason: Option<String>,
 }
+
+type IndexEntry = (Vec<u8>, Vec<u8>, u16, Result<Vec<f32>, String>);
 
 struct Cache {
     connection: Connection,
@@ -144,10 +139,7 @@ impl Cache {
             .map_err(error)
     }
 
-    fn save(
-        &mut self,
-        entries: &[(Vec<u8>, Vec<u8>, u16, Result<Vec<f32>, String>)],
-    ) -> Result<(), String> {
+    fn save(&mut self, entries: &[IndexEntry]) -> Result<(), String> {
         let transaction = self.connection.transaction().map_err(error)?;
         for (path, stamp, rotation, result) in entries {
             let (vector, issue) = match result {
@@ -244,11 +236,7 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         writable: is_writable(&scan),
         ..Default::default()
     };
-    status.running = ACTIVE
-        .lock()
-        .map_err(error)?
-        .as_ref()
-        .is_some_and(|(id, _)| *id == scan_id);
+    (status.running, status.queued) = ACTIVE.status(scan_id)?;
     match Cache::open(&scan, false) {
         Ok(Some(cache)) => {
             status.enabled = cache.enabled()?;
@@ -342,22 +330,79 @@ pub(super) fn decode(
     Ok(image)
 }
 
-struct ActiveGuard;
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE.lock() {
-            *active = None;
-        }
+pub(super) fn decode_with_slot(
+    scan: &Scan,
+    item: &Item,
+    cancel: &AtomicBool,
+    run: &Run,
+) -> Option<Result<(image::RgbImage, Permit<'static>), String>> {
+    match ai::indexing::image_slot(cancel) {
+        Ok(Some(permit)) => Some(
+            run.measure(Stage::Decode, || decode(scan, item, cancel))
+                .map(|image| (image, permit)),
+        ),
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
     }
 }
 
+fn save_current_batch(
+    scan_id: u64,
+    generation: u64,
+    cache: &mut Cache,
+    batch: &mut Vec<(usize, IndexEntry)>,
+    state: &mut IndexStatus,
+) -> Result<(), String> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let guard = session()?;
+    let Ok(library) = current(&guard, scan_id) else {
+        batch.clear();
+        return Ok(());
+    };
+    let model_current = generation == MODEL_GENERATION.load(Ordering::Relaxed);
+    let mut valid = Vec::with_capacity(batch.len());
+    for (file_id, entry) in batch.drain(..) {
+        if model_current && library.rotations.get(&file_id).copied().unwrap_or(0) == entry.2 {
+            valid.push(entry);
+        } else if entry.3.is_ok() {
+            state.indexed -= 1;
+        } else {
+            state.failed -= 1;
+        }
+    }
+    // Keep the rotation snapshot valid through the bounded SQLite commit.
+    let result = cache.save(&valid);
+    drop(guard);
+    result
+}
+
+#[cfg(test)]
 fn update(
     scan_id: u64,
     automatic: bool,
     progress: &Channel<IndexStatus>,
     load_model: impl FnOnce() -> Result<Arc<ai::inference::Runtime>, String>,
 ) -> Result<IndexStatus, String> {
+    update_with_run(
+        scan_id,
+        automatic,
+        progress,
+        &Mode::Pipeline.into(),
+        load_model,
+    )
+}
+
+pub(super) fn update_with_run(
+    scan_id: u64,
+    automatic: bool,
+    progress: &Channel<IndexStatus>,
+    run: &Run,
+    load_model: impl FnOnce() -> Result<Arc<ai::inference::Runtime>, String>,
+) -> Result<IndexStatus, String> {
     let _serial = SERIAL.lock().map_err(error)?;
+    let mode = run.mode.for_active_models();
     let scan = scan(scan_id)?;
     let initial = status(scan_id)?;
     if automatic && (!initial.enabled || !initial.writable || initial.needs_rebuild) {
@@ -367,16 +412,38 @@ fn update(
         return Err("此相册的 AI 索引不可写，已有索引仍可用于搜索。".into());
     }
     let generation = MODEL_GENERATION.load(Ordering::Relaxed);
-    let cancel = Arc::new(AtomicBool::new(false));
-    *ACTIVE.lock().map_err(error)? = Some((scan_id, cancel.clone()));
-    let _active = ActiveGuard;
+    let active = ACTIVE.start(scan_id)?;
+    let cancel = &active.job.cancel;
     let mut state = initial;
     state.running = true;
-    let _ = progress.send(state.clone());
-    let Some(_analysis) = ai::analysis_slot(&cancel)? else {
+    let Some(_analysis) = mode.admit(&active.job, || {
+        state.queued = true;
+        let _ = progress.send(state.clone());
+    })?
+    else {
+        drop(active);
         return status(scan_id);
     };
-    let runtime = load_model()?;
+    state.queued = false;
+    let _ = progress.send(state.clone());
+    let interrupted = || {
+        cancel.load(Ordering::Relaxed)
+            || generation != MODEL_GENERATION.load(Ordering::Relaxed)
+            || super::scan(scan_id).is_err()
+    };
+    if interrupted() {
+        drop(active);
+        return status(scan_id);
+    }
+    let Some(runtime) = mode.infer(cancel, load_model)? else {
+        drop(active);
+        return status(scan_id);
+    };
+    let runtime = runtime?;
+    if interrupted() {
+        drop(active);
+        return status(scan_id);
+    }
     if runtime.spec.id != state.model_id {
         return Err("模型已变化，请重试索引。".into());
     }
@@ -391,17 +458,14 @@ fn update(
     state.rebuild_reason = None;
     let records = cache.records()?;
     let saved_rotations = rotations(scan_id)?;
-    let mut batch = Vec::new();
+    let mut jobs = Vec::new();
     state.indexed = 0;
     state.failed = 0;
     for item in scan.items.iter().filter(|i| eligible(i)) {
-        let path = favorites::path_key(&item.file.relative);
-        if cancel.load(Ordering::Relaxed)
-            || generation != MODEL_GENERATION.load(Ordering::Relaxed)
-            || super::scan(scan_id).is_err()
-        {
+        if interrupted() {
             break;
         }
+        let path = favorites::path_key(&item.file.relative);
         let rotation = saved_rotations.get(&item.file.id).copied().unwrap_or(0);
         if let Some(record) = records.get(&path).filter(|r| r.matches(item, rotation))
             && (record.indexed || automatic)
@@ -413,37 +477,69 @@ fn update(
                 state.failed += 1;
             }
         } else {
-            let result = decode(&scan, item, &cancel)
-                .and_then(|image| runtime.encode_image(image, rotation));
-            if cancel.load(Ordering::Relaxed)
-                || generation != MODEL_GENERATION.load(Ordering::Relaxed)
-            {
-                break;
-            }
-            // Never save a vector with an old rotation after an interactive edit.
-            if rotations(scan_id)?.get(&item.file.id).copied().unwrap_or(0) != rotation {
-                continue;
-            }
-            if result.is_ok() {
-                state.indexed += 1;
-            } else {
-                state.failed += 1;
-            }
-            batch.push((path, item.file.stamp.portable_key(), rotation, result));
+            jobs.push((item, path, rotation));
         }
-        // Keep completed vectors available to concurrent searches and resilient to interruption.
-        if batch.len() >= 8 {
-            cache.save(&batch)?;
-            batch.clear();
-        }
-        state.pending = state.total.saturating_sub(state.indexed + state.failed);
-        let _ = progress.send(state.clone());
     }
-    cache.save(&batch)?;
-    if !cancel.load(Ordering::Relaxed)
-        && generation == MODEL_GENERATION.load(Ordering::Relaxed)
-        && super::scan(scan_id).is_ok()
-    {
+    drop(records);
+    if !jobs.is_empty() && !interrupted() {
+        let mut batch = Vec::with_capacity(8);
+        mode.with_prepared(
+            jobs.into_iter(),
+            |(item, path, rotation)| {
+                if interrupted() {
+                    return None;
+                }
+                let input = decode_with_slot(&scan, item, cancel, run)?.map(|(image, _permit)| {
+                    run.measure(Stage::Prepare, || runtime.prepare_image(image, rotation))
+                });
+                Some((item, path, rotation, input))
+            },
+            |prepared| {
+                for (item, path, rotation, input) in prepared {
+                    if interrupted() {
+                        break;
+                    }
+                    let result = match input {
+                        Ok(input) => {
+                            let Some(result) = mode.infer(cancel, || {
+                                run.measure(Stage::Inference, || runtime.encode_pixels(input))
+                            })?
+                            else {
+                                break;
+                            };
+                            result
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if interrupted() {
+                        break;
+                    }
+                    if result.is_ok() {
+                        state.indexed += 1;
+                    } else {
+                        state.failed += 1;
+                    }
+                    batch.push((
+                        item.file.id,
+                        (path, item.file.stamp.portable_key(), rotation, result),
+                    ));
+                    if batch.len() == 8 {
+                        run.measure(Stage::Write, || {
+                            save_current_batch(
+                                scan_id, generation, &mut cache, &mut batch, &mut state,
+                            )
+                        })?;
+                    }
+                    state.pending = state.total.saturating_sub(state.indexed + state.failed);
+                    let _ = progress.send(state.clone());
+                }
+                run.measure(Stage::Write, || {
+                    save_current_batch(scan_id, generation, &mut cache, &mut batch, &mut state)
+                })
+            },
+        )?;
+    }
+    if !interrupted() {
         cache.prune(
             &scan
                 .items
@@ -454,7 +550,7 @@ fn update(
         )?;
     }
     let reused = state.reused;
-    drop(_active);
+    drop(active);
     let mut result = status(scan_id)?;
     result.reused = reused;
     Ok(result)
@@ -469,7 +565,13 @@ pub(crate) async fn ai_update_index(
 ) -> Result<IndexStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        update(scan_id, automatic, &progress, || ai::runtime(&app))
+        update_with_run(
+            scan_id,
+            automatic,
+            &progress,
+            &Mode::configured(&app).into(),
+            || ai::runtime(&app),
+        )
     })
     .await
     .map_err(error)?
@@ -797,6 +899,22 @@ static SEARCH_READER: Mutex<SearchReader> = Mutex::new(SearchReader {
 pub(crate) fn close_reader() -> Result<(), String> {
     *SEARCH_READER.lock().map_err(error)? = SearchReader::default();
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn benchmark_search(
+    runtime: &ai::inference::Runtime,
+    scan_id: u64,
+    filter: Filter,
+) -> impl FnMut(&str) -> Result<(), String> {
+    let mut reader = SearchReader::default();
+    move |query| {
+        reader
+            .search(scan_id, query, filter.clone(), 0, 24, |text| {
+                runtime.encode_text(text)
+            })
+            .map(drop)
+    }
 }
 
 impl SearchReader {

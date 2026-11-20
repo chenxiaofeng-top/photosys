@@ -102,3 +102,31 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml \
 本机已生成 Linux deb（约 35 MB）和 AppImage（约 204 MB），从两种安装包解出后，AI 运行时均成功加载；同时检查了运行时许可文件、现有 FFmpeg 和 AppImage 的 VPX 插件。权重不随安装包分发。AppImage 构建需 patchelf；不支持 FUSE 的构建环境使用 `APPIMAGE_EXTRACT_AND_RUN=1`。
 
 Intel macOS 使用上游 1.22.0 CPU 库，其他平台使用 1.24.2；Rust 绑定固定使用 C API 22。所有运行时均来自微软官方发布包，校验和固定，许可证随安装包提供，运行时遥测关闭。
+
+## 内容与人物索引并发基准
+
+基准每轮生成一个临时相册，包含 12 张单人 JPEG、12 张合成多人 JPEG、12 张图案 JPEG 和 4 张 48 MP HEIC。模型预热后，测量两种索引同时有任务时的总耗时、各阶段耗时、缩略图和内容查询 P95，以及无变化复扫。缩略图和查询计时覆盖原生处理流程。各模式使用同一套写入校验，同一后端的索引数据指纹可直接比较。
+
+2026-11-20 在 Windows x64 上用发布配置实测，Intel Core i7-9750H（12 个逻辑线程）、NVIDIA GTX 1650（4 GiB）。每组运行三轮。工作集为测试进程峰值，显存为采样期间整张 NVIDIA 显卡的峰值占用。
+
+| 后端与模式 | 两项总耗时中位数 | 缩略图 P95 | 搜索 P95 | 工作集 / 显存 |
+| --- | ---: | ---: | ---: | ---: |
+| CPU 逐张串行 | 20.993 s | 14.229 ms | 74.595 ms | 1081 MiB / — |
+| CPU 单任务流水线 | 18.465 s | 15.490 ms | 80.085 ms | 1220 MiB / — |
+| CPU 双任务 | 15.289 s | 20.477 ms | 100.700 ms | 1240 MiB / — |
+| DirectML 逐张串行 | 10.133 s | 14.467 ms | 28.296 ms | 1440 MiB / 881 MiB |
+| DirectML 单任务流水线 | 8.563 s | 19.176 ms | 33.756 ms | 1439 MiB / 881 MiB |
+| DirectML 双任务 | 6.592 s | 22.984 ms | 32.200 ms | 1465 MiB / 881 MiB |
+
+同一后端各模式均索引全部 40 张照片、检测到 48 个人脸，索引与人物归组指纹一致。无变化复扫复用全部结果，耗时 53–98 ms。CPU 双任务比单任务流水线节省 17.2%，缩略图和搜索 P95 分别增加 32.2% 和 25.7%，因此 CPU 默认使用单任务流水线。DirectML 双任务节省 23.0%，缩略图 P95 增加 19.9%，搜索 P95 下降 4.6%，达到发布门槛。首版默认开启范围限定为至少 12 个逻辑线程且实际使用 DirectML 的默认模型组合。
+
+在 PowerShell 中设置已下载模型的上级目录和肖像样本路径。每个后端和模式分别启动一个测试进程，内存测试可按输出的 PID 采样进程工作集，显存测试按实际推理适配器采样。`PHOTOSYS_AI_BENCHMARK_BACKEND` 可设为 `cpu` 或 `directml`，`PHOTOSYS_AI_BENCHMARK_MODE` 可设为 `serial`、`pipeline` 或 `concurrent`。每个组合默认运行三轮。
+
+```powershell
+$env:PHOTOSYS_MODEL_OPTIONS_DIR = 'D:\path\to\model-options'
+$env:PHOTOSYS_MODEL_OPTIONS_PORTRAIT = 'D:\path\to\portrait.jpg'
+$env:PHOTOSYS_AI_BENCHMARK_BACKEND = 'cpu'
+$env:PHOTOSYS_AI_BENCHMARK_MODE = 'concurrent'
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib benchmark_index_pipeline -- --ignored --nocapture --test-threads=1
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib maintenance_stops_both_indexes_and_preserves_completed_work -- --ignored --nocapture --test-threads=1
+```

@@ -283,7 +283,7 @@ defineExpose({ refreshIndex });
     <div class="ai-summary">
       <span class="ai-label"><ElIcon aria-hidden="true"><MagicStick /></ElIcon>本地 AI</span>
       <span class="model-status" :class="{ ready: model?.activeReady }" role="status">{{ modelTask ? '正在处理模型…' : model?.activeReady ? '当前模型已就绪' : '尚未安装可用模型' }}</span>
-      <span v-if="index" role="status">{{ indexTask ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
+      <span v-if="index" role="status">{{ index.queued ? '排队中 · ' : indexTask || index.running ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
       <ElButton v-if="indexTask" @click="cancelIndex">停止索引</ElButton>
       <ElButton v-else-if="!peopleModel && scanId !== undefined && model?.activeReady"
         :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.needsRebuild ? '重建内容索引' : index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>

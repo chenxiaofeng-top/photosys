@@ -21,6 +21,22 @@ pub(crate) enum Preference {
     Cpu,
 }
 
+pub(super) fn prefers_directml(app: &AppHandle) -> bool {
+    SUPPORTS_DIRECTML && app.state::<Settings>().current == Preference::Auto
+}
+
+pub(super) fn indexing_uses_directml() -> bool {
+    let (Ok(search), Ok(people)) = (
+        super::model::inference_status(),
+        super::people_model::inference_status(),
+    ) else {
+        return false;
+    };
+    // The other model may still be cold. A known CPU fallback keeps admission serial.
+    !(search.is_empty() && people.is_empty())
+        && search.iter().chain(&people).all(|session| session.directml)
+}
+
 struct Settings {
     current: Preference,
     saved: Mutex<Preference>,
@@ -171,7 +187,7 @@ fn initialized_runtime(app: &AppHandle) -> Result<SessionStatus, String> {
 
 fn select_runtime(app: &AppHandle) -> Result<SessionStatus, String> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let fallback = if app.state::<Settings>().current == Preference::Auto {
+    let fallback = if prefers_directml(app) {
         match load_directml(&runtime_path(
             app,
             "onnxruntime/directml/x86_64/onnxruntime.dll",

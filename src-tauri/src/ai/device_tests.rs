@@ -27,6 +27,12 @@ pub(super) fn assert_directml_profile(path: &str) {
 }
 
 pub(crate) fn directml_test_device(profile_dir: &Path) -> SessionDevice {
+    let mut device = directml_device();
+    device.profile_dir = Some(profile_dir.to_owned());
+    device
+}
+
+pub(crate) fn directml_device() -> SessionDevice {
     load_directml(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("binaries/onnxruntime/directml/x86_64/onnxruntime.dll"),
@@ -34,8 +40,22 @@ pub(crate) fn directml_test_device(profile_dir: &Path) -> SessionDevice {
     .unwrap();
     let mut device = SessionDevice::cpu();
     device.status.directml = true;
-    device.profile_dir = Some(profile_dir.to_owned());
     device
+}
+
+pub(crate) fn assert_directml_active(search: &Runtime, people: &FaceRuntime) {
+    let search = search.inference_status().unwrap();
+    let people = people.inference_status().unwrap();
+    assert!(
+        search.iter().chain(&people).all(|session| session.directml),
+        "DirectML fallback: {}",
+        search
+            .iter()
+            .chain(&people)
+            .filter_map(|session| session.fallback.as_deref())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
 }
 
 pub(crate) fn assert_directml_profiles(paths: Vec<String>) {
@@ -58,7 +78,10 @@ pub(crate) fn benchmark_indexes(
         let start = Instant::now();
         let (indexed, failed) = index(album.path(), gpu);
         assert_eq!((indexed, failed), (PHOTOS, 0));
-        println!("{label} fresh index: {:.2} photos/s ({indexed} photos)", indexed as f64 / start.elapsed().as_secs_f64());
+        println!(
+            "{label} fresh index: {:.2} photos/s ({indexed} photos)",
+            indexed as f64 / start.elapsed().as_secs_f64()
+        );
     }
 }
 

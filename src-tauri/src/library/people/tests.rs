@@ -3,7 +3,7 @@ use super::*;
 use crate::ai::faces::Face;
 use image::RgbImage;
 use rusqlite::params;
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::atomic::AtomicBool};
 fn face(axis: usize) -> Face {
     let mut v = vec![0.; faces::DIM];
     v[axis] = 1.;

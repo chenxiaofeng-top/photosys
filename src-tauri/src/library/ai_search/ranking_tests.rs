@@ -26,6 +26,62 @@ fn index_entry(cache: &mut Cache, item: &Item, rotation: u16, value: Result<Vec<
 }
 
 #[test]
+fn pending_index_batch_discards_results_after_rotation() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let album = tempfile::tempdir().unwrap();
+    for name in ["keep.png", "rotate.png"] {
+        image::RgbImage::new(2, 2)
+            .save(album.path().join(name))
+            .unwrap();
+    }
+    let id = super::super::open_directory(album.path().to_str().unwrap(), OpenMode::Select, |_| {})
+        .unwrap()
+        .scan_id;
+    let scan = scan(id).unwrap();
+    let mut cache = Cache::open(&scan, true).unwrap().unwrap();
+    let mut batch = scan
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.file.id,
+                (
+                    favorites::path_key(&item.file.relative),
+                    item.file.stamp.portable_key(),
+                    0,
+                    Ok(vec![1.; DIM]),
+                ),
+            )
+        })
+        .collect();
+    let rotated = scan
+        .items
+        .iter()
+        .find(|item| item.file.relative == Path::new("rotate.png"))
+        .unwrap();
+    tauri::async_runtime::block_on(super::super::set_library_rotation(id, rotated.file.id, 90))
+        .unwrap();
+    let mut state = IndexStatus {
+        indexed: 2,
+        ..Default::default()
+    };
+    save_current_batch(
+        id,
+        MODEL_GENERATION.load(Ordering::Relaxed),
+        &mut cache,
+        &mut batch,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.indexed, 1);
+    let records = cache.records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(records.contains_key(b"keep.png".as_slice()));
+    drop(cache);
+    *session().unwrap() = None;
+}
+
+#[test]
 fn search_reuses_ranking_and_refreshes_on_index_metadata_or_scan_changes() {
     let _session = TEST_SESSION.lock().unwrap();
     let album = tempfile::tempdir().unwrap();

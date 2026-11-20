@@ -19,6 +19,7 @@ export interface IndexStatus {
   scanId: number;
   enabled: boolean;
   running: boolean;
+  queued: boolean;
   total: number;
   indexed: number;
   failed: number;

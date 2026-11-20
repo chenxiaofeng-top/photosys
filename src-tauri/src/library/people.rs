@@ -9,6 +9,7 @@ use super::{Filter, Issue, ItemView, Page, Sort, current, favorites, scan, sessi
 use crate::ai::{
     self, PEOPLE_GENERATION as MODEL_GENERATION, error,
     faces::{self, FaceRuntime},
+    indexing::{Active, Mode, Run, Stage},
 };
 use query::{FaceScope, FaceView, Month, PersonView};
 use rusqlite::{OptionalExtension, params};
@@ -17,7 +18,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -32,7 +33,7 @@ pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, Stri
     cancel_all();
     SERIAL.lock().map_err(error)
 }
-static ACTIVE: Mutex<Option<(u64, Arc<AtomicBool>)>> = Mutex::new(None);
+static ACTIVE: Active = Active::new();
 static EDIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +41,7 @@ pub(crate) struct IndexStatus {
     pub scan_id: u64,
     pub enabled: bool,
     pub running: bool,
+    pub queued: bool,
     pub total: usize,
     pub indexed: usize,
     pub pending: usize,
@@ -56,28 +58,11 @@ pub(crate) struct IndexStatus {
     pub rebuild_reason: Option<String>,
 }
 pub(crate) fn cancel_all() {
-    if let Ok(a) = ACTIVE.lock()
-        && let Some((_, c)) = a.as_ref()
-    {
-        c.store(true, Ordering::Relaxed);
-    }
+    ACTIVE.cancel(None);
 }
 #[tauri::command]
 pub(crate) fn people_cancel_index(scan_id: u64) {
-    if let Ok(a) = ACTIVE.lock()
-        && let Some((id, c)) = a.as_ref()
-        && *id == scan_id
-    {
-        c.store(true, Ordering::Relaxed);
-    }
-}
-struct ActiveGuard;
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        if let Ok(mut a) = ACTIVE.lock() {
-            *a = None;
-        }
-    }
+    ACTIVE.cancel(Some(scan_id));
 }
 fn status(scan_id: u64) -> Result<IndexStatus, String> {
     let scan = scan(scan_id)?;
@@ -95,11 +80,7 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         writable: Store::writable(&scan),
         ..Default::default()
     };
-    state.running = ACTIVE
-        .lock()
-        .map_err(error)?
-        .as_ref()
-        .is_some_and(|(id, _)| *id == scan_id);
+    (state.running, state.queued) = ACTIVE.status(scan_id)?;
     if let Some(s) = Store::open(&scan, false)? {
         state.enabled = s.enabled()?;
         state.needs_rebuild = ai::index_policy::needs_rebuild(&s.connection, spec, faces::VERSION)?;
@@ -171,13 +152,25 @@ pub(crate) async fn people_index_status(scan_id: u64) -> Result<IndexStatus, Str
     .await
     .map_err(error)?
 }
+#[cfg(test)]
 fn update(
     scan_id: u64,
     automatic: bool,
     progress: &Channel<IndexStatus>,
     load: impl FnOnce() -> Result<Arc<FaceRuntime>, String>,
 ) -> Result<IndexStatus, String> {
+    update_with_run(scan_id, automatic, progress, &Mode::Pipeline.into(), load)
+}
+
+pub(super) fn update_with_run(
+    scan_id: u64,
+    automatic: bool,
+    progress: &Channel<IndexStatus>,
+    run: &Run,
+    load: impl FnOnce() -> Result<Arc<FaceRuntime>, String>,
+) -> Result<IndexStatus, String> {
     let _serial = SERIAL.lock().map_err(error)?;
+    let mode = run.mode.for_active_models();
     let scan = scan(scan_id)?;
     let mut state = status(scan_id)?;
     if automatic && (!state.enabled || !state.writable || state.needs_rebuild) {
@@ -186,22 +179,38 @@ fn update(
     if !state.writable {
         return Err("此相册的人物索引不可写，可以浏览已有结果。".into());
     }
-    let cancel = Arc::new(AtomicBool::new(false));
-    *ACTIVE.lock().map_err(error)? = Some((scan_id, cancel.clone()));
-    let _active = ActiveGuard;
+    let active = ACTIVE.start(scan_id)?;
+    let cancel = &active.job.cancel;
     state.running = true;
-    let _ = progress.send(state.clone());
-    let Some(_slot) = ai::analysis_slot(&cancel)? else {
-        drop(_active);
+    let Some(_slot) = mode.admit(&active.job, || {
+        state.queued = true;
+        let _ = progress.send(state.clone());
+    })?
+    else {
+        drop(active);
         return status(scan_id);
     };
-    if cancel.load(Ordering::Relaxed) {
-        drop(_active);
+    state.queued = false;
+    let _ = progress.send(state.clone());
+    let generation = MODEL_GENERATION.load(Ordering::Relaxed);
+    let interrupted = || {
+        cancel.load(Ordering::Relaxed)
+            || MODEL_GENERATION.load(Ordering::Relaxed) != generation
+            || super::scan(scan_id).is_err()
+    };
+    if interrupted() {
+        drop(active);
         return status(scan_id);
     }
-    super::scan(scan_id)?;
-    let generation = MODEL_GENERATION.load(Ordering::Relaxed);
-    let runtime = load()?;
+    let Some(runtime) = mode.infer(cancel, load)? else {
+        drop(active);
+        return status(scan_id);
+    };
+    let runtime = runtime?;
+    if interrupted() {
+        drop(active);
+        return status(scan_id);
+    }
     if runtime.spec.id != state.model_id {
         return Err("人物模型已变化，请重试。".into());
     }
@@ -226,12 +235,7 @@ fn update(
             EDIT_GENERATION.load(Ordering::Relaxed),
         )
     };
-    let interrupted = || {
-        cancel.load(Ordering::Relaxed)
-            || MODEL_GENERATION.load(Ordering::Relaxed) != generation
-            || super::scan(scan_id).is_err()
-    };
-    let mut last = Instant::now();
+    let mut jobs = Vec::new();
     for item in scan
         .items
         .iter()
@@ -246,7 +250,7 @@ fn update(
             && r.stamp == item.file.stamp.portable_key()
             && r.rotation == rotation
             && r.geometry_version == faces::GEOMETRY_VERSION
-            && r.version == ai::catalog::active(ai::ModelKind::People).feature_version
+            && r.version == runtime.spec.feature_version
             && (r.error.is_none() || automatic)
         {
             if r.error.is_none() {
@@ -256,39 +260,86 @@ fn update(
                 state.failed += 1;
             }
         } else {
-            let result = super::ai_search::decode(&scan, item, &cancel)
-                .and_then(|im| runtime.analyze(im, rotation, &cancel));
-            if interrupted() {
-                break;
-            }
-            let _edit = MUTATION.lock().map_err(error)?;
-            let latest = current(&*session()?, scan_id)?
-                .rotations
-                .get(&item.file.id)
-                .copied()
-                .unwrap_or(0);
-            if latest != rotation {
-                continue;
-            }
-            let ids = store.save_for_model(
-                &path,
-                &item.file.stamp.portable_key(),
-                rotation,
-                &result,
-                runtime.spec.feature_version,
-            )?;
-            assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, &ids)?;
-            if result.is_ok() {
-                state.indexed += 1;
-            } else {
-                state.failed += 1;
-            }
+            jobs.push((item, path, rotation));
         }
-        state.pending = state.total.saturating_sub(state.indexed + state.failed);
-        if last.elapsed().as_millis() >= 150 {
-            let _ = progress.send(state.clone());
-            last = Instant::now();
-        }
+    }
+    drop(records);
+    if !jobs.is_empty() && !interrupted() {
+        let mut last = Instant::now();
+        mode.with_prepared(
+            jobs.into_iter(),
+            |(item, path, rotation)| {
+                if interrupted() {
+                    return None;
+                }
+                let image = super::ai_search::decode_with_slot(&scan, item, cancel, run)?;
+                Some((item, path, rotation, image))
+            },
+            |prepared| {
+                for (item, path, rotation, image) in prepared {
+                    if interrupted() {
+                        break;
+                    }
+                    let result = match image {
+                        Ok((image, _permit)) => {
+                            let Some(result) = mode.infer(cancel, || {
+                                run.measure(Stage::Inference, || {
+                                    runtime.analyze(image, rotation, cancel)
+                                })
+                            })?
+                            else {
+                                break;
+                            };
+                            result
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let _edit = lock_edits()?;
+                    if interrupted() {
+                        break;
+                    }
+                    let guard = session()?;
+                    let Ok(library) = current(&guard, scan_id) else {
+                        break;
+                    };
+                    if library.rotations.get(&item.file.id).copied().unwrap_or(0) != rotation {
+                        continue;
+                    }
+                    let ids = run.measure(Stage::Write, || {
+                        store.save_for_model(
+                            &path,
+                            &item.file.stamp.portable_key(),
+                            rotation,
+                            &result,
+                            runtime.spec.feature_version,
+                        )
+                    })?;
+                    drop(guard);
+                    run.measure(Stage::Group, || {
+                        assign_with_edits(
+                            scan_id,
+                            &mut store,
+                            &mut groups,
+                            &policy,
+                            &mut edits,
+                            &ids,
+                        )
+                    })?;
+                    drop(_edit);
+                    if result.is_ok() {
+                        state.indexed += 1;
+                    } else {
+                        state.failed += 1;
+                    }
+                    state.pending = state.total.saturating_sub(state.indexed + state.failed);
+                    if last.elapsed().as_millis() >= 150 {
+                        let _ = progress.send(state.clone());
+                        last = Instant::now();
+                    }
+                }
+                Ok(())
+            },
+        )?;
     }
     if !interrupted() {
         let _edit = MUTATION.lock().map_err(error)?;
@@ -309,10 +360,12 @@ fn update(
                 break;
             }
             let _edit = MUTATION.lock().map_err(error)?;
-            assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, chunk)?;
+            run.measure(Stage::Group, || {
+                assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, chunk)
+            })?;
         }
     }
-    drop(_active);
+    drop(active);
     let mut final_state = status(scan_id)?;
     final_state.reused = state.reused;
     Ok(final_state)
@@ -342,9 +395,13 @@ pub(crate) async fn people_update_index(
 ) -> Result<IndexStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        update(scan_id, automatic, &progress, || {
-            ai::people_model::runtime(&app)
-        })
+        update_with_run(
+            scan_id,
+            automatic,
+            &progress,
+            &Mode::configured(&app).into(),
+            || ai::people_model::runtime(&app),
+        )
     })
     .await
     .map_err(error)?

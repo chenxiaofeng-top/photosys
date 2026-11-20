@@ -1,6 +1,8 @@
 pub(crate) mod ai_search;
 pub(crate) mod albums;
 mod favorites;
+#[cfg(test)]
+mod index_benchmark;
 mod live;
 pub(crate) mod locations;
 pub(crate) mod people;
@@ -786,6 +788,7 @@ pub(crate) async fn set_library_rotation(
     tauri::async_runtime::spawn_blocking(move || {
         let _task = crate::file_task()?;
         let _database = crate::database_access::read()?;
+        let _edits = people::lock_edits()?;
         session()?
             .as_mut()
             .ok_or(STALE_SCAN)?

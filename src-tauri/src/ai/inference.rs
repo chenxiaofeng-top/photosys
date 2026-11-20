@@ -395,8 +395,11 @@ impl Runtime {
             )
         })
     }
+    pub(crate) fn prepare_image(&self, image: RgbImage, rotation: u16) -> Vec<f32> {
+        pixels_at(image, rotation, self.spec.image_size)
+    }
     pub(crate) fn encode_image(&self, image: RgbImage, rotation: u16) -> Result<Vec<f32>, String> {
-        self.encode_pixels(pixels_at(image, rotation, self.spec.image_size))
+        self.encode_pixels(self.prepare_image(image, rotation))
     }
     pub(crate) fn encode_pixels(&self, pixels: Vec<f32>) -> Result<Vec<f32>, String> {
         let session = &self.vision;
