@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{
@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::ValueRef};
 use serde::Serialize;
 use tauri::{AppHandle, ipc::Channel};
 
@@ -544,6 +544,7 @@ fn vector_dim(bytes: &[u8], dim: usize) -> Result<Vec<f32>, String> {
     )
 }
 
+#[cfg(test)]
 fn rank(
     scan: &Scan,
     embedding: &[f32],
@@ -563,6 +564,7 @@ fn rank(
     )
 }
 
+#[cfg(test)]
 fn rank_for(
     scan: &Scan,
     embedding: &[f32],
@@ -584,6 +586,7 @@ fn rank_for(
     )
 }
 
+#[cfg(test)]
 fn rank_for_limit(
     scan: &Scan,
     embedding: &[f32],
@@ -594,70 +597,325 @@ fn rank_for_limit(
     spec: &'static ai::catalog::ModelSpec,
     page_size: usize,
 ) -> Result<Page<ItemView>, String> {
+    let cache = Cache::open(scan, false)?;
+    let ranked = rank_index(
+        cache.as_ref().map(|cache| &cache.connection),
+        scan,
+        embedding,
+        filter,
+        favorites,
+        rotations,
+        spec,
+    )?;
+    Ok(ranked.page(scan, favorites, rotations, page, page_size))
+}
+
+const RESULT_LIMIT: usize = 200;
+
+struct Scored {
+    score: f32,
+    id: usize,
+}
+
+impl Ord for Scored {
+    // The worst retained match is at the top of the heap.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(self.id.cmp(&other.id))
+    }
+}
+impl PartialOrd for Scored {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Scored {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Scored {}
+
+#[derive(Default)]
+struct Ranked {
+    ids: Vec<usize>,
+    indexed: usize,
+    failed: usize,
+    pending: usize,
+}
+
+impl Ranked {
+    fn page(
+        &self,
+        scan: &Scan,
+        favorites: &HashSet<usize>,
+        rotations: &HashMap<usize, u16>,
+        page: usize,
+        page_size: usize,
+    ) -> Page<ItemView> {
+        let total = self.ids.len();
+        let (page, offset) = Page::<ItemView>::bounds(page, total);
+        let items = self
+            .ids
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|&id| {
+                scan.items[id].view(
+                    favorites.contains(&id),
+                    rotations.get(&id).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Page { page, total, items }
+    }
+}
+
+fn rank_index(
+    connection: Option<&Connection>,
+    scan: &Scan,
+    embedding: &[f32],
+    filter: &Filter,
+    favorites: &HashSet<usize>,
+    rotations: &HashMap<usize, u16>,
+    spec: &'static ai::catalog::ModelSpec,
+) -> Result<Ranked, String> {
     filter.validate_location()?;
     let from = parse_date(filter.from.as_deref())?;
     let to = parse_date(filter.to.as_deref())?;
     if matches!((from, to), (Some(a), Some(b)) if a > b) {
         return Err("开始日期应早于或等于结束日期。".into());
     }
-    let cache = Cache::open(scan, false)?;
-    let mut ranked = Vec::new();
-    if let Some(mut cache) = cache {
-        cache.spec = spec;
-        let candidates: HashMap<_, _> = scan
-            .items
-            .iter()
-            .filter(|i| eligible(i) && filter.matches_location(i))
-            .filter(|i| !filter.favorites_only || favorites.contains(&i.file.id))
-            .filter(|i| {
-                if filter.unknown_date {
-                    i.captured_on.is_none()
-                } else {
-                    from.is_none_or(|d| i.captured_on >= Some(d))
-                        && to.is_none_or(|d| i.captured_on.is_some_and(|v| v <= d))
-                }
-            })
-            .map(|i| (favorites::path_key(&i.file.relative), i))
-            .collect();
-        let mut stmt = cache.connection.prepare("SELECT path, stamp, rotation, vector FROM embeddings WHERE version=?1 AND vector IS NOT NULL").map_err(error)?;
-        let mut rows = stmt.query([cache.spec.feature_version]).map_err(error)?;
-        while let Some(row) = rows.next().map_err(error)? {
-            let path: Vec<u8> = row.get(0).map_err(error)?;
-            let Some(item) = candidates.get(&path) else {
-                continue;
+    let Some(connection) = connection else {
+        return Ok(Ranked {
+            pending: scan.items.iter().filter(|item| eligible(item)).count(),
+            ..Ranked::default()
+        });
+    };
+    let candidates: HashMap<_, _> = scan
+        .items
+        .iter()
+        .filter(|item| eligible(item))
+        .map(|item| {
+            let matches_date = if filter.unknown_date {
+                item.captured_on.is_none()
+            } else {
+                from.is_none_or(|d| item.captured_on >= Some(d))
+                    && to.is_none_or(|d| item.captured_on.is_some_and(|v| v <= d))
             };
-            let stamp: Vec<u8> = row.get(1).map_err(error)?;
-            let rotation: u16 = row.get(2).map_err(error)?;
-            if stamp != item.file.stamp.portable_key()
-                || rotation != rotations.get(&item.file.id).copied().unwrap_or(0)
-            {
-                continue;
-            }
-            let stored: Vec<u8> = row.get(3).map_err(error)?;
-            let v = vector_dim(&stored, cache.spec.dimension)?;
-            if embedding.len() != v.len() {
-                return Err("查询与索引模型不兼容。".into());
-            }
-            let score: f32 = embedding.iter().zip(v).map(|(a, b)| a * b).sum();
-            ranked.push((score, item.file.id));
-        }
-    }
-    ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    ranked.truncate(200);
-    let total = ranked.len();
-    let (page, offset) = Page::<ItemView>::bounds(page, total);
-    let items = ranked
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .map(|(_, id)| {
-            scan.items[id].view(
-                favorites.contains(&id),
-                rotations.get(&id).copied().unwrap_or(0),
-            )
+            let matches = matches_date
+                && (!filter.favorites_only || favorites.contains(&item.file.id))
+                && filter.matches_location(item);
+            (favorites::path_key(&item.file.relative), (item, matches))
         })
         .collect();
-    Ok(Page { page, total, items })
+
+    let mut result = Ranked::default();
+    let mut ranked = BinaryHeap::with_capacity(RESULT_LIMIT);
+    let mut statement = connection
+        .prepare("SELECT path, stamp, rotation, vector FROM embeddings WHERE version=?1")
+        .map_err(error)?;
+    let mut rows = statement.query([spec.feature_version]).map_err(error)?;
+    while let Some(row) = rows.next().map_err(error)? {
+        let path = row.get_ref(0).map_err(error)?.as_blob().map_err(error)?;
+        let Some(&(item, matches)) = candidates.get(path) else {
+            continue;
+        };
+        let stamp = row.get_ref(1).map_err(error)?.as_blob().map_err(error)?;
+        let rotation: u16 = row.get(2).map_err(error)?;
+        if stamp != item.file.stamp.portable_key()
+            || rotation != rotations.get(&item.file.id).copied().unwrap_or(0)
+        {
+            continue;
+        }
+        let stored = row.get_ref(3).map_err(error)?;
+        if stored == ValueRef::Null {
+            result.failed += 1;
+            continue;
+        }
+        result.indexed += 1;
+        if !matches {
+            continue;
+        }
+        let vector = vector_dim(stored.as_blob().map_err(error)?, spec.dimension)?;
+        if embedding.len() != vector.len() {
+            return Err("查询与索引模型不兼容。".into());
+        }
+        let score = embedding.iter().zip(vector).map(|(a, b)| a * b).sum();
+        let entry = Scored {
+            score,
+            id: item.file.id,
+        };
+        if ranked.len() < RESULT_LIMIT {
+            ranked.push(entry);
+        } else if let Some(mut worst) = ranked.peek_mut()
+            && entry < *worst
+        {
+            *worst = entry;
+        }
+    }
+    result.pending = candidates.len() - result.indexed - result.failed;
+    result.ids = ranked
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    Ok(result)
+}
+
+#[derive(Default)]
+struct SearchReader {
+    scan_id: Option<u64>,
+    connection: Option<Connection>,
+    text: Option<TextEmbedding>,
+    ranking: Option<CachedRanking>,
+}
+
+struct TextEmbedding {
+    query: String,
+    generation: u64,
+    version: &'static str,
+    vector: Vec<f32>,
+}
+
+struct CachedRanking {
+    filter: Filter,
+    metadata_revision: u64,
+    database_version: i64,
+    result: Ranked,
+}
+
+static SEARCH_READER: Mutex<SearchReader> = Mutex::new(SearchReader {
+    scan_id: None,
+    connection: None,
+    text: None,
+    ranking: None,
+});
+
+pub(crate) fn close_reader() -> Result<(), String> {
+    *SEARCH_READER.lock().map_err(error)? = SearchReader::default();
+    Ok(())
+}
+
+impl SearchReader {
+    fn search(
+        &mut self,
+        scan_id: u64,
+        query: &str,
+        mut filter: Filter,
+        page: usize,
+        page_size: usize,
+        encode: impl FnOnce(&str) -> Result<Vec<f32>, String>,
+    ) -> Result<SearchPage, String> {
+        let scan = scan(scan_id)?;
+        if self.scan_id != Some(scan_id) {
+            *self = Self {
+                scan_id: Some(scan_id),
+                ..Self::default()
+            };
+        }
+        let generation = MODEL_GENERATION.load(Ordering::Relaxed);
+        let spec = ai::catalog::active(ai::ModelKind::Search);
+        let query = query.trim();
+        if !self.text.as_ref().is_some_and(|cached| {
+            cached.query == query
+                && cached.generation == generation
+                && cached.version == spec.feature_version
+        }) {
+            self.ranking = None;
+            self.text = Some(TextEmbedding {
+                query: query.to_owned(),
+                generation,
+                version: spec.feature_version,
+                vector: encode(query)?,
+            });
+        }
+        let embedding = &self.text.as_ref().unwrap().vector;
+        // The search text is keyed above. Content search always targets photos.
+        filter.query.clear();
+        filter.kind = None;
+        if self.connection.is_none() {
+            self.connection = Cache::open(&scan, false)?.map(|cache| cache.connection);
+        }
+        let database_version = self
+            .connection
+            .as_ref()
+            .map(|connection| {
+                connection.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            })
+            .transpose()
+            .map_err(error)?;
+        loop {
+            let lock = session()?;
+            let state = current(&lock, scan_id)?;
+            if generation != MODEL_GENERATION.load(Ordering::Relaxed)
+                || spec.feature_version
+                    != ai::catalog::active(ai::ModelKind::Search).feature_version
+            {
+                return Err("模型已变化，请重新搜索。".into());
+            }
+            if let Some(cached) = &self.ranking
+                && Some(cached.database_version) == database_version
+                && cached.metadata_revision == state.search_revision
+                && cached.filter == filter
+            {
+                return Ok(cached.result.search_page(state, page, page_size));
+            }
+            let metadata_revision = state.search_revision;
+            let (favorites, rotations) = (state.favorites.clone(), state.rotations.clone());
+            drop(lock);
+            let ranked = rank_index(
+                self.connection.as_ref(),
+                &scan,
+                embedding,
+                &filter,
+                &favorites,
+                &rotations,
+                spec,
+            )?;
+            let lock = session()?;
+            let state = current(&lock, scan_id)?;
+            if state.search_revision != metadata_revision {
+                continue;
+            }
+            if generation != MODEL_GENERATION.load(Ordering::Relaxed)
+                || spec.feature_version
+                    != ai::catalog::active(ai::ModelKind::Search).feature_version
+            {
+                return Err("模型已变化，请重新搜索。".into());
+            }
+            let result = ranked.search_page(state, page, page_size);
+            self.ranking = database_version.map(|database_version| CachedRanking {
+                filter,
+                metadata_revision,
+                database_version,
+                result: ranked,
+            });
+            return Ok(result);
+        }
+    }
+}
+
+impl Ranked {
+    fn search_page(&self, state: &super::Session, page: usize, page_size: usize) -> SearchPage {
+        let Page { page, total, items } = self.page(
+            &state.scan,
+            &state.favorites,
+            &state.rotations,
+            page,
+            page_size,
+        );
+        SearchPage {
+            page,
+            total,
+            items,
+            indexed: self.indexed,
+            pending: self.pending,
+            failed: self.failed,
+        }
+    }
 }
 
 #[tauri::command]
@@ -670,33 +928,21 @@ pub(crate) async fn ai_search(
 ) -> Result<SearchPage, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        let scan = scan(scan_id)?;
-        let generation = MODEL_GENERATION.load(Ordering::Relaxed);
-        let (favorites, rotations) = {
-            let lock = session()?;
-            let session = current(&lock, scan_id)?;
-            (session.favorites.clone(), session.rotations.clone())
-        };
-        let embedding = ai::runtime(&app)?.encode_text(query.trim())?;
-        let state = status(scan_id)?;
-        let Page { page, total, items } =
-            rank(&scan, &embedding, &filter, &favorites, &rotations, page)?;
-        super::scan(scan_id)?;
-        if generation != MODEL_GENERATION.load(Ordering::Relaxed) {
-            return Err("模型目录已变化，请重新搜索。".into());
-        }
-        Ok(SearchPage {
+        SEARCH_READER.lock().map_err(error)?.search(
+            scan_id,
+            &query,
+            filter,
             page,
-            total,
-            items,
-            indexed: state.indexed,
-            pending: state.pending,
-            failed: state.failed,
-        })
+            super::PAGE_SIZE,
+            |query| ai::runtime(&app)?.encode_text(query),
+        )
     })
     .await
     .map_err(error)?
 }
+
+#[cfg(test)]
+mod ranking_tests;
 
 #[cfg(test)]
 mod tests {
@@ -948,8 +1194,11 @@ mod tests {
         benchmark_indexes(&portrait, |path, use_gpu| {
             favorites::initialize(&crate::duplicates::Root::new(path).unwrap()).unwrap();
             let opened = super::super::open_directory(
-                path.to_str().unwrap(), super::super::OpenMode::Refresh, |_| {},
-            ).unwrap();
+                path.to_str().unwrap(),
+                super::super::OpenMode::Refresh,
+                |_| {},
+            )
+            .unwrap();
             let runtime = if use_gpu { &gpu } else { &cpu };
             let result = update(opened.scan_id, false, &progress, || Ok(runtime.clone())).unwrap();
             (result.indexed, result.failed)
@@ -1573,27 +1822,11 @@ pub(super) fn map_items(
     query: &str,
     filter: &Filter,
 ) -> Result<Vec<ItemView>, String> {
-    let scan = scan(scan_id)?;
-    let generation = MODEL_GENERATION.load(Ordering::Relaxed);
-    let (favorites, rotations) = {
-        let lock = session()?;
-        let s = current(&lock, scan_id)?;
-        (s.favorites.clone(), s.rotations.clone())
-    };
-    let embedding = ai::runtime(app)?.encode_text(query.trim())?;
-    let page = rank_for_limit(
-        &scan,
-        &embedding,
-        filter,
-        &favorites,
-        &rotations,
-        0,
-        ai::catalog::active(ai::ModelKind::Search),
-        200,
-    )?;
-    super::scan(scan_id)?;
-    if generation != MODEL_GENERATION.load(Ordering::Relaxed) {
-        return Err("模型已变化，请重新搜索。".into());
-    }
-    Ok(page.items)
+    Ok(SEARCH_READER
+        .lock()
+        .map_err(error)?
+        .search(scan_id, query, filter.clone(), 0, RESULT_LIMIT, |query| {
+            ai::runtime(app)?.encode_text(query)
+        })?
+        .items)
 }

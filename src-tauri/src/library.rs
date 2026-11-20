@@ -59,7 +59,7 @@ pub(crate) enum Kind {
     Video,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Filter {
     #[serde(default)]
@@ -371,6 +371,7 @@ struct Session {
     scan: Arc<Scan>,
     favorites: HashSet<usize>,
     rotations: HashMap<usize, u16>,
+    search_revision: u64,
 }
 
 impl Session {
@@ -396,6 +397,7 @@ impl Session {
             scan: Arc::new(scan),
             favorites,
             rotations,
+            search_revision: 0,
         }
     }
 
@@ -421,6 +423,7 @@ impl Session {
         } else {
             self.rotations.insert(file_id, rotation);
         }
+        self.search_revision += 1;
         Ok(rotation)
     }
 
@@ -639,6 +642,7 @@ pub(crate) fn open_directory(
     mode: OpenMode,
     progress: impl FnMut(Progress),
 ) -> Result<Summary, String> {
+    ai_search::close_reader()?;
     let root =
         Root::new(Path::new(directory)).map_err(|error| format!("无法打开媒体库目录。{error}"))?;
     crate::database_backup::recover(&root)?;
@@ -662,6 +666,7 @@ pub(crate) async fn scan_startup_library(
         let _task = crate::file_task()?;
         let _database = crate::database_access::maintenance()?;
         people::close_reader()?;
+        ai_search::close_reader()?;
         let portable = portable_directory();
         let preference = directory_preference(&app);
         let Some(StartupLibrary {
@@ -816,6 +821,7 @@ pub(crate) async fn set_library_favorite(
         } else {
             session.favorites.remove(&file_id);
         }
+        session.search_revision += 1;
         Ok(())
     })
     .await
@@ -922,6 +928,7 @@ pub(crate) async fn library_item(scan_id: u64, file_id: usize) -> Result<ItemVie
 /// Called under exclusive database access before replacing any database files.
 pub(crate) fn invalidate() -> Result<(), String> {
     *session()? = None;
+    ai_search::close_reader()?;
     people::close_reader()
 }
 

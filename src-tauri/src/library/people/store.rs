@@ -396,17 +396,21 @@ impl Store {
         Ok(state)
     }
     pub fn edit(&mut self, edit: Edit) -> Result<(), String> {
-        self.connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(error)?;
-        let result = self.apply(edit);
-        match result {
-            Ok(()) => self.connection.execute_batch("COMMIT").map_err(error),
-            Err(e) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.edit_checked(edit, |_| Ok(()))
+    }
+    pub fn edit_checked(
+        &mut self,
+        edit: Edit,
+        check: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(error)?;
+        check(self)?;
+        self.apply(edit)?;
+        tx.commit().map_err(error)
     }
     fn apply(&self, edit: Edit) -> Result<(), String> {
         let mut undo = Undo::default();

@@ -790,6 +790,7 @@ pub(crate) async fn database_restore(
         let _task = crate::file_task()?;
         let _database = crate::database_access::maintenance()?;
         library::people::close_reader()?;
+        library::ai_search::close_reader()?;
         let root = Root::new(Path::new(&directory)).map_err(error)?;
         let directory = root.path.to_str().ok_or("相册路径无法显示。")?.to_owned();
         let (rollback, mut warning) = restore(

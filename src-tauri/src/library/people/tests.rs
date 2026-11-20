@@ -467,6 +467,159 @@ fn assigned(store: &Store, id: i64) -> Option<i64> {
         .unwrap()
 }
 
+fn suggested_people(scan_id: u64, ids: &[i64]) -> std::collections::HashMap<i64, Vec<i64>> {
+    let result =
+        tauri::async_runtime::block_on(people_face_suggestions(scan_id, ids.to_vec())).unwrap();
+    let json = serde_json::to_value(&result).unwrap();
+    json["faces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|face| {
+            let people = face["people"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|person| person["id"].as_i64().unwrap())
+                .collect();
+            (face["faceId"].as_i64().unwrap(), people)
+        })
+        .collect()
+}
+
+#[test]
+fn pending_suggestions_filter_candidates_and_validate_batch_with_persistent_undo() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let _restore = RestorePeopleModel(ai::catalog::active(ai::ModelKind::People));
+    let spec = ai::catalog::default_model(ai::ModelKind::People);
+    ai::catalog::select(spec);
+    let album = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        RgbImage::new(2, 2)
+            .save(album.path().join(format!("{i}.png")))
+            .unwrap();
+    }
+    let id = open(album.path());
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    let a = model_face(spec, &[1.]);
+    let b = model_face(spec, &[0., 1.]);
+    let mixed = model_face(spec, &[0.70710677, 0.70710677]);
+    let mut missing = mixed.clone();
+    missing.vector = None;
+    let mut ids = Vec::new();
+    for (item, found) in scan.items.iter().zip([
+        vec![a.clone(), mixed.clone()],
+        vec![b],
+        vec![mixed.clone()],
+        vec![mixed.clone()],
+        vec![missing],
+        vec![model_face(spec, &[0., 0., 1.])],
+        vec![a],
+        vec![mixed.clone(), mixed],
+    ]) {
+        ids.push(
+            store
+                .save_for_model(
+                    &favorites::path_key(&item.file.relative),
+                    &item.file.stamp.portable_key(),
+                    0,
+                    &Ok(found),
+                    spec.feature_version,
+                )
+                .unwrap(),
+        );
+    }
+    for (face_id, name) in [(ids[0][0], "人物甲"), (ids[1][0], "人物乙")] {
+        store
+            .edit(Edit::Assign {
+                face_ids: vec![face_id],
+                person_id: None,
+                name: Some(name.into()),
+            })
+            .unwrap();
+    }
+    let person_a = assigned(&store, ids[0][0]).unwrap();
+    let person_b = assigned(&store, ids[1][0]).unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO rejections VALUES(?1,?2)",
+            params![ids[2][0], person_b],
+        )
+        .unwrap();
+    let selections = [
+        ids[0][1], ids[2][0], ids[3][0], ids[4][0], ids[5][0], ids[6][0],
+    ];
+    assert!(
+        query::with(id, |store| store
+            .unwrap()
+            .connection
+            .is_readonly("main")
+            .map_err(error))
+        .unwrap()
+    );
+    let candidates = suggested_people(id, &selections);
+    assert_eq!(candidates[&ids[0][1]], [person_b]);
+    assert_eq!(candidates[&ids[2][0]], [person_a]);
+    assert_eq!(candidates[&ids[3][0]], [person_a, person_b]);
+    assert!(!candidates.contains_key(&ids[4][0]));
+    assert!(candidates[&ids[5][0]].is_empty());
+    assert_eq!(candidates[&ids[6][0]], [person_a]);
+    assert!(
+        tauri::async_runtime::block_on(people_face_suggestions(id, vec![ids[2][0]; 25])).is_err()
+    );
+
+    let apply = |face_ids: Vec<i64>, person_id, version: &str| {
+        tauri::async_runtime::block_on(people_edit(
+            id,
+            Edit::Assign {
+                face_ids,
+                person_id: Some(person_id),
+                name: None,
+            },
+            Some(version.into()),
+        ))
+    };
+    let version = spec.feature_version;
+    assert!(apply(vec![ids[3][0], ids[2][0]], person_b, version).is_err());
+    assert!(apply(ids[7].clone(), person_a, version).is_err());
+    assert!(apply(vec![ids[3][0]], person_a, "old-model").is_err());
+    assert!(ids[7].iter().all(|&id| assigned(&store, id).is_none()));
+    assert_eq!(assigned(&store, ids[3][0]), None);
+
+    // Simulate the background index assigning the face after the UI received its suggestions.
+    let mut groups = grouping::Groups::load(id, grouping::Policy::shipped()).unwrap();
+    groups.assign(&mut store, &ids[6]).unwrap();
+    assert_eq!(assigned(&store, ids[6][0]), Some(person_a));
+    assert!(apply(vec![ids[3][0], ids[6][0]], person_a, version).is_err());
+    assert_eq!(assigned(&store, ids[3][0]), None);
+
+    apply(vec![ids[2][0], ids[3][0]], person_a, version).unwrap();
+    let confirmed = query::faces(id, FaceScope::Person, Some(person_a), None, 0).unwrap();
+    for face_id in [ids[2][0], ids[3][0]] {
+        assert!(
+            confirmed
+                .items
+                .iter()
+                .any(|face| face.id == face_id && face.manual)
+        );
+    }
+    drop(store);
+    query::close_for_test();
+    let reopened = open(album.path());
+    tauri::async_runtime::block_on(people_undo(reopened)).unwrap();
+    let store = Store::open(&library::scan(reopened).unwrap(), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned(&store, ids[2][0]), None);
+    assert_eq!(assigned(&store, ids[3][0]), None);
+    assert_eq!(
+        suggested_people(reopened, &[ids[2][0]])[&ids[2][0]],
+        [person_a]
+    );
+}
+
 #[test]
 fn conservative_grouping_for_both_models_reuses_features_and_keeps_uncertain_faces_pending() {
     let _session = TEST_SESSION.lock().unwrap();
@@ -601,6 +754,7 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
                 person_id: None,
                 name: Some("纠正的人物".into()),
             },
+            None,
         ))
         .unwrap();
         let corrected = assigned(&store, ids[0]).unwrap();
@@ -617,6 +771,7 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
                 person_id: Some(corrected),
                 name: None,
             },
+            None,
         ))
         .unwrap();
         tauri::async_runtime::block_on(people_edit(
@@ -625,6 +780,7 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
                 source_id: old,
                 target_id: corrected,
             },
+            None,
         ))
         .unwrap();
         tauri::async_runtime::block_on(people_edit(
@@ -632,6 +788,7 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
             Edit::Ignore {
                 face_ids: vec![ids[4]],
             },
+            None,
         ))
         .unwrap();
         assign_with_edits(id, &mut store, &mut groups, &policy, &mut edits, &ids).unwrap();
@@ -657,6 +814,7 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
                 person_id: corrected,
                 name: "家人".into(),
             },
+            None,
         ))
         .unwrap();
         assert_eq!(query::people(id, "家人", 0).unwrap().items[0].id, corrected);
@@ -789,6 +947,21 @@ fn real_faces_install_incremental_cancel_and_restore() {
     let face_id = f.items[0].id;
     let scan = scan(id).unwrap();
     let mut s = Store::open(&scan, true).unwrap().unwrap();
+    s.connection
+        .execute("UPDATE faces SET person_id=NULL WHERE id=?1", [face_id])
+        .unwrap();
+    assert_eq!(suggested_people(id, &[face_id])[&face_id], [person]);
+    tauri::async_runtime::block_on(people_edit(
+        id,
+        Edit::Assign {
+            face_ids: vec![face_id],
+            person_id: Some(person),
+            name: None,
+        },
+        Some(runtime.spec.feature_version.into()),
+    ))
+    .unwrap();
+    assert_eq!(assigned(&s, face_id), Some(person));
     s.edit(Edit::Assign {
         face_ids: vec![face_id],
         person_id: None,

@@ -3,8 +3,8 @@ use crate::ai::{
     error,
     faces::{self},
 };
-use rusqlite::params;
-use serde::Deserialize;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 #[derive(Clone, Deserialize)]
@@ -96,7 +96,7 @@ pub(super) struct Groups {
     policy: Policy,
     enabled: bool,
 }
-fn vector(bytes: &[u8]) -> Option<Vec<f32>> {
+pub(super) fn vector(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.len() != crate::ai::catalog::active(crate::ai::ModelKind::People).dimension * 4 {
         return None;
     }
@@ -109,6 +109,142 @@ fn vector(bytes: &[u8]) -> Option<Vec<f32>> {
     )
     .ok()
 }
+
+pub(super) const SUGGESTION_CHANGED: &str = "人脸或建议已变化，请重新查看归组建议。";
+pub(super) const PENDING_FACE: &str =
+    "f.active=1 AND f.ignored=0 AND f.manual=0 AND f.review=0 AND f.person_id IS NULL
+     AND f.vector IS NOT NULL AND m.version=?2 AND m.error IS NULL";
+
+pub(super) struct SuggestionSource {
+    pub id: i64,
+    pub file_id: usize,
+    path: Vec<u8>,
+    vector: Vec<f32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FaceSuggestions {
+    pub(super) feature_version: &'static str,
+    faces: Vec<SuggestedFace>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SuggestedFace {
+    face_id: i64,
+    people: Vec<query::Identity>,
+}
+
+pub(super) fn suggestion_sources(
+    scan_id: u64,
+    ids: &[i64],
+    version: &str,
+) -> Result<Vec<SuggestionSource>, String> {
+    query::with(scan_id, |store| {
+        let Some(store) = store else {
+            return Ok(Vec::new());
+        };
+        let mut statement = store
+            .connection
+            .prepare(&format!(
+            "SELECT f.file_id,f.path,f.vector FROM visible_faces f JOIN media m ON m.path=f.path
+             WHERE f.id=?1 AND {PENDING_FACE}"
+        ))
+            .map_err(error)?;
+        let mut sources = Vec::new();
+        for &id in ids {
+            let row: Option<(usize, Vec<u8>, Vec<u8>)> = statement
+                .query_row(params![id, version], |row| {
+                    Ok((row.get::<_, i64>(0)? as usize, row.get(1)?, row.get(2)?))
+                })
+                .optional()
+                .map_err(error)?;
+            if let Some((file_id, path, bytes)) = row
+                && let Some(vector) = vector(&bytes)
+            {
+                sources.push(SuggestionSource {
+                    id,
+                    file_id,
+                    path,
+                    vector,
+                });
+            }
+        }
+        Ok(sources)
+    })
+}
+
+pub(super) fn target_blocked(
+    connection: &Connection,
+    person: i64,
+    path: &[u8],
+    face: i64,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM people WHERE id=?1 AND archived=0)
+         OR EXISTS(SELECT 1 FROM faces WHERE path=?2 AND active=1 AND ignored=0 AND person_id=?1)
+         OR EXISTS(SELECT 1 FROM rejections WHERE face_id=?3 AND person_id=?1)",
+            params![person, path, face],
+            |row| row.get(0),
+        )
+        .map_err(error)
+}
+
+pub(super) fn suggestions(scan_id: u64, ids: &[i64]) -> Result<FaceSuggestions, String> {
+    let feature_version = crate::ai::catalog::active(crate::ai::ModelKind::People).feature_version;
+    let sources = suggestion_sources(scan_id, ids, feature_version)?;
+    let mut result = FaceSuggestions {
+        feature_version,
+        faces: Vec::new(),
+    };
+    if sources.is_empty() {
+        return Ok(result);
+    }
+    let groups = Groups::load(scan_id, Policy::shipped())?;
+    if !groups.enabled {
+        return Ok(result);
+    }
+    result.faces = query::with(scan_id, |store| {
+        let Some(store) = store else {
+            return Ok(Vec::new());
+        };
+        let mut suggestions = Vec::new();
+        for source in sources {
+            let mut people = Vec::new();
+            for (id, score) in groups.ranked(&source.vector)? {
+                if score < groups.policy.threshold {
+                    break;
+                }
+                if !target_blocked(&store.connection, id, &source.path, source.id)? {
+                    let name = store
+                        .connection
+                        .query_row(
+                            "SELECT name FROM people WHERE id=?1 AND archived=0",
+                            [id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(error)?;
+                    if let Some(name) = name {
+                        people.push(query::Identity { id, name });
+                    }
+                    if people.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            suggestions.push(SuggestedFace {
+                face_id: source.id,
+                people,
+            });
+        }
+        Ok(suggestions)
+    })?;
+    Ok(result)
+}
+
 impl Groups {
     pub fn load(scan_id: u64, policy: Policy) -> Result<Self, String> {
         let enabled = policy.allowed();
@@ -175,6 +311,26 @@ impl Groups {
         self.anchors.insert(id as u64, Anchor { person, vector });
         Ok(())
     }
+
+    fn ranked(&self, vector: &[f32]) -> Result<Vec<(i64, f32)>, String> {
+        let mut scores: HashMap<i64, f32> = HashMap::new();
+        if self.index.size() > 0 {
+            let hits = self.index.search(vector, 32).map_err(error)?;
+            for key in hits.keys {
+                if let Some(anchor) = self.anchors.get(&key) {
+                    let score = faces::cosine(vector, &anchor.vector);
+                    scores
+                        .entry(anchor.person)
+                        .and_modify(|s| *s = s.max(score))
+                        .or_insert(score);
+                }
+            }
+        }
+        let mut ranked: Vec<_> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(ranked)
+    }
+
     pub fn assign(&mut self, s: &mut Store, ids: &[i64]) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -189,28 +345,13 @@ impl Groups {
             let Some(v) = vector(&bytes) else {
                 continue;
             };
-            let mut scores: HashMap<i64, f32> = HashMap::new();
-            if self.index.size() > 0 {
-                let hits = self.index.search(&v, 32).map_err(error)?;
-                for key in hits.keys {
-                    if let Some(a) = self.anchors.get(&key) {
-                        let score = faces::cosine(&v, &a.vector);
-                        scores
-                            .entry(a.person)
-                            .and_modify(|s| *s = s.max(score))
-                            .or_insert(score);
-                    }
-                }
-            }
-            let mut ranked: Vec<_> = scores.into_iter().collect();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let ranked = self.ranked(&v)?;
             let target = if let Some(&(p, score)) = ranked.first() {
                 if score >= self.policy.threshold {
                     let ambiguous = ranked
                         .get(1)
                         .is_some_and(|(_, other)| score - other < self.policy.margin);
-                    let blocked:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM people WHERE id=?1 AND archived=0) OR EXISTS(SELECT 1 FROM faces WHERE path=?2 AND active=1 AND ignored=0 AND person_id=?1) OR EXISTS(SELECT 1 FROM rejections WHERE face_id=?3 AND person_id=?1)",params![p,path,id],|r|r.get(0)).map_err(error)?;
-                    if ambiguous || blocked {
+                    if ambiguous || target_blocked(&tx, p, &path, *id)? {
                         continue;
                     }
                     Some(p)
@@ -254,7 +395,6 @@ impl Groups {
         })
     }
 }
-use rusqlite::OptionalExtension;
 #[cfg(test)]
 mod tests {
     use super::*;

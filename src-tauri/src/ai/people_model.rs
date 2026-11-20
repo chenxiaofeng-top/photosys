@@ -200,13 +200,16 @@ pub(crate) fn activate(app: &AppHandle, spec: &'static ModelSpec) -> Result<Mode
     let runtime = runtime_for(app, spec, true)?;
     let directory = selected(app)?.ok_or("缺少模型目录。")?.join(spec.id);
     let stamps = packages::stamps(&directory, &spec.assets)?;
-    model::persist_choice(app, spec)?;
-    PEOPLE_GENERATION.fetch_add(1, Ordering::Relaxed);
-    *LOADED.lock().map_err(error)? = Some(Loaded {
-        directory,
-        stamps,
-        runtime,
-    });
+    {
+        let _edits = crate::library::people::lock_edits()?;
+        model::persist_choice(app, spec)?;
+        PEOPLE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        *LOADED.lock().map_err(error)? = Some(Loaded {
+            directory,
+            stamps,
+            runtime,
+        });
+    }
     device::notify(app);
     drop(task);
     status_for(app, spec)

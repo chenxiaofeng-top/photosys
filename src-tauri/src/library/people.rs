@@ -11,6 +11,7 @@ use crate::ai::{
     faces::{self, FaceRuntime},
 };
 use query::{FaceScope, FaceView, Month, PersonView};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use std::{
     collections::HashSet,
@@ -24,6 +25,9 @@ use store::{Edit, Store};
 use tauri::{AppHandle, ipc::Channel};
 static SERIAL: Mutex<()> = Mutex::new(());
 static MUTATION: Mutex<()> = Mutex::new(());
+pub(crate) fn lock_edits() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    MUTATION.lock().map_err(error)
+}
 pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, String> {
     cancel_all();
     SERIAL.lock().map_err(error)
@@ -373,6 +377,32 @@ pub(crate) async fn people_faces(
     .await
     .map_err(error)?
 }
+
+fn validate_suggestion_selection(ids: &[i64]) -> Result<(), String> {
+    if ids.is_empty()
+        || ids.len() > super::PAGE_SIZE
+        || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
+    {
+        return Err("请选择本页 1～24 张不同的人脸。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn people_face_suggestions(
+    scan_id: u64,
+    face_ids: Vec<i64>,
+) -> Result<grouping::FaceSuggestions, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        validate_suggestion_selection(&face_ids)?;
+        let _edit = lock_edits()?;
+        grouping::suggestions(scan_id, &face_ids)
+    })
+    .await
+    .map_err(error)?
+}
+
 #[tauri::command]
 pub(crate) async fn people_photos(
     scan_id: u64,
@@ -403,30 +433,108 @@ pub(crate) async fn people_months(
     .map_err(error)?
 }
 #[tauri::command]
-pub(crate) async fn people_edit(scan_id: u64, edit: Edit) -> Result<(), String> {
+pub(crate) async fn people_edit(
+    scan_id: u64,
+    edit: Edit,
+    suggestion_version: Option<String>,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        let _edit = MUTATION.lock().map_err(error)?;
-        match &edit {
-            Edit::Assign { face_ids, .. }
-            | Edit::Ignore { face_ids }
-            | Edit::Restore { face_ids } => {
-                if face_ids.is_empty() || face_ids.len() > 1000 {
-                    return Err("请选择 1～1000 张人脸。".into());
+        let _edit = lock_edits()?;
+        if let Some(version) = suggestion_version {
+            apply_suggestion(scan_id, edit, &version)?;
+        } else {
+            match &edit {
+                Edit::Assign { face_ids, .. }
+                | Edit::Ignore { face_ids }
+                | Edit::Restore { face_ids } => {
+                    if face_ids.is_empty() || face_ids.len() > 1000 {
+                        return Err("请选择 1～1000 张人脸。".into());
+                    }
+                    query::validate_faces(scan_id, face_ids, matches!(&edit, Edit::Assign { .. }))?;
                 }
-                query::validate_faces(scan_id, face_ids, matches!(&edit, Edit::Assign { .. }))?;
+                _ => {}
             }
-            _ => {}
+            let s = session()?;
+            let scan = &current(&s, scan_id)?.scan;
+            Store::open(scan, true)?
+                .ok_or("无法打开人物数据库。")?
+                .edit(edit)?;
         }
-        let s = session()?;
-        let scan = &current(&s, scan_id)?.scan;
-        let mut store = Store::open(scan, true)?.ok_or("无法打开人物数据库。")?;
-        store.edit(edit)?;
         EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })
     .await
     .map_err(error)?
+}
+
+// The caller holds MUTATION so publishing a new model or assigning a face cannot interleave.
+fn apply_suggestion(scan_id: u64, edit: Edit, version: &str) -> Result<(), String> {
+    let Edit::Assign {
+        ref face_ids,
+        person_id: Some(person_id),
+        ..
+    } = edit
+    else {
+        return Err(grouping::SUGGESTION_CHANGED.into());
+    };
+    validate_suggestion_selection(face_ids)?;
+    let spec = ai::catalog::active(ai::ModelKind::People);
+    if spec.feature_version != version {
+        return Err(grouping::SUGGESTION_CHANGED.into());
+    }
+    let sources = grouping::suggestion_sources(scan_id, face_ids, version)?;
+    if sources.len() != face_ids.len()
+        || sources
+            .iter()
+            .map(|source| source.file_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != sources.len()
+    {
+        return Err(grouping::SUGGESTION_CHANGED.into());
+    }
+    let lock = session()?;
+    let state = current(&lock, scan_id)?;
+    let mut store = Store::open(&state.scan, true)?.ok_or("无法打开人物数据库。")?;
+    store.edit_checked(edit, |store| {
+        let geometry = store.geometry_expression()?;
+        let mut pending = store
+            .connection
+            .prepare(&format!(
+            "SELECT f.path,m.stamp,m.rotation,f.vector FROM faces f JOIN media m ON m.path=f.path
+             WHERE f.id=?1 AND {} AND ({geometry})=?3",
+            grouping::PENDING_FACE,
+        ))
+            .map_err(error)?;
+        for source in sources {
+            let item = state.scan.item(source.file_id)?;
+            state
+                .scan
+                .root
+                .open_matching(&item.file)
+                .map_err(|_| grouping::SUGGESTION_CHANGED.to_string())?;
+            let row: Option<(Vec<u8>, Vec<u8>, u16, Vec<u8>)> = pending
+                .query_row(
+                    params![source.id, version, faces::GEOMETRY_VERSION],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(error)?;
+            let Some((path, stamp, rotation, vector)) = row else {
+                return Err(grouping::SUGGESTION_CHANGED.into());
+            };
+            if path != favorites::path_key(&item.file.relative)
+                || stamp != item.file.stamp.portable_key()
+                || rotation != state.rotations.get(&source.file_id).copied().unwrap_or(0)
+                || grouping::vector(&vector).is_none()
+                || grouping::target_blocked(&store.connection, person_id, &path, source.id)?
+            {
+                return Err(grouping::SUGGESTION_CHANGED.into());
+            }
+        }
+        Ok(())
+    })
 }
 #[tauri::command]
 pub(crate) async fn people_undo(scan_id: u64) -> Result<(), String> {
