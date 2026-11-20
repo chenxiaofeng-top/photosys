@@ -155,6 +155,7 @@ function selectAll() {
       <div class="face-toolbar">
         <button type="button" class="secondary" :disabled="selectionDisabled || (grouped && (writable === false || selectedCount === results.total))" @click="selectAll">{{ grouped ? '全选本组' : '选择本页' }}</button>
         <button type="button" class="secondary" :disabled="selectionDisabled || !selectedCount" @click="clearSelection">取消选择</button>
+        <button v-if="scope === 'pending'" type="button" class="secondary" :disabled="disabled || !selectedCount" @click="edit('ignore')">忽略所选</button>
         <button v-if="scope === 'pending' && !grouped" type="button" class="secondary"
           :disabled="selectionDisabled || loadingSuggestions || !selectedFaces.some(face => !face.needsReview)"
           @click="loadSuggestions">查看归组建议</button>
@@ -197,8 +198,8 @@ function selectAll() {
         <label v-if="target === 'new'">新人物名称 <input v-model="newName" placeholder="可稍后命名" maxlength="80" /></label>
         <button type="button" :disabled="!target || !canAssign" @click="edit('assign')">{{ target === 'new' ? '新建人物并归入' : '移入此人物' }}</button>
         <button v-if="scope === 'person' || scope === 'photo'" type="button" class="secondary" :disabled="!canUnassign" @click="edit('unassign')">移回待整理</button>
-        <button v-if="scope !== 'ignored'" type="button" class="secondary" :disabled="!selectedCount" @click="edit('ignore')">忽略所选</button>
-        <button v-else type="button" class="secondary" :disabled="!selectedCount" @click="edit('restore')">恢复所选</button>
+        <button v-if="scope === 'person' || scope === 'photo'" type="button" class="secondary" :disabled="!selectedCount" @click="edit('ignore')">忽略所选</button>
+        <button v-else-if="scope === 'ignored'" type="button" class="secondary" :disabled="!selectedCount" @click="edit('restore')">恢复所选</button>
       </fieldset>
       <p v-if="writable === false" class="muted">此相册只读，可以查看标注和归组建议。</p>
       <nav v-if="results.total > 24" class="face-toolbar" aria-label="人脸分页">
