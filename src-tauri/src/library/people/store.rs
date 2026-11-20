@@ -15,7 +15,7 @@ use std::{
 pub(super) struct Store {
     pub connection: Connection,
 }
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 const SCHEMA:&str="
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0,important INTEGER NOT NULL DEFAULT 0);
@@ -94,12 +94,6 @@ pub(crate) enum Edit {
     Restore {
         face_ids: Vec<i64>,
     },
-    IgnorePeople {
-        person_ids: Vec<i64>,
-    },
-    RestorePeople {
-        person_ids: Vec<i64>,
-    },
     DeletePeople {
         person_ids: Vec<i64>,
     },
@@ -113,6 +107,27 @@ fn name(s: &str) -> Result<String, String> {
     }
 }
 impl Store {
+    fn undo_history(&self) -> Result<Vec<(i64, String, Undo)>, String> {
+        let mut q = self
+            .connection
+            .prepare("SELECT id,description,payload FROM edits ORDER BY id")
+            .map_err(error)?;
+        q.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(error)?
+        .map(|row| {
+            let (id, description, json) = row.map_err(error)?;
+            let undo = serde_json::from_str::<Undo>(&json).map_err(error)?;
+            Ok((id, description, undo))
+        })
+        .collect()
+    }
+
     // The same evidence is used for the writable migration and the read-only projection.
     pub(super) fn classify_legacy(
         &self,
@@ -120,24 +135,7 @@ impl Store {
         important: &str,
     ) -> Result<Vec<(i64, String, Undo)>, String> {
         let c = &self.connection;
-        let mut q = c
-            .prepare("SELECT id,description,payload FROM edits ORDER BY id")
-            .map_err(error)?;
-        let mut edits = q
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(error)?
-            .map(|row| {
-                let (id, description, json) = row.map_err(error)?;
-                let undo = serde_json::from_str::<Undo>(&json).map_err(error)?;
-                Ok((id, description, undo))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let mut edits = self.undo_history()?;
 
         let mut evidence = HashSet::new();
         let mut confirmed = HashMap::new();
@@ -265,6 +263,92 @@ impl Store {
             .map_err(error)
     }
 
+    fn legacy_ignored_groups(&self) -> Result<HashSet<i64>, String> {
+        let mut query = self
+            .connection
+            .prepare("SELECT id FROM people WHERE ignored=1")
+            .map_err(error)?;
+        query
+            .query_map([], |r| r.get(0))
+            .map_err(error)?
+            .collect::<Result<_, _>>()
+            .map_err(error)
+    }
+
+    fn undo_after_dissolving(
+        &self,
+        groups: &HashSet<i64>,
+    ) -> Result<Vec<(i64, String, Option<Undo>)>, String> {
+        Ok(self
+            .undo_history()?
+            .into_iter()
+            .map(|(id, description, mut undo)| {
+                undo.people.retain(|person| !groups.contains(&person.id));
+                undo.created.retain(|person| !groups.contains(person));
+                undo.pending_assignments
+                    .retain(|(_, person)| !groups.contains(person));
+                for face in &mut undo.faces {
+                    if face
+                        .person_id
+                        .is_some_and(|person| groups.contains(&person))
+                    {
+                        face.person_id = None;
+                    }
+                    face.rejections.retain(|person| !groups.contains(person));
+                }
+                let keep = !matches!(description.as_str(), "忽略人物" | "恢复忽略的人物")
+                    && !(undo.people.is_empty()
+                        && undo.faces.is_empty()
+                        && undo.created.is_empty()
+                        && undo.pending_assignments.is_empty());
+                (id, description, keep.then_some(undo))
+            })
+            .collect())
+    }
+
+    fn dissolve_ignored_groups(&self) -> Result<(), String> {
+        let groups = self.legacy_ignored_groups()?;
+        for &person in &groups {
+            self.detach_person_faces(person)?;
+        }
+        self.connection
+            .execute("UPDATE people SET archived=1,ignored=0 WHERE ignored=1", [])
+            .map_err(error)?;
+        for (id, _, undo) in self.undo_after_dissolving(&groups)? {
+            if let Some(undo) = undo {
+                self.connection
+                    .execute(
+                        "UPDATE edits SET payload=?2 WHERE id=?1",
+                        params![id, serde_json::to_string(&undo).map_err(error)?],
+                    )
+                    .map_err(error)?;
+            } else {
+                self.connection
+                    .execute("DELETE FROM edits WHERE id=?1", [id])
+                    .map_err(error)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn undo_description(&self) -> Result<Option<String>, String> {
+        if (3..SCHEMA_VERSION).contains(&self.schema_version()?) {
+            return Ok(self
+                .undo_after_dissolving(&self.legacy_ignored_groups()?)?
+                .into_iter()
+                .rev()
+                .find_map(|(_, description, undo)| undo.map(|_| description)));
+        }
+        self.connection
+            .query_row(
+                "SELECT description FROM edits ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(error)
+    }
+
     fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool, String> {
         c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
@@ -322,6 +406,13 @@ impl Store {
             let c = &store.connection;
             c.execute_batch("BEGIN IMMEDIATE").map_err(error)?;
             let migration = (|| -> Result<(), String> {
+                let version = store.schema_version()?;
+                if version == SCHEMA_VERSION {
+                    return Ok(());
+                }
+                if version > SCHEMA_VERSION {
+                    return Err("人物数据库来自较新版本，请更新 PhotoSys。".into());
+                }
                 c.execute_batch(SCHEMA).map_err(error)?;
                 if !Self::has_column(c, "media", "geometry_version")? {
                     c.execute_batch(
@@ -349,6 +440,7 @@ impl Store {
                 if version < 5 {
                     store.migrate_automatic_groups()?;
                 }
+                store.dissolve_ignored_groups()?;
                 c.pragma_update(None, "user_version", SCHEMA_VERSION)
                     .map_err(error)?;
                 Ok(())
@@ -557,15 +649,15 @@ impl Store {
     fn person(&self, id: i64) -> Result<PersonState, String> {
         self.connection
             .query_row(
-                "SELECT id,name,archived,ignored,important FROM people WHERE id=?1 AND archived=0",
+                "SELECT id,name,archived,important FROM people WHERE id=?1 AND archived=0",
                 [id],
                 |r| {
                     Ok(PersonState {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         archived: r.get(2)?,
-                        ignored: r.get(3)?,
-                        important: r.get(4)?,
+                        ignored: false,
+                        important: r.get(3)?,
                     })
                 },
             )
@@ -658,9 +750,6 @@ impl Store {
                 important,
             } => {
                 let previous = self.person(person_id)?;
-                if previous.ignored {
-                    return Err("请先恢复该人物。".into());
-                }
                 if previous.important == important {
                     return Ok(());
                 }
@@ -686,9 +775,6 @@ impl Store {
                 }
                 let source = self.person(source_id)?;
                 let target = self.person(target_id)?;
-                if source.ignored || target.ignored {
-                    return Err("请先恢复已忽略的人物再合并。".into());
-                }
                 if source.important && !target.important {
                     self.connection
                         .execute("UPDATE people SET important=1 WHERE id=?1", [target_id])
@@ -717,9 +803,7 @@ impl Store {
                 }
                 let needs_pending = pending_group || person_id.is_none();
                 let target = if let Some(id) = person_id {
-                    if self.person(id)?.ignored {
-                        return Err("归属目标已被忽略，请选择其他人物。".into());
-                    }
+                    self.person(id)?;
                     id
                 } else {
                     let n = name(n.as_deref().unwrap_or(""))?;
@@ -798,43 +882,20 @@ impl Store {
             }
             Edit::Ignore { face_ids } => return self.disposition(face_ids, false, pending_group),
             Edit::Restore { face_ids } => return self.disposition(face_ids, true, false),
-            Edit::IgnorePeople { person_ids } => return self.people_disposition(person_ids, true),
-            Edit::RestorePeople { person_ids } => {
-                return self.people_disposition(person_ids, false);
-            }
             Edit::DeletePeople { person_ids } => return self.delete_people(person_ids),
         }
         self.save_undo(description, undo)
     }
-    fn people_disposition(&self, ids: Vec<i64>, ignored: bool) -> Result<(), String> {
-        if ids.is_empty() || ids.len() > 1000 {
-            return Err("请选择 1～1000 个人物。".into());
-        }
-        let mut undo = Undo::default();
-        let mut seen = std::collections::HashSet::new();
-        for id in ids.into_iter().filter(|id| seen.insert(*id)) {
-            let previous = self.person(id)?;
-            if previous.ignored != ignored {
-                undo.people.push(previous);
-                self.connection
-                    .execute(
-                        "UPDATE people SET ignored=?2 WHERE id=?1",
-                        params![id, ignored],
-                    )
-                    .map_err(error)?;
-            }
-        }
-        if undo.people.is_empty() {
-            return Ok(());
-        }
-        self.save_undo(
-            if ignored {
-                "忽略人物"
-            } else {
-                "恢复忽略的人物"
-            },
-            undo,
-        )
+    fn detach_person_faces(&self, person_id: i64) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE faces SET person_id=NULL,
+             manual=CASE WHEN active=1 AND ignored=0 THEN 1 ELSE manual END
+             WHERE person_id=?1",
+                [person_id],
+            )
+            .map_err(error)?;
+        Ok(())
     }
 
     fn delete_people(&self, person_ids: Vec<i64>) -> Result<(), String> {
@@ -844,20 +905,9 @@ impl Store {
         let mut undo = Undo::default();
         let mut seen = std::collections::HashSet::new();
         for id in person_ids.into_iter().filter(|id| seen.insert(*id)) {
-            let person = self.person(id)?;
-            if person.ignored {
-                return Err("请先恢复已忽略的人物再删除。".into());
-            }
-            undo.people.push(person);
+            undo.people.push(self.person(id)?);
             undo.faces.extend(self.person_faces(id)?);
-            self.connection
-                .execute(
-                    "UPDATE faces SET person_id=NULL,
-                     manual=CASE WHEN active=1 AND ignored=0 THEN 1 ELSE manual END
-                     WHERE person_id=?1",
-                    [id],
-                )
-                .map_err(error)?;
+            self.detach_person_faces(id)?;
             self.connection
                 .execute("UPDATE people SET archived=1 WHERE id=?1", [id])
                 .map_err(error)?;
@@ -917,8 +967,8 @@ impl Store {
         let u: Undo = serde_json::from_str(&json).map_err(error)?;
         for p in u.people {
             tx.execute(
-                "UPDATE people SET name=?2,archived=?3,ignored=?4,important=?5 WHERE id=?1",
-                params![p.id, p.name, p.archived, p.ignored, p.important],
+                "UPDATE people SET name=?2,archived=?3,important=?4 WHERE id=?1",
+                params![p.id, p.name, p.archived, p.important],
             )
             .map_err(error)?;
         }

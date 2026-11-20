@@ -50,7 +50,6 @@ pub(crate) struct IndexStatus {
     pub message: Option<String>,
     pub pending_faces: usize,
     pub ignored_faces: usize,
-    pub ignored_people: usize,
     pub undo_description: Option<String>,
     pub auto_grouping: bool,
     pub grouping_settings: Option<grouping::Settings>,
@@ -110,10 +109,9 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         state.rebuild_reason = Some("当前模型需要重新计算人脸特征，请手动重建人物索引。".into());
     }
     state.pending = state.total.saturating_sub(state.indexed + state.failed);
-    let (pending, ignored, ignored_people, undo) = query::counts(scan_id)?;
+    let (pending, ignored, undo) = query::counts(scan_id)?;
     state.pending_faces = pending;
     state.ignored_faces = ignored;
-    state.ignored_people = ignored_people;
     state.undo_description = undo;
     let policy = grouping::Policy::effective(store.as_ref())?;
     state.auto_grouping = policy.allowed();
@@ -445,11 +443,12 @@ pub(crate) async fn people_save_grouping(
 pub(crate) async fn people_pending_groups(
     scan_id: u64,
     page: usize,
+    resume_group: Option<pending::ResumeGroup>,
 ) -> Result<pending::Overview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
         let _edit = lock_edits()?;
-        pending::overview(scan_id, page)
+        pending::overview(scan_id, page, resume_group.as_ref())
     })
     .await
     .map_err(error)?
@@ -477,18 +476,19 @@ fn edit_pending_group(
     person_id: Option<i64>,
     name: Option<String>,
     ignore: bool,
-) -> Result<(), String> {
+) -> Result<Vec<i64>, String> {
     let _edit = lock_edits()?;
-    let selected = pending::selected(scan_id, &view, selection)?;
+    let pending::GroupSelection { chosen, remaining } =
+        pending::selected(scan_id, &view, selection)?;
     let guard = session()?;
     let scan = &current(&guard, scan_id)?.scan;
-    for &(_, file_id) in &selected {
+    for &(_, file_id) in &chosen {
         let item = scan.item(file_id)?;
         scan.root
             .open_matching(&item.file)
             .map_err(|_| pending::CHANGED.to_string())?;
     }
-    let face_ids = selected.into_iter().map(|(face_id, _)| face_id).collect();
+    let face_ids = chosen.into_iter().map(|(face_id, _)| face_id).collect();
     let edit = if ignore {
         Edit::Ignore { face_ids }
     } else {
@@ -500,7 +500,8 @@ fn edit_pending_group(
     };
     Store::open(scan, true)?
         .ok_or("无法打开人物数据库。")?
-        .edit_pending_group(edit)
+        .edit_pending_group(edit)?;
+    Ok(if ignore { remaining } else { Vec::new() })
 }
 
 #[tauri::command]
@@ -511,7 +512,7 @@ pub(crate) async fn people_edit_pending_group(
     person_id: Option<i64>,
     name: Option<String>,
     ignore: bool,
-) -> Result<(), String> {
+) -> Result<Vec<i64>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
         edit_pending_group(scan_id, view, selection, person_id, name, ignore)

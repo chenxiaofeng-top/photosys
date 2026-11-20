@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { personName, type Face, type FaceSuggestions, type Person, type Page, type PendingView } from "./people";
+import { personName, type Face, type FaceEditKind, type FaceSuggestions, type Person, type Page, type PendingView } from "./people";
 const props = defineProps<{ scanId: number; scope?: "pending" | "person" | "ignored" | "photo"; personId?: number; fileId?: number; revision?: number; writable?: boolean; busy?: boolean; pendingView?: PendingView }>();
-const emit = defineEmits<{ changed: []; preview: [fileId: number]; stale: [] }>();
+const emit = defineEmits<{ changed: [kind: FaceEditKind, remainingFaceIds?: number[]]; preview: [fileId: number]; stale: [] }>();
 const results = shallowRef<Page<Face>>();
 const page = ref(0);
+const faceReload = ref(0);
 const loading = ref(false);
 const saving = ref(false);
 const error = ref("");
@@ -69,9 +70,13 @@ watch(selected, () => {
   suggestionError.value = "";
   loadingSuggestions.value = false;
 }, { flush: "sync" });
-const faceContext = [() => props.scanId, scope, () => props.personId, () => props.fileId, () => props.revision, () => props.pendingView] as const;
-watch(faceContext, () => { page.value = 0; clearSelection(); });
-watch([...faceContext, page], async (_, __, cleanup) => {
+const faceIdentity = computed(() => ({ scanId: props.scanId, scope: scope.value, personId: props.personId, fileId: props.fileId }));
+const faceContext = [faceIdentity, () => props.revision, () => props.pendingView] as const;
+watch(faceContext, ([identity], [previousIdentity]) => {
+  page.value = props.pendingView && identity === previousIdentity ? (results.value?.page ?? page.value) : 0;
+  clearSelection();
+});
+watch([...faceContext, page, faceReload], async (_, __, cleanup) => {
   let current = true; cleanup(() => { current = false; });
   loading.value = true; error.value = ""; results.value = undefined;
   if (!grouped.value) clearSelection();
@@ -107,19 +112,20 @@ async function loadSuggestions() {
     if (request === suggestionRequest) loadingSuggestions.value = false;
   }
 }
-async function edit(kind: "assign" | "ignore" | "restore" | "unassign", suggestedPerson?: number) {
+async function edit(kind: FaceEditKind, suggestedPerson?: number) {
   if (disabled.value || !selectedCount.value || (kind === "unassign" && !canUnassign.value)
     || (kind === "assign" && (!canAssign.value || (suggestedPerson === undefined && !target.value)))) return;
   const suggestionVersion = suggestedPerson === undefined ? undefined : suggestions.value?.featureVersion;
   if (suggestedPerson !== undefined && !suggestionVersion) return;
   const scanId = props.scanId; saving.value = true; error.value = "";
   try {
+    let remainingFaceIds: number[] | undefined;
     const personId = suggestedPerson ?? (target.value && target.value !== "new" ? Number(target.value) : null);
     if (grouped.value) {
       const selection = wholeGroup.value
         ? { kind: "all", excludedFaceIds: excluded.value }
         : { kind: "selected", faceIds: selected.value };
-      await invoke("people_edit_pending_group", {
+      remainingFaceIds = await invoke<number[]>("people_edit_pending_group", {
         scanId, view: props.pendingView, selection, personId, name: newName.value, ignore: kind === "ignore",
       });
     } else {
@@ -128,7 +134,7 @@ async function edit(kind: "assign" | "ignore" | "restore" | "unassign", suggeste
         edit: { kind, faceIds: selected.value, ...(kind === "assign" ? { personId, name: newName.value } : {}) },
       });
     }
-    if (scanId === props.scanId) { clearSelection(); newName.value = ""; emit("changed"); }
+    if (scanId === props.scanId) { clearSelection(); newName.value = ""; emit("changed", kind, remainingFaceIds); }
   } catch (cause) {
     if (scanId === props.scanId) {
       reportError(cause);
@@ -149,8 +155,9 @@ function selectAll() {
 <template>
   <section class="face-editor" aria-label="整理人脸" :aria-busy="loading || saving">
     <p v-if="error" class="error" role="alert">{{ error }}</p>
+    <button v-if="pendingView && error && !results" type="button" class="secondary" @click="faceReload++">重新读取人脸</button>
     <p v-if="loading" role="status">正在读取人脸…</p>
-    <p v-else-if="!results?.total" class="muted">{{ scope === 'photo' ? '这张照片尚无可用的人脸标注，请在人物页建立或更新索引。' : '这里暂时没有人脸。' }}</p>
+    <p v-else-if="!error && !results?.total" class="muted">{{ scope === 'photo' ? '这张照片尚无可用的人脸标注，请在人物页建立或更新索引。' : '这里暂时没有人脸。' }}</p>
     <template v-if="results?.items.length">
       <div class="face-toolbar">
         <button type="button" class="secondary" :disabled="selectionDisabled || (grouped && (writable === false || selectedCount === results.total))" @click="selectAll">{{ grouped ? '全选本组' : '选择本页' }}</button>
@@ -166,7 +173,7 @@ function selectAll() {
           <label><input type="checkbox" :checked="isSelected(face.id)" :disabled="selectionDisabled || (grouped && writable === false)" :aria-label="`选择人脸 ${face.id}`" @change="toggle(face.id)" />
             <img :src="face.thumbnail" :alt="face.personName || '未命名人脸'" width="112" height="112" loading="lazy" />
           </label>
-          <p>{{ face.personName || (face.personId ? `未命名人物 ${face.personId}` : '待整理') }}<span v-if="face.personId"> · {{ face.manual ? '人工指定' : '自动归入' }}</span><span v-if="face.personIgnored"> · 已忽略人物</span><span v-if="face.ignored"> · 已忽略人脸</span></p>
+          <p>{{ face.personName || (face.personId ? `未命名人物 ${face.personId}` : '待整理') }}<span v-if="face.personId"> · {{ face.manual ? '人工指定' : '自动归入' }}</span><span v-if="face.ignored"> · 已忽略人脸</span></p>
           <p v-if="face.needsReview" class="review">照片已变化，这是旧标注。请核对当前检出的人脸后重新指定人物，或忽略此标注。</p>
           <template v-if="suggestions && selected.includes(face.id) && !face.needsReview">
             <p v-if="suggestionsByFace.get(face.id)?.length">

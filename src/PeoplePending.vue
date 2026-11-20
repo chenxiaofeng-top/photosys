@@ -2,30 +2,43 @@
 import { computed, ref, shallowRef, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
-import type { PendingGroup, PendingOverview } from "./people";
+import type { FaceEditKind, PendingGroupResume, PendingOverview } from "./people";
 
 const props = defineProps<{ scanId: number; revision: number; writable: boolean; busy: boolean }>();
 const emit = defineEmits<{ changed: []; preview: [fileId: number] }>();
 const overview = shallowRef<PendingOverview>();
-const active = shallowRef<PendingGroup | "ungrouped">();
+const active = shallowRef<number | "ungrouped" | "dissolved">();
+const resumeGroup = shallowRef<PendingGroupResume>();
+const snapshotRevision = ref(props.revision);
 const page = ref(0);
 const refresh = ref(0);
 const loading = ref(false);
 const error = ref("");
 const stale = ref(false);
+let keepAfterIgnore = false;
 
-const view = computed(() => active.value && overview.value
-  ? { token: overview.value.token, groupId: active.value === "ungrouped" ? null : active.value.id }
+const view = computed(() => active.value !== undefined && active.value !== "dissolved" && overview.value
+  ? { token: overview.value.token, groupId: active.value === "ungrouped" ? null : active.value }
   : undefined);
 
-watch(() => props.scanId, () => {
+function closeDetail() {
   active.value = undefined;
+  resumeGroup.value = undefined;
+  keepAfterIgnore = false;
+}
+
+watch(() => props.scanId, () => {
+  closeDetail();
   page.value = 0;
   stale.value = false;
 });
 watch(() => props.revision, () => {
-  if (active.value) stale.value = true;
-  active.value = undefined;
+  if (keepAfterIgnore) {
+    keepAfterIgnore = false;
+    return;
+  }
+  if (active.value !== undefined) stale.value = true;
+  closeDetail();
   page.value = 0;
 });
 watch([() => props.scanId, () => props.revision, page, refresh], async (_, __, cleanup) => {
@@ -33,10 +46,20 @@ watch([() => props.scanId, () => props.revision, page, refresh], async (_, __, c
   cleanup(() => { current = false; });
   loading.value = true;
   error.value = "";
-  overview.value = undefined;
+  if (active.value === undefined) overview.value = undefined;
+  const requestedResume = resumeGroup.value;
+  const revision = props.revision;
   try {
-    const result = await invoke<PendingOverview>("people_pending_groups", { scanId: props.scanId, page: page.value });
-    if (current) overview.value = result;
+    const result = await invoke<PendingOverview>("people_pending_groups", {
+      scanId: props.scanId, page: page.value, resumeGroup: requestedResume,
+    });
+    if (!current) return;
+    if (requestedResume && resumeGroup.value === requestedResume) {
+      active.value = result.resumedGroupId ?? "dissolved";
+      resumeGroup.value = undefined;
+    }
+    overview.value = result;
+    snapshotRevision.value = revision;
   } catch (cause) {
     if (current) error.value = String(cause);
   } finally {
@@ -45,22 +68,27 @@ watch([() => props.scanId, () => props.revision, page, refresh], async (_, __, c
 }, { immediate: true });
 
 function reload() {
-  active.value = undefined;
   refresh.value++;
 }
 
 function onStale() {
-  stale.value = true;
-  reload();
+  error.value = "待整理分组已变化，请重新读取。";
 }
 
-function onChanged() {
-  active.value = undefined;
+function onChanged(kind: FaceEditKind, remainingFaceIds?: number[]) {
+  if (kind === "ignore") {
+    keepAfterIgnore = true;
+    if (typeof active.value === "number" && remainingFaceIds) {
+      resumeGroup.value = { groupId: active.value, faceIds: remainingFaceIds };
+    }
+  } else {
+    closeDetail();
+  }
   stale.value = false;
   emit("changed");
 }
 
-function open(group: PendingGroup | "ungrouped") {
+function open(group: number | "ungrouped") {
   stale.value = false;
   active.value = group;
 }
@@ -74,15 +102,17 @@ function open(group: PendingGroup | "ungrouped") {
       <p class="error" role="alert">{{ error }}</p>
       <button type="button" class="secondary" @click="reload">重新读取</button>
     </div>
-    <template v-if="view">
+    <template v-if="active !== undefined">
       <div class="pending-actions">
-        <button type="button" class="secondary" @click="active = undefined">返回待整理</button>
+        <button type="button" class="secondary" @click="closeDetail">返回待整理</button>
         <h2>{{ active === 'ungrouped' ? '未成组的人脸' : '相似人脸组' }}</h2>
       </div>
-      <PeopleFaceEditor :scan-id="scanId" scope="pending" :pending-view="view" :revision="revision"
-        :writable="writable" :busy="busy" @changed="onChanged" @preview="emit('preview', $event)" @stale="onStale" />
+      <PeopleFaceEditor v-if="view" v-show="!loading && !error" :scan-id="scanId" scope="pending" :pending-view="view"
+        :revision="snapshotRevision" :writable="writable" :busy="busy || loading || !!error"
+        @changed="onChanged" @preview="emit('preview', $event)" @stale="onStale" />
+      <p v-else-if="active === 'dissolved' && !loading && !error" class="muted">这个相似人脸组已解散。</p>
     </template>
-    <template v-else-if="overview">
+    <template v-else-if="overview && !loading && !error">
       <div v-if="overview.ungroupedCount" class="pending-actions">
         <button type="button" class="secondary" @click="open('ungrouped')">未成组的人脸（{{ overview.ungroupedCount }}）</button>
       </div>
@@ -90,7 +120,7 @@ function open(group: PendingGroup | "ungrouped") {
         <h2>相似人脸组</h2>
         <ul class="pending-groups">
           <li v-for="group in overview.groups.items" :key="group.id">
-            <button type="button" class="secondary group-card" @click="open(group)">
+            <button type="button" class="secondary group-card" @click="open(group.id)">
               <img :src="group.thumbnail" alt="" width="96" height="96" loading="lazy" />
               <span>{{ group.count }} 张人脸</span>
             </button>

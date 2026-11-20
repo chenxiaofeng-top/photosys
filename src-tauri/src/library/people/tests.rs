@@ -496,7 +496,7 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
         vec![0.64],
         vec![1.],
         vec![1.],
-        vec![1.],
+        vec![0.62],
         vec![1.],
         vec![0.7, 0.7],
         vec![0.2],
@@ -537,9 +537,15 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
         })
         .unwrap();
     store
-        .edit(Edit::IgnorePeople {
-            person_ids: vec![assigned(&store, ids[6][0]).unwrap()],
-        })
+        .connection
+        .execute(
+            "UPDATE people SET ignored=1 WHERE id=?1",
+            [assigned(&store, ids[6][0]).unwrap()],
+        )
+        .unwrap();
+    store
+        .connection
+        .pragma_update(None, "user_version", 5)
         .unwrap();
     store
         .connection
@@ -555,6 +561,7 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
             [ids[7][0]],
         )
         .unwrap();
+    drop(store);
 
     let target_view = query::people(id, "目标", 0, Default::default())
         .unwrap()
@@ -581,9 +588,12 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
         .collect();
     assert_eq!(
         found,
-        [ids[1][0], ids[2][0], ids[8][0], ids[8][1], ids[3][0]]
+        [
+            ids[1][0], ids[2][0], ids[8][0], ids[8][1], ids[3][0], ids[6][0]
+        ]
     );
     assert_eq!(results.faces.items[1].source_person_id, Some(other));
+    assert_eq!(results.faces.items[5].source_person_id, None);
     assert!((results.faces.items[1].score - 0.8).abs() < 0.001);
     assert!(
         query::with(id, |store| store
@@ -613,6 +623,7 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
         ))
     };
     assert!(confirm(&[2, 3]).is_err());
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
     store
         .edit(Edit::Unassign {
             face_ids: vec![ids[2][0]],
@@ -896,7 +907,7 @@ fn deleted_people_return_faces_to_manual_sorting_and_undo_as_one_edit() {
     );
 
     assert!(grouping::Groups::pending_ids(id).unwrap().is_empty());
-    pending::overview(id, 0).unwrap();
+    pending::overview(id, 0, None).unwrap();
     let mut groups = grouping::Groups::load(id, grouping::Policy::shipped()).unwrap();
     groups.assign(&mut store, &[automatic, manual]).unwrap();
     assert_eq!(assigned(&store, automatic), None);
@@ -1203,7 +1214,7 @@ fn pending_groups_are_temporary_and_confirm_across_pages_for_both_models() {
             query::people(id, "", 0, Default::default()).unwrap().total,
             0
         );
-        let overview = || serde_json::to_value(pending::overview(id, 0).unwrap()).unwrap();
+        let overview = || serde_json::to_value(pending::overview(id, 0, None).unwrap()).unwrap();
         let view = |snapshot: &serde_json::Value| pending::View {
             token: snapshot["token"].as_str().unwrap().into(),
             group_id: snapshot["groups"]["items"][0]["id"].as_i64(),
@@ -1289,6 +1300,74 @@ fn pending_groups_are_temporary_and_confirm_across_pages_for_both_models() {
             0
         );
         assert_eq!(status(id).unwrap().pending_faces, 29);
+
+        let original = view(&overview());
+        let original_group_id = original.group_id.unwrap();
+        assert_eq!(original_group_id, ids[0][0]);
+        let ignored = vec![ids[0][0], ids[1][0], ids[2][0], ids[3][0]];
+        let remaining = edit_pending_group(
+            id,
+            original,
+            pending::Selection::Selected {
+                face_ids: ignored.clone(),
+            },
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(remaining.len(), 23);
+        assert!(remaining.contains(&excluded));
+        assert!(ignored.iter().all(|id| !remaining.contains(id)));
+        let refreshed = serde_json::to_value(
+            pending::overview(
+                id,
+                0,
+                Some(&pending::ResumeGroup {
+                    group_id: original_group_id,
+                    face_ids: remaining,
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let resumed_id = refreshed["resumedGroupId"].as_i64().unwrap();
+        assert_ne!(resumed_id, original_group_id);
+        let resumed = pending::View {
+            token: refreshed["token"].as_str().unwrap().into(),
+            group_id: Some(resumed_id),
+        };
+        let faces = query::pending_faces(id, 1, &resumed).unwrap();
+        assert_eq!(faces.page, 0);
+        assert!(faces.items.iter().any(|face| face.id == excluded));
+        assert!(faces.items.iter().all(|face| !ignored.contains(&face.id)));
+        let remaining = edit_pending_group(
+            id,
+            resumed,
+            pending::Selection::All {
+                excluded_face_ids: vec![],
+            },
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(remaining.is_empty());
+        let refreshed = serde_json::to_value(
+            pending::overview(
+                id,
+                0,
+                Some(&pending::ResumeGroup {
+                    group_id: resumed_id,
+                    face_ids: remaining,
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(refreshed["resumedGroupId"].is_null());
+        store.undo().unwrap();
+        store.undo().unwrap();
 
         store
             .edit(Edit::Assign {
@@ -1518,7 +1597,7 @@ fn real_faces_install_incremental_cancel_and_restore() {
     let same = update(id, true, &channel, || Ok(runtime.clone())).unwrap();
     assert_eq!(same.reused, 3);
     assert_eq!(same.pending_faces, 3);
-    let overview = serde_json::to_value(pending::overview(id, 0).unwrap()).unwrap();
+    let overview = serde_json::to_value(pending::overview(id, 0, None).unwrap()).unwrap();
     assert_eq!(overview["groups"]["items"][0]["count"], 3);
     let f = query::faces(id, FaceScope::Pending, None, None, 0).unwrap();
     let face_id = f.items[0].id;
@@ -2165,7 +2244,10 @@ fn version_two_people_remain_visible_and_old_undo_payloads_survive() {
         query::people(id, "", 0, Default::default()).unwrap().items[0].name,
         "新名字"
     );
-    assert_eq!(query::counts(id).unwrap().2, 0);
+    assert_eq!(
+        query::counts(id).unwrap().2.as_deref(),
+        Some("修改人物名称")
+    );
     assert_eq!(
         Store::open(&scan, false)
             .unwrap()
@@ -2179,15 +2261,6 @@ fn version_two_people_remain_visible_and_old_undo_payloads_survive() {
     assert_eq!(
         query::people(id, "", 0, Default::default()).unwrap().items[0].name,
         "旧名字"
-    );
-    store
-        .edit(Edit::IgnorePeople {
-            person_ids: vec![person],
-        })
-        .unwrap();
-    assert_eq!(
-        query::people(id, "", 0, Default::default()).unwrap().total,
-        0
     );
 }
 
@@ -2401,15 +2474,15 @@ fn person_photos_months_and_map_share_geographic_filters() {
 }
 
 #[test]
-fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader() {
+fn database_backup_restores_legacy_people_and_dissolves_ignored_groups() {
     use crate::database_backup;
     let _session = TEST_SESSION.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    image::RgbImage::new(8, 8)
-        .save(source.join("a.jpg"))
-        .unwrap();
+    for file in ["a.jpg", "b.jpg"] {
+        image::RgbImage::new(8, 8).save(source.join(file)).unwrap();
+    }
     let id = open(&source);
     let faces = save(id);
     let scan = scan(id).unwrap();
@@ -2421,16 +2494,52 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
             name: Some("妈妈".into()),
         })
         .unwrap();
+    let parent = assigned(&store, faces[0]).unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: faces[1..].to_vec(),
+            person_id: None,
+            name: Some("旧分组".into()),
+        })
+        .unwrap();
+    let retired = assigned(&store, faces[1]).unwrap();
     store
         .edit(Edit::Ignore {
-            face_ids: vec![faces[1]],
+            face_ids: vec![faces[2]],
         })
         .unwrap();
     store
-        .edit(Edit::IgnorePeople {
-            person_ids: vec![1],
+        .edit(Edit::Rename {
+            person_id: parent,
+            name: "新名称".into(),
         })
         .unwrap();
+    store
+        .edit(Edit::Rename {
+            person_id: retired,
+            name: "隐藏分组".into(),
+        })
+        .unwrap();
+    let connection = &store.connection;
+    connection
+        .execute("UPDATE people SET ignored=1 WHERE id=?1", [retired])
+        .unwrap();
+    connection
+        .execute("UPDATE faces SET manual=0 WHERE id=?1", [faces[1]])
+        .unwrap();
+    connection
+        .execute("UPDATE faces SET active=0,review=1 WHERE id=?1", [faces[3]])
+        .unwrap();
+    for description in ["忽略人物", "恢复忽略的人物", "忽略人物"] {
+        connection
+            .execute(
+                "INSERT INTO edits(description,payload)
+            SELECT ?1,payload FROM edits WHERE description='修改人物名称' ORDER BY id DESC LIMIT 1",
+                [description],
+            )
+            .unwrap();
+    }
+    connection.pragma_update(None, "user_version", 5).unwrap();
     let model = ai::catalog::active(ai::ModelKind::People);
     let saved = serde_json::json!({"threshold": 0.62_f32, "margin": 0.04_f32});
     grouping::Policy::save(
@@ -2440,20 +2549,71 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
     )
     .unwrap();
     drop(store);
+    let assert_projection = |scan_id| {
+        let people = query::people(scan_id, "", 0, Default::default()).unwrap();
+        assert_eq!(people.total, 1);
+        assert_eq!(people.items[0].id, parent);
+        assert_eq!(people.items[0].photo_count, 1);
+        assert_eq!(
+            query::photos(scan_id, parent, &all(), Sort::DateAsc, 0)
+                .unwrap()
+                .total,
+            1
+        );
+        assert!(query::photos(scan_id, retired, &all(), Sort::DateAsc, 0).is_err());
+        let pending = query::faces(scan_id, FaceScope::Pending, None, None, 0).unwrap();
+        assert_eq!(pending.total, 2);
+        assert!(
+            pending
+                .items
+                .iter()
+                .all(|f| f.person_id.is_none() && f.manual)
+        );
+        assert!(
+            pending
+                .items
+                .iter()
+                .any(|f| f.id == faces[1] && !f.needs_review)
+        );
+        assert!(
+            pending
+                .items
+                .iter()
+                .any(|f| f.id == faces[3] && f.needs_review)
+        );
+        let ignored = query::faces(scan_id, FaceScope::Ignored, None, None, 0).unwrap();
+        assert_eq!(ignored.total, 1);
+        assert_eq!(ignored.items[0].id, faces[2]);
+        assert_eq!(ignored.items[0].person_id, None);
+        assert_eq!(
+            query::counts(scan_id).unwrap(),
+            (2, 1, Some("修改人物名称".into()))
+        );
+    };
     // Keep the reusable read connection alive just as the people UI does.
+    assert_projection(id);
     assert_eq!(
-        query::people(id, "", 0, Default::default()).unwrap().total,
-        0
+        Store::open(&scan, false)
+            .unwrap()
+            .unwrap()
+            .schema_version()
+            .unwrap(),
+        5
     );
     let zip = temp.path().join("backup.zip");
     database_backup::export(&scan.root, &zip, |_| {}).unwrap();
     let checked = tempfile::tempdir().unwrap();
     let inspection = database_backup::inspect(&zip, checked.path(), &|_| {}).unwrap();
-    let original = fs::read(source.join("a.jpg")).unwrap();
+    let original = [
+        fs::read(source.join("a.jpg")).unwrap(),
+        fs::read(source.join("b.jpg")).unwrap(),
+    ];
     let mut store = Store::open(&scan, true).unwrap().unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_projection(id);
     store
         .edit(Edit::Rename {
-            person_id: 1,
+            person_id: parent,
             name: "恢复前的名称".into(),
         })
         .unwrap();
@@ -2472,39 +2632,34 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
     let new_id = open(&source);
     assert_ne!(id, new_id);
     assert!(query::people(id, "", 0, Default::default()).is_err());
-    assert_eq!(
-        query::people(new_id, "", 0, Default::default())
-            .unwrap()
-            .total,
-        0
-    );
+    assert_projection(new_id);
     let restored = status(new_id).unwrap();
-    assert_eq!(restored.ignored_people, 1);
     assert_eq!(
         serde_json::to_value(restored.grouping_settings).unwrap()["parameters"],
         saved
     );
     let scan = super::scan(new_id).unwrap();
+    assert_eq!(
+        Store::open(&scan, false)
+            .unwrap()
+            .unwrap()
+            .schema_version()
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        Store::open(&scan, true)
+            .unwrap()
+            .unwrap()
+            .schema_version()
+            .unwrap(),
+        SCHEMA_VERSION
+    );
     let mut store = Store::open(&scan, true).unwrap().unwrap();
-    assert_eq!(
-        store
-            .connection
-            .query_row("SELECT manual FROM faces WHERE id=?1", [faces[0]], |r| r
-                .get::<_, bool>(
-                0
-            ))
-            .unwrap(),
-        true
-    );
-    assert_eq!(
-        store
-            .connection
-            .query_row("SELECT ignored FROM faces WHERE id=?1", [faces[1]], |r| {
-                r.get::<_, bool>(0)
-            })
-            .unwrap(),
-        true
-    );
+    assert_projection(new_id);
+    assert_eq!(assigned(&store, faces[1]), None);
+    assert_eq!(assigned(&store, faces[2]), None);
+    assert_eq!(assigned(&store, faces[3]), None);
     store.undo().unwrap();
     assert_eq!(
         query::people(new_id, "", 0, Default::default())
@@ -2515,14 +2670,25 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
     );
     store.undo().unwrap();
     assert_eq!(
-        store
-            .connection
-            .query_row("SELECT ignored FROM faces WHERE id=?1", [faces[1]], |r| {
-                r.get::<_, bool>(0)
-            })
-            .unwrap(),
-        false
+        query::faces(new_id, FaceScope::Ignored, None, None, 0)
+            .unwrap()
+            .total,
+        0
     );
-    assert_eq!(fs::read(source.join("a.jpg")).unwrap(), original);
+    assert_eq!(assigned(&store, faces[2]), None);
+    assert_eq!(query::counts(new_id).unwrap().0, 3);
+    while store.undo_description().unwrap().is_some() {
+        store.undo().unwrap();
+        assert_eq!(
+            query::people(new_id, "隐藏分组", 0, Default::default())
+                .unwrap()
+                .total,
+            0
+        );
+        assert!(query::photos(new_id, retired, &all(), Sort::DateAsc, 0).is_err());
+    }
+    for (file, bytes) in ["a.jpg", "b.jpg"].into_iter().zip(original) {
+        assert_eq!(fs::read(source.join(file)).unwrap(), bytes);
+    }
     query::close_for_test();
 }

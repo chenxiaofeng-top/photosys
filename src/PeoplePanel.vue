@@ -25,11 +25,10 @@ const similarityPerson = shallowRef<Person>();
 const selectedDetails = shallowRef<Person>();
 const activePerson = computed(() => selectedDetails.value?.id === props.selected?.id ? selectedDetails.value : props.selected);
 const loading = ref(false);
-const scope = ref<"people" | "pending" | "ignoredPeople" | "ignoredFaces">("people");
+const scope = ref<"people" | "pending" | "ignoredFaces">("people");
 const unnamedOnly = ref(false);
 const singlePhotoOnly = ref(false);
 const selectedIds = ref<number[]>([]);
-const managedHidden = shallowRef<Person>();
 const dispositionMessage = ref("");
 const peopleTab = ref<HTMLButtonElement>();
 const deleteDialog = ref<HTMLDialogElement>();
@@ -46,8 +45,6 @@ let request = 0;
 let mounted = true;
 const running = computed(() => indexTask.value || !!state.value?.running);
 const editDisabled = computed(() => props.libraryBusy || saving.value || groupingBusy.value || similarityBusy.value || !state.value?.writable);
-const ignoredScope = computed(() => scope.value === "ignoredPeople" || scope.value === "ignoredFaces");
-const listScope = computed(() => scope.value === "people" || scope.value === "ignoredPeople");
 function setState(value: PeopleStatus) { if (value.scanId === props.scanId && mounted) { state.value = value; emit("status", value); } }
 async function refresh(automatic = false) {
   if (props.libraryBusy) return;
@@ -72,7 +69,7 @@ async function cancel() { cancelling.value = true; try { await invoke("people_ca
 watch(() => props.libraryBusy, busy => { if (!busy) void refresh(true); });
 watch(() => props.scanId, (id, old) => {
   request++; indexTask.value = false; state.value = undefined; error.value = ""; page.value = 0; scope.value = "people"; search.value = ""; committedSearch.value = ""; issuesOpen.value = false; issuePage.value = 0; cancelling.value = false;
-  unnamedOnly.value = false; singlePhotoOnly.value = false; managedHidden.value = undefined; dispositionMessage.value = "";
+  unnamedOnly.value = false; singlePhotoOnly.value = false; dispositionMessage.value = "";
   selectedDetails.value = undefined; similarityPerson.value = undefined;
   deleteDialog.value?.close();
   if (old !== undefined) void invoke("people_cancel_index", { scanId: old }).catch(() => {});
@@ -81,20 +78,17 @@ watch(() => props.scanId, (id, old) => {
 watch(ready, () => { void refresh(true); });
 watch(() => props.revision, () => { void refresh(); });
 watch(search, (_, __, cleanup) => { const timer = setTimeout(() => { committedSearch.value = search.value; page.value = 0; }, 250); cleanup(() => clearTimeout(timer)); });
-watch(scope, () => { search.value = ""; committedSearch.value = ""; managedHidden.value = undefined; dispositionMessage.value = ""; }, { flush: "sync" });
+watch(scope, () => { search.value = ""; committedSearch.value = ""; dispositionMessage.value = ""; }, { flush: "sync" });
 watch([scope, unnamedOnly, singlePhotoOnly], () => { page.value = 0; }, { flush: "sync" });
-const listQuery = computed(() => {
-  const ignored = scope.value === "ignoredPeople";
-  return {
-    scanId: props.scanId, query: committedSearch.value, page: page.value,
-    filter: { ignored, unnamedOnly: !ignored && unnamedOnly.value, singlePhotoOnly: !ignored && singlePhotoOnly.value, importantFirst: !ignored },
-  };
-});
-watch([listQuery, () => props.revision], async ([query], [previous], cleanup) => {
+const listQuery = computed(() => ({
+  scanId: props.scanId, query: committedSearch.value, page: page.value,
+  filter: { unnamedOnly: unnamedOnly.value, singlePhotoOnly: singlePhotoOnly.value, importantFirst: true },
+}));
+watch([listQuery, scope, () => props.revision], async ([query, currentScope], [previous], cleanup) => {
   let current = true; cleanup(() => { current = false; });
   selectedIds.value = [];
   if (query !== previous) people.value = undefined;
-  if (!listScope.value) { loading.value = false; return; }
+  if (currentScope !== "people") { loading.value = false; return; }
   loading.value = true;
   try {
     const value = await invoke<Page<Person>>("people_list", query);
@@ -146,7 +140,6 @@ async function mutate(kind: "rename" | "merge" | "undo") {
     else await invoke("people_edit", { scanId, edit: kind === "rename" ? { kind, personId: person!.id, name: rename.value } : { kind, sourceId: person!.id, targetId: Number(mergeTarget.value) } });
     if (scanId === props.scanId) {
       if (kind === "merge") emit("select", undefined);
-      if (kind === "undo") managedHidden.value = undefined;
       emit("changed");
     }
   } catch (cause) { if (scanId === props.scanId) error.value = String(cause); }
@@ -164,23 +157,6 @@ async function setImportant(person: Person) {
     if (mounted && scanId === props.scanId) emit("changed");
   } catch (cause) {
     if (mounted && scanId === props.scanId) error.value = String(cause);
-  } finally {
-    saving.value = false;
-  }
-}
-async function setPeopleIgnored(personIds: number[], ignored: boolean) {
-  if (editDisabled.value || !personIds.length) return;
-  const scanId = props.scanId;
-  saving.value = true; error.value = ""; dispositionMessage.value = "";
-  try {
-    await invoke("people_edit", { scanId, edit: { kind: ignored ? "ignorePeople" : "restorePeople", personIds } });
-    if (scanId !== props.scanId || !mounted) return;
-    if (props.selected && personIds.includes(props.selected.id)) emit("select", undefined);
-    if (managedHidden.value && personIds.includes(managedHidden.value.id)) managedHidden.value = undefined;
-    dispositionMessage.value = `已${ignored ? "忽略" : "恢复"} ${personIds.length} 个人物。`;
-    emit("changed");
-  } catch (cause) {
-    if (scanId === props.scanId && mounted) error.value = String(cause);
   } finally {
     saving.value = false;
   }
@@ -214,10 +190,6 @@ async function deletePeople() {
   } finally {
     saving.value = false;
   }
-}
-function openPerson(person: Person) {
-  if (scope.value === "ignoredPeople") managedHidden.value = person;
-  else emit("select", person);
 }
 onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_index", { scanId: props.scanId }).catch(() => {}); });
 </script>
@@ -260,7 +232,6 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
       <details class="person-management"><summary>修改分组 / 管理人物与人脸</summary>
         <form class="people-actions" @submit.prevent="mutate('rename')"><label>人物名称 <input v-model="rename" maxlength="80" placeholder="例如：妈妈" :disabled="editDisabled" /></label><button type="submit" :disabled="editDisabled">保存名称</button></form>
         <div class="people-actions">
-          <button type="button" class="secondary" :disabled="editDisabled" @click="setPeopleIgnored([activePerson.id], true)">忽略此人</button>
           <button type="button" class="secondary" :disabled="editDisabled" @click="requestDelete([activePerson.id], activePerson)">删除此人</button>
         </div>
         <div class="people-actions"><label>查找合并目标 <input v-model="mergeSearch" maxlength="80" placeholder="输入另一人物的名称" /></label><label>合并到 <select v-model="mergeTarget" :disabled="editDisabled"><option value="">选择人物</option><option v-for="p in mergeTargets?.items.filter(p => p.id !== activePerson!.id)" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option></select></label><button type="button" class="secondary" :disabled="editDisabled || !mergeTarget" @click="mutate('merge')">合并人物</button></div>
@@ -272,46 +243,31 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
       <nav class="people-tabs" aria-label="人物分类">
         <button ref="peopleTab" type="button" :class="{ secondary: scope !== 'people' }" :aria-pressed="scope === 'people'" @click="scope = 'people'">人物</button>
         <button type="button" :class="{ secondary: scope !== 'pending' }" :aria-pressed="scope === 'pending'" @click="scope = 'pending'">待整理（{{ state?.pendingFaces ?? 0 }}）</button>
-        <button type="button" :class="{ secondary: !ignoredScope }" :aria-pressed="ignoredScope" @click="scope = 'ignoredPeople'">已忽略</button>
+        <button type="button" :class="{ secondary: scope !== 'ignoredFaces' }" :aria-pressed="scope === 'ignoredFaces'" @click="scope = 'ignoredFaces'">已忽略（{{ state?.ignoredFaces ?? 0 }}）</button>
       </nav>
-      <nav v-if="ignoredScope" class="people-tabs" aria-label="已忽略的项目">
-        <button type="button" :class="{ secondary: scope !== 'ignoredPeople' }" :aria-pressed="scope === 'ignoredPeople'" @click="scope = 'ignoredPeople'">人物（{{ state?.ignoredPeople ?? 0 }}）</button>
-        <button type="button" :class="{ secondary: scope !== 'ignoredFaces' }" :aria-pressed="scope === 'ignoredFaces'" @click="scope = 'ignoredFaces'">单张人脸（{{ state?.ignoredFaces ?? 0 }}）</button>
-      </nav>
-      <div v-if="managedHidden" class="person-management">
-        <div class="people-actions detail-title">
-          <button type="button" class="secondary" @click="managedHidden = undefined">返回已忽略人物</button>
-          <h2>{{ personName(managedHidden) }}</h2>
-          <button type="button" :disabled="editDisabled" @click="setPeopleIgnored([managedHidden.id], false)">恢复此人</button>
-        </div>
-        <PeopleFaceEditor :scan-id="scanId" :person-id="managedHidden.id" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
-      </div>
-      <template v-else-if="listScope">
+      <template v-if="scope === 'people'">
         <label class="people-search">查找人物 <input v-model="search" placeholder="输入人物名称" maxlength="80" /></label>
-        <div v-if="scope === 'people'" class="people-actions">
+        <div class="people-actions">
           <label><input v-model="unnamedOnly" type="checkbox" /> 仅未命名</label>
           <label><input v-model="singlePhotoOnly" type="checkbox" /> 仅出现在一张照片</label>
         </div>
         <p v-if="loading" role="status">正在读取人物…</p>
-        <p v-else-if="people && !people.total" class="muted">{{ scope === 'ignoredPeople' ? '没有符合条件的已忽略人物。' : state?.enabled ? '没有符合条件的人物。' : '建立人物索引后，可从「待整理」选择人脸并新增人物。' }}</p>
+        <p v-else-if="people && !people.total" class="muted">{{ state?.enabled ? '没有符合条件的人物。' : '建立人物索引后，可从「待整理」选择人脸并新增人物。' }}</p>
         <div v-if="people?.items.length && state?.writable" class="people-actions">
           <button type="button" class="secondary" :disabled="editDisabled" @click="selectedIds = people!.items.map(person => person.id)">选择本页</button>
           <button v-if="selectedIds.length" type="button" class="secondary" :disabled="editDisabled" @click="selectedIds = []">取消选择</button>
-          <button type="button" :disabled="editDisabled || !selectedIds.length" @click="setPeopleIgnored(selectedIds, scope === 'people')">
-            {{ scope === 'people' ? '忽略所选人物' : '恢复所选人物' }}{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
-          </button>
-          <button v-if="scope === 'people'" type="button" class="secondary" :disabled="editDisabled || loading || !selectedIds.length" @click="requestDelete(selectedIds)">
+          <button type="button" class="secondary" :disabled="editDisabled || loading || !selectedIds.length" @click="requestDelete(selectedIds)">
             删除所选人物{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
           </button>
         </div>
         <ul v-if="people?.items.length" class="person-grid">
           <li v-for="person in people.items" :key="person.id" class="person-item" :class="{ checked: selectedIds.includes(person.id) }">
             <input v-if="state?.writable" v-model="selectedIds" class="person-checkbox" type="checkbox" :value="person.id" :disabled="editDisabled" :aria-label="`选择 ${personName(person)}`" />
-            <button type="button" class="person-card secondary" @click="openPerson(person)">
+            <button type="button" class="person-card secondary" @click="emit('select', person)">
             <img v-if="person.thumbnail" :src="person.thumbnail" :alt="personName(person)" width="112" height="112" loading="lazy" /><span v-else class="avatar-placeholder" aria-hidden="true">人</span>
             <strong>{{ personName(person) }}</strong><span>{{ person.photoCount }} 张照片</span>
             </button>
-            <button v-if="scope === 'people' && (state?.writable || person.important)" type="button" class="secondary important-action"
+            <button v-if="state?.writable || person.important" type="button" class="secondary important-action"
               :aria-label="`${person.important ? '取消重要人物标记' : '标记为重要人物'} ${personName(person)}`"
               :aria-pressed="!!person.important" :disabled="editDisabled" @click="setImportant(person)">
               {{ person.important ? '★ 重要人物' : '☆ 标记重要' }}

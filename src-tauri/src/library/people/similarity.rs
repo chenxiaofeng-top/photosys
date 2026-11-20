@@ -12,7 +12,7 @@ const INDEXED: &str = "FROM visible_faces f JOIN media m ON m.path=f.path
     LEFT JOIN person_groups p ON p.id=f.person_id
     WHERE m.version=?1 AND m.error IS NULL AND f.ignored=0 AND f.review=0
       AND f.vector IS NOT NULL";
-const CANDIDATES: &str = "AND (f.person_id IS NULL OR (p.id<>?2 AND p.ignored=0 AND p.archived=0))
+const CANDIDATES: &str = "AND (f.person_id IS NULL OR (p.id<>?2 AND p.archived=0))
     AND NOT EXISTS(SELECT 1 FROM faces
         WHERE path=f.path AND active=1 AND ignored=0 AND person_id=?2)
     AND NOT EXISTS(SELECT 1 FROM rejections WHERE face_id=f.id AND person_id=?2)";
@@ -113,7 +113,7 @@ fn anchor(
     let face = connection
         .query_row(
             &format!(
-                "SELECT {} {INDEXED} AND f.person_id=?2 AND f.id=?3 AND p.ignored=0 AND p.archived=0",
+                "SELECT {} {INDEXED} AND f.person_id=?2 AND f.id=?3 AND p.archived=0",
                 IndexedFace::COLUMNS
             ),
             params![version, criteria.target_person_id, criteria.anchor_face_id],

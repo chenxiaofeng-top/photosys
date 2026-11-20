@@ -2,11 +2,11 @@
 use super::{
     super::{self as library, Filter, ItemView, Kind, Page, Sort, favorites},
     pending,
-    store::Store,
+    store::{SCHEMA_VERSION, Store},
 };
 use crate::ai::{error, faces::GEOMETRY_VERSION};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -86,19 +86,21 @@ pub(super) fn with<T>(
                 .map_err(error)?;
             let geometry = store.geometry_expression()?;
             let schema_version = store.schema_version()?;
-            let ignored = if schema_version >= 3 { "ignored" } else { "0" };
+            let legacy_groups = (3..SCHEMA_VERSION).contains(&schema_version);
             let important = if schema_version >= 4 {
                 "important"
             } else {
                 "0"
             };
-            let legacy_data_version = if schema_version < 5 {
-                let version = data_version(&store)?;
-                store.classify_legacy(ignored, important)?;
+            let legacy_data_version = (schema_version < 5)
+                .then(|| data_version(&store))
+                .transpose()?;
+            let source_faces = if legacy_data_version.is_some() {
+                store.classify_legacy(if legacy_groups { "ignored" } else { "0" }, important)?;
                 store
                     .connection
                     .execute_batch(
-                        "CREATE TEMP VIEW faces AS
+                        "CREATE TEMP VIEW legacy_assigned_faces AS
                     SELECT f.id,f.path,f.bbox,f.confidence,f.vector,f.thumbnail,
                       CASE WHEN c.id IS NOT NULL OR (f.manual=1 AND d.id IS NULL)
                         THEN f.person_id END AS person_id,
@@ -108,17 +110,39 @@ pub(super) fn with<T>(
                     LEFT JOIN temp.legacy_dispositions d ON d.id=f.id AND d.person_id=f.person_id;",
                     )
                     .map_err(error)?;
-                Some(version)
+                "temp.legacy_assigned_faces"
             } else {
-                None
+                "main.faces"
             };
+            if legacy_groups {
+                store
+                    .connection
+                    .execute_batch(&format!(
+                        "CREATE TEMP VIEW faces AS
+                    SELECT f.id,f.path,f.bbox,f.confidence,f.vector,f.thumbnail,
+                      CASE WHEN retired.id IS NULL THEN f.person_id END AS person_id,
+                      CASE WHEN retired.id IS NOT NULL AND f.active=1 AND f.ignored=0
+                        THEN 1 ELSE f.manual END AS manual,f.ignored,f.active,f.review
+                    FROM {source_faces} f LEFT JOIN main.people retired
+                      ON retired.id=f.person_id AND retired.ignored=1;"
+                    ))
+                    .map_err(error)?;
+            } else if legacy_data_version.is_some() {
+                store
+                    .connection
+                    .execute_batch(
+                        "CREATE TEMP VIEW faces AS SELECT * FROM temp.legacy_assigned_faces;",
+                    )
+                    .map_err(error)?;
+            }
             let archived = if legacy_data_version.is_some() {
                 "(archived OR id NOT IN(SELECT id FROM temp.legacy_people))"
             } else {
                 "archived"
             };
+            let retired = if legacy_groups { " OR ignored=1" } else { "" };
             store.connection.execute_batch(&format!(
-                "CREATE TEMP VIEW person_groups AS SELECT id,name,{archived} AS archived,{ignored} AS ignored,{important} AS important FROM main.people;"
+                "CREATE TEMP VIEW person_groups AS SELECT id,name,({archived}{retired}) AS archived,{important} AS important FROM main.people;"
             )).map_err(error)?;
             store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND ({geometry})='{GEOMETRY_VERSION}';")).map_err(error)?;
             store.connection.execute_batch(&format!("
@@ -129,10 +153,10 @@ pub(super) fn with<T>(
                   WITH stale AS MATERIALIZED (SELECT c.path FROM current_media c LEFT JOIN media m ON m.path=c.path
                     WHERE m.path IS NULL OR ({geometry})!='{GEOMETRY_VERSION}' OR m.stamp!=c.stamp OR m.rotation!=c.rotation)
                   SELECT id FROM visible_faces WHERE ignored=0 AND person_id IS NULL
-                  UNION ALL SELECT f.id FROM faces f JOIN current_media c ON c.path=f.path LEFT JOIN person_groups p ON p.id=f.person_id
-                    WHERE f.active=0 AND f.review=1 AND f.manual=1 AND f.ignored=0 AND COALESCE(p.ignored,0)=0
-                  UNION ALL SELECT f.id FROM stale s CROSS JOIN faces f LEFT JOIN person_groups p ON p.id=f.person_id
-                    WHERE f.path=s.path AND f.active=1 AND f.manual=1 AND f.ignored=0 AND COALESCE(p.ignored,0)=0;
+                  UNION ALL SELECT f.id FROM faces f JOIN current_media c ON c.path=f.path
+                    WHERE f.active=0 AND f.review=1 AND f.manual=1 AND f.ignored=0
+                  UNION ALL SELECT f.id FROM stale s CROSS JOIN faces f
+                    WHERE f.path=s.path AND f.active=1 AND f.manual=1 AND f.ignored=0;
             ")).map_err(error)?;
             *reader = Some(Reader {
                 scan_id,
@@ -223,7 +247,6 @@ pub(crate) struct FaceView {
     pub bbox: [f32; 4],
     pub manual: bool,
     pub ignored: bool,
-    pub person_ignored: bool,
     pub needs_review: bool,
 }
 #[derive(Serialize)]
@@ -238,7 +261,6 @@ pub(super) fn image(bytes: Vec<u8>) -> String {
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct PeopleFilter {
-    ignored: bool,
     unnamed_only: bool,
     single_photo_only: bool,
     important_first: bool,
@@ -262,14 +284,13 @@ pub(super) fn people(
                 items: Vec::new(),
             });
         };
-        const MATCH: &str = "FROM person_groups g WHERE g.archived=0 AND g.ignored=?2
-            AND (?1='' OR instr(lower(g.name),lower(?1))>0) AND (?3=0 OR g.name='')
-            AND (?4=0 OR (SELECT COUNT(*) FROM (SELECT DISTINCT path FROM visible_faces
+        const MATCH: &str = "FROM person_groups g WHERE g.archived=0
+            AND (?1='' OR instr(lower(g.name),lower(?1))>0) AND (?2=0 OR g.name='')
+            AND (?3=0 OR (SELECT COUNT(*) FROM (SELECT DISTINCT path FROM visible_faces
                 WHERE person_id=g.id AND ignored=0 LIMIT 2))=1)
-            AND (?5 IS NULL OR g.id=?5)";
+            AND (?4 IS NULL OR g.id=?4)";
         let args = params![
             query.trim(),
-            filter.ignored,
             filter.unnamed_only,
             filter.single_photo_only,
             filter.person_id
@@ -286,7 +307,7 @@ pub(super) fn people(
             .prepare(&format!(
                 "WITH selected AS (
                 SELECT g.id,g.name,g.important {MATCH}
-                ORDER BY (?7 AND g.important) DESC,g.name='',g.name,g.id LIMIT 24 OFFSET ?6
+                ORDER BY (?6 AND g.important) DESC,g.name='',g.name,g.id LIMIT 24 OFFSET ?5
              )
              SELECT p.id,p.name,
                (SELECT COUNT(DISTINCT path) FROM visible_faces WHERE person_id=p.id AND ignored=0),
@@ -295,14 +316,13 @@ pub(super) fn people(
              FROM selected p LEFT JOIN faces avatar ON avatar.id=(
                 SELECT id FROM visible_faces WHERE person_id=p.id AND ignored=0 ORDER BY id LIMIT 1
              )
-             ORDER BY (?7 AND p.important) DESC,p.name='',p.name,p.id"
+             ORDER BY (?6 AND p.important) DESC,p.name='',p.name,p.id"
             ))
             .map_err(error)?;
         let rows = q
             .query_map(
                 params![
                     query.trim(),
-                    filter.ignored,
                     filter.unnamed_only,
                     filter.single_photo_only,
                     filter.person_id,
@@ -335,9 +355,7 @@ pub(super) fn people(
 fn face_where(scope: FaceScope) -> &'static str {
     match scope {
         FaceScope::Pending => "1",
-        FaceScope::Person => {
-            "f.person_id=?1 AND f.ignored=0 AND (f.valid=1 OR (p.ignored=1 AND f.manual=1 AND (f.active=1 OR f.review=1)))"
-        }
+        FaceScope::Person => "f.person_id=?1 AND f.ignored=0 AND f.valid=1",
         FaceScope::Ignored => "f.ignored=1",
         FaceScope::Photo => {
             "f.file_id=?2 AND (f.valid=1 OR (f.manual=1 AND f.ignored=0 AND ((f.active=0 AND f.review=1) OR f.active=1)))"
@@ -415,7 +433,7 @@ fn faces_filtered(
             )
             .map_err(error)?;
         let (page, offset) = Page::<FaceView>::bounds(page, total);
-        let mut q=s.connection.prepare(&format!("SELECT f.id,f.file_id,f.person_id,p.name,f.thumbnail,f.bbox,f.manual,f.ignored,COALESCE(p.ignored,0),f.valid=0 {join} WHERE {condition} ORDER BY f.review DESC,f.id LIMIT 24 OFFSET ?3")).map_err(error)?;
+        let mut q=s.connection.prepare(&format!("SELECT f.id,f.file_id,f.person_id,p.name,f.thumbnail,f.bbox,f.manual,f.ignored,f.valid=0 {join} WHERE {condition} ORDER BY f.review DESC,f.id LIMIT 24 OFFSET ?3")).map_err(error)?;
         let rows = q
             .query_map(
                 params![
@@ -435,7 +453,6 @@ fn faces_filtered(
                         r.get::<_, bool>(6)?,
                         r.get::<_, bool>(7)?,
                         r.get::<_, bool>(8)?,
-                        r.get::<_, bool>(9)?,
                     ))
                 },
             )
@@ -443,18 +460,8 @@ fn faces_filtered(
             .collect::<Result<Vec<_>, _>>()
             .map_err(error)?;
         let mut items = Vec::new();
-        for (
-            id,
-            file_id,
-            person_id,
-            person_name,
-            thumb,
-            bbox,
-            manual,
-            ignored,
-            person_ignored,
-            needs_review,
-        ) in rows
+        for (id, file_id, person_id, person_name, thumb, bbox, manual, ignored, needs_review) in
+            rows
         {
             items.push(FaceView {
                 id,
@@ -466,7 +473,6 @@ fn faces_filtered(
                 bbox: serde_json::from_str(&bbox).map_err(error)?,
                 manual,
                 ignored,
-                person_ignored,
                 needs_review,
             });
         }
@@ -500,7 +506,7 @@ fn conditions(
     let exists: bool = s
         .connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM person_groups WHERE id=?1 AND archived=0 AND ignored=0)",
+            "SELECT EXISTS(SELECT 1 FROM person_groups WHERE id=?1 AND archived=0)",
             [person_id],
             |r| r.get(0),
         )
@@ -628,10 +634,10 @@ pub(super) fn months(
         .map_err(error)
     })
 }
-pub(super) fn counts(scan_id: u64) -> Result<(usize, usize, usize, Option<String>), String> {
+pub(super) fn counts(scan_id: u64) -> Result<(usize, usize, Option<String>), String> {
     with(scan_id, |store| {
         let Some(s) = store else {
-            return Ok((0, 0, 0, None));
+            return Ok((0, 0, None));
         };
         let pending = s
             .connection
@@ -640,24 +646,7 @@ pub(super) fn counts(scan_id: u64) -> Result<(usize, usize, usize, Option<String
             })
             .map_err(error)?;
         let ignored=s.connection.query_row("SELECT COUNT(*) FROM faces f JOIN current_media c ON c.path=f.path WHERE f.ignored=1",[],|r|r.get::<_,i64>(0).map(|v|v as usize)).map_err(error)?;
-        let ignored_people = s
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM person_groups WHERE archived=0 AND ignored=1",
-                [],
-                |r| r.get::<_, i64>(0).map(|v| v as usize),
-            )
-            .map_err(error)?;
-        let undo = s
-            .connection
-            .query_row(
-                "SELECT description FROM edits ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(error)?;
-        Ok((pending, ignored, ignored_people, undo))
+        Ok((pending, ignored, s.undo_description()?))
     })
 }
 pub(super) fn validate_faces(
@@ -687,7 +676,7 @@ pub(super) fn photo_people(scan_id: u64, file_id: usize) -> Result<Vec<Identity>
         let Some(s) = store else {
             return Ok(Vec::new());
         };
-        let mut q=s.connection.prepare("SELECT DISTINCT p.id,p.name FROM visible_faces v JOIN person_groups p ON p.id=v.person_id WHERE v.file_id=?1 AND v.ignored=0 AND p.archived=0 AND p.ignored=0 ORDER BY p.name,p.id").map_err(error)?;
+        let mut q=s.connection.prepare("SELECT DISTINCT p.id,p.name FROM visible_faces v JOIN person_groups p ON p.id=v.person_id WHERE v.file_id=?1 AND v.ignored=0 AND p.archived=0 ORDER BY p.name,p.id").map_err(error)?;
         q.query_map([file_id as i64], |r| {
             Ok(Identity {
                 id: r.get(0)?,

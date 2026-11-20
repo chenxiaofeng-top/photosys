@@ -4,6 +4,7 @@ use crate::ai::faces;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashSet},
     sync::{
         Mutex,
@@ -40,6 +41,18 @@ pub(crate) enum Selection {
     All { excluded_face_ids: Vec<i64> },
 }
 
+pub(super) struct GroupSelection {
+    pub(super) chosen: Vec<(i64, usize)>,
+    pub(super) remaining: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResumeGroup {
+    pub(super) group_id: i64,
+    pub(super) face_ids: Vec<i64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Group {
@@ -52,6 +65,7 @@ pub(crate) struct Group {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Overview {
     token: String,
+    resumed_group_id: Option<i64>,
     ungrouped_count: usize,
     groups: Page<Group>,
 }
@@ -185,11 +199,34 @@ pub(super) fn check_view(store: &Store, scan_id: u64, view: &View) -> Result<(),
     Ok(())
 }
 
-pub(super) fn overview(scan_id: u64, page: usize) -> Result<Overview, String> {
+fn resumed_group_id(store: &Store, resume: &ResumeGroup) -> Result<Option<i64>, String> {
+    let mut lookup = store
+        .connection
+        .prepare("SELECT group_id FROM temp.pending_group_members WHERE face_id=?1")
+        .map_err(error)?;
+    let mut counts = BTreeMap::<i64, usize>::new();
+    for face_id in resume.face_ids.iter().copied().collect::<HashSet<_>>() {
+        let mut rows = lookup.query([face_id]).map_err(error)?;
+        if let Some(row) = rows.next().map_err(error)? {
+            *counts.entry(row.get(0).map_err(error)?).or_default() += 1;
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .max_by_key(|&(id, count)| (count, id == resume.group_id, Reverse(id)))
+        .map(|(id, _)| id))
+}
+
+pub(super) fn overview(
+    scan_id: u64,
+    page: usize,
+    resume: Option<&ResumeGroup>,
+) -> Result<Overview, String> {
     query::with(scan_id, |store| {
         let Some(store) = store else {
             return Ok(Overview {
                 token: String::new(),
+                resumed_group_id: None,
                 ungrouped_count: 0,
                 groups: Page {
                     items: Vec::new(),
@@ -199,6 +236,10 @@ pub(super) fn overview(scan_id: u64, page: usize) -> Result<Overview, String> {
             });
         };
         let token = ensure(store, scan_id)?;
+        let resumed_group_id = match resume {
+            Some(resume) => resumed_group_id(store, resume)?,
+            None => None,
+        };
         let c = &store.connection;
         let ungrouped_count = c
             .query_row(
@@ -241,6 +282,7 @@ pub(super) fn overview(scan_id: u64, page: usize) -> Result<Overview, String> {
             .map_err(error)?;
         Ok(Overview {
             token,
+            resumed_group_id,
             ungrouped_count,
             groups: Page { items, page, total },
         })
@@ -251,7 +293,7 @@ pub(super) fn selected(
     scan_id: u64,
     view: &View,
     selection: Selection,
-) -> Result<Vec<(i64, usize)>, String> {
+) -> Result<GroupSelection, String> {
     let group_id = view.group_id.ok_or(CHANGED)?;
     let (all, ids) = match selection {
         Selection::All { excluded_face_ids } => (true, excluded_face_ids),
@@ -279,19 +321,22 @@ pub(super) fn selected(
                 Ok((r.get(0)?, r.get::<_, i64>(1)? as usize))
             })
             .map_err(error)?;
-        let mut choices = Vec::new();
+        let mut chosen = Vec::new();
+        let mut remaining = Vec::new();
         for row in rows {
             let (id, file) = row.map_err(error)?;
             if ids.remove(&id) != all {
-                choices.push((id, file));
+                chosen.push((id, file));
+            } else {
+                remaining.push(id);
             }
         }
         if !ids.is_empty() {
             return Err(CHANGED.into());
         }
-        if choices.is_empty() {
+        if chosen.is_empty() {
             return Err("请选择至少一张人脸。".into());
         }
-        Ok(choices)
+        Ok(GroupSelection { chosen, remaining })
     })
 }

@@ -5,7 +5,7 @@ use crate::ai::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 #[derive(Clone, Deserialize)]
 pub(super) struct Policy {
@@ -175,9 +175,6 @@ pub(super) struct Groups {
     index: Index,
     anchors: HashMap<u64, Anchor>,
     policy: Policy,
-    ignored: HashSet<i64>,
-    #[cfg(test)]
-    ignored_parameters: Parameters,
     enabled: bool,
 }
 
@@ -295,7 +292,7 @@ pub(super) fn suggestions(scan_id: u64, ids: &[i64]) -> Result<FaceSuggestions, 
     }
     let policy = Policy::shipped();
     let enabled = policy.allowed();
-    let groups = Groups::create(scan_id, policy, enabled, false)?;
+    let groups = Groups::create(scan_id, policy, enabled)?;
     if !groups.enabled {
         return Ok(result);
     }
@@ -314,7 +311,7 @@ pub(super) fn suggestions(scan_id: u64, ids: &[i64]) -> Result<FaceSuggestions, 
                     let name = store
                         .connection
                         .query_row(
-                            "SELECT name FROM person_groups WHERE id=?1 AND archived=0 AND ignored=0",
+                            "SELECT name FROM person_groups WHERE id=?1 AND archived=0",
                             [id],
                             |row| row.get(0),
                         )
@@ -355,30 +352,17 @@ impl Groups {
     #[cfg(test)]
     pub fn load(scan_id: u64, policy: Policy) -> Result<Self, String> {
         let enabled = policy.allowed();
-        Self::create(scan_id, policy, enabled, true)
+        Self::create(scan_id, policy, enabled)
     }
     #[cfg(test)]
     pub fn for_evaluation(scan_id: u64, policy: Policy) -> Result<Self, String> {
-        Self::create(scan_id, policy, true, true)
+        Self::create(scan_id, policy, true)
     }
-    fn create(
-        scan_id: u64,
-        policy: Policy,
-        enabled: bool,
-        include_ignored: bool,
-    ) -> Result<Self, String> {
+    fn create(scan_id: u64, policy: Policy, enabled: bool) -> Result<Self, String> {
         let index = representative_index()?;
-        #[cfg(test)]
-        let defaults = Policy::for_version(&policy.version);
         let mut g = Self {
             index,
             anchors: HashMap::new(),
-            ignored: HashSet::new(),
-            #[cfg(test)]
-            ignored_parameters: Parameters {
-                threshold: policy.threshold.max(defaults.threshold),
-                margin: policy.margin.max(defaults.margin),
-            },
             policy,
             enabled,
         };
@@ -389,13 +373,12 @@ impl Groups {
             let Some(s) = s else {
                 return Ok(Vec::new());
             };
-            let mut q=s.connection.prepare("WITH candidates AS(SELECT v.id,v.person_id,v.vector,v.manual,p.ignored,ROW_NUMBER() OVER(PARTITION BY v.person_id ORDER BY v.manual DESC,v.id) rank FROM visible_faces v JOIN person_groups p ON p.id=v.person_id JOIN media m ON m.path=v.path WHERE m.version=?1 AND m.error IS NULL AND v.ignored=0 AND v.vector IS NOT NULL AND p.archived=0 AND (?2 OR p.ignored=0)) SELECT id,person_id,vector,ignored FROM candidates WHERE rank=1 OR (manual=1 AND rank<=5) ORDER BY id").map_err(error)?;
-            q.query_map(params![g.policy.version, include_ignored], |r| {
+            let mut q=s.connection.prepare("WITH candidates AS(SELECT v.id,v.person_id,v.vector,v.manual,ROW_NUMBER() OVER(PARTITION BY v.person_id ORDER BY v.manual DESC,v.id) rank FROM visible_faces v JOIN person_groups p ON p.id=v.person_id JOIN media m ON m.path=v.path WHERE m.version=?1 AND m.error IS NULL AND v.ignored=0 AND v.vector IS NOT NULL AND p.archived=0) SELECT id,person_id,vector FROM candidates WHERE rank=1 OR (manual=1 AND rank<=5) ORDER BY id").map_err(error)?;
+            q.query_map([&g.policy.version], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, Vec<u8>>(2)?,
-                    r.get::<_, bool>(3)?,
                 ))
             })
             .map_err(error)?
@@ -403,11 +386,8 @@ impl Groups {
             .map_err(error)
         })?;
         g.index.reserve(rows.len().max(64)).map_err(error)?;
-        for (id, person, bytes, ignored) in rows {
+        for (id, person, bytes) in rows {
             if let Some(v) = vector(&bytes) {
-                if ignored {
-                    g.ignored.insert(person);
-                }
                 g.insert(id, person, v)?;
             }
         }
@@ -452,16 +432,11 @@ impl Groups {
         if score < self.policy.threshold {
             return Ok(Match::New);
         }
-        let parameters = if self.ignored.contains(&person) {
-            self.ignored_parameters
-        } else {
-            self.policy.parameters()
-        };
         let ambiguous = ranked.get(1).is_some_and(|&(_, other)| {
             let gap = score - other;
-            gap <= 0. || gap < parameters.margin
+            gap <= 0. || gap < self.policy.margin
         });
-        Ok(if score < parameters.threshold || ambiguous {
+        Ok(if ambiguous {
             Match::Pending
         } else {
             Match::Existing(person)
