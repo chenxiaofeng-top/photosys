@@ -3,8 +3,8 @@ use std::io::{self, Read, Seek};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use chrono::{Datelike, NaiveDate};
-use nom_exif::{EntryValue, ExifTag, MediaParser, MediaSource, TrackInfoTag};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
+use nom_exif::{EntryValue, ExifIter, ExifTag, MediaParser, MediaSource, TrackInfo, TrackInfoTag};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
@@ -114,23 +114,8 @@ fn metadata_from_file(
 }
 
 fn parse_file(parser: &mut MediaParser, mut file: File, media: Media) -> Option<Metadata> {
-    // The streaming parser can hit EOF after sniffing the whole of a small file.
-    if file.metadata().ok()?.len() <= 1024 {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).ok()?;
-        return parse_metadata(parser, MediaSource::from_memory(bytes).ok()?, media);
-    }
-    parse_metadata(parser, MediaSource::seekable(file).ok()?, media)
-}
-
-fn parse_metadata(
-    parser: &mut MediaParser,
-    source: MediaSource<impl io::Read>,
-    media: Media,
-) -> Option<Metadata> {
-    match media {
-        Media::Photo => {
-            let exif = parser.parse_exif(source).ok()?;
+    match read_embedded_metadata(parser, &mut file, media)? {
+        EmbeddedMetadata::Photo(exif) => {
             // parse_gps borrows/clones the EXIF iterator; the media is opened and parsed once.
             let coordinates = exif
                 .parse_gps()
@@ -144,11 +129,10 @@ fn parse_metadata(
                 .find(|&date| valid_year(date));
             Some(Metadata { date, coordinates })
         }
-        Media::Video => {
-            let track = parser.parse_track(source).ok()?;
+        EmbeddedMetadata::Video(track) => {
             let coordinates = track.gps_info().and_then(Coordinates::from_gps);
             let date = track.get(TrackInfoTag::CreateDate).and_then(|value| {
-                if matches!(value, EntryValue::DateTime(date) if date.timestamp() == -2_082_844_800)
+                if matches!(value, EntryValue::DateTime(date) if !valid_video_creation_time(*date))
                 {
                     return None;
                 }
@@ -156,6 +140,37 @@ fn parse_metadata(
             });
             Some(Metadata { date, coordinates })
         }
+    }
+}
+
+pub(crate) enum EmbeddedMetadata {
+    Photo(ExifIter),
+    Video(TrackInfo),
+}
+
+pub(crate) fn read_embedded_metadata(
+    parser: &mut MediaParser,
+    file: &mut File,
+    media: Media,
+) -> Option<EmbeddedMetadata> {
+    file.rewind().ok()?;
+    // The streaming parser can hit EOF after sniffing the whole of a small file.
+    if file.metadata().ok()?.len() <= 1024 {
+        let mut bytes = Vec::new();
+        file.take(1024).read_to_end(&mut bytes).ok()?;
+        return parse_embedded(parser, MediaSource::from_memory(bytes).ok()?, media);
+    }
+    parse_embedded(parser, MediaSource::seekable(file).ok()?, media)
+}
+
+fn parse_embedded(
+    parser: &mut MediaParser,
+    source: MediaSource<impl io::Read>,
+    media: Media,
+) -> Option<EmbeddedMetadata> {
+    match media {
+        Media::Photo => parser.parse_exif(source).ok().map(EmbeddedMetadata::Photo),
+        Media::Video => parser.parse_track(source).ok().map(EmbeddedMetadata::Video),
         Media::LivePhoto => None,
     }
 }
@@ -168,8 +183,12 @@ fn value_date(value: &EntryValue) -> Option<NaiveDate> {
     }
 }
 
-fn valid_year(date: NaiveDate) -> bool {
+pub(crate) fn valid_year(date: NaiveDate) -> bool {
     (1..=9999).contains(&date.year())
+}
+
+pub(crate) fn valid_video_creation_time(date: DateTime<FixedOffset>) -> bool {
+    date.timestamp() != -2_082_844_800 && valid_year(date.date_naive())
 }
 
 fn live_photo_metadata(

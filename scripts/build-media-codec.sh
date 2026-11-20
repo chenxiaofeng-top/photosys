@@ -90,7 +90,7 @@ build() (
 
   local signature
   signature="$( "${sha256[@]}" "$repo/scripts/build-media-codec.sh" | cut -d' ' -f1 )"
-  if [[ ! -x "$prefix/bin/ffmpeg$extension" || ! -f "$work/build-signature" ||
+  if [[ ! -x "$prefix/bin/ffmpeg$extension" || ! -x "$prefix/bin/ffprobe$extension" || ! -f "$work/build-signature" ||
         "$(< "$work/build-signature")" != "$signature" ]]; then
     rm -rf -- "$work"
     mkdir -p "$work"/{ffmpeg,vpx,ogg,vorbis}
@@ -130,21 +130,22 @@ build() (
       ./configure --prefix="$prefix" --cc="$cc" --arch="$arch" \
         "${platform[@]}" "${x86asm[@]}" --pkg-config-flags=--static \
         --extra-cflags="$cflags" --extra-ldflags="$ldflags" \
-        --disable-autodetect --disable-network --disable-doc --disable-ffplay --disable-ffprobe \
+        --disable-autodetect --disable-network --disable-doc --disable-ffplay \
         --disable-shared --enable-static --disable-everything --enable-libvpx --enable-libvorbis \
         --enable-protocol=file,fd --enable-demuxer=mov,matroska --enable-muxer=image2,webm \
         --enable-parser=h264,hevc,aac,mjpeg,mpeg4video,h263,vp8,vp9 \
         --enable-decoder=h264,hevc,mjpeg,mpeg4,h263,vp8,vp9,aac,alac,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f32be \
         --enable-encoder=mjpeg,libvpx_vp8,libvorbis \
         --enable-filter=scale,format,aformat,aresample,transpose,hflip,vflip,crop,xstack,null,anull,trim,atrim
-      make -j "$jobs" ffmpeg$extension
+      make -j "$jobs" ffmpeg$extension ffprobe$extension
       mkdir -p "$prefix/bin"
-      install -m 755 "ffmpeg$extension" "$prefix/bin/ffmpeg$extension"
+      install -m 755 "ffmpeg$extension" "ffprobe$extension" "$prefix/bin/"
     )
     printf '%s\n' "$signature" > "$work/build-signature"
   fi
 
   install -m 755 "$prefix/bin/ffmpeg$extension" "$destination/photosys-ffmpeg-$target$extension"
+  install -m 755 "$prefix/bin/ffprobe$extension" "$destination/photosys-ffprobe-$target$extension"
   local notices="$destination/media-codec-licenses"
   mkdir -p "$notices"
   cp "$work/ffmpeg/COPYING.LGPLv2.1" "$notices/FFmpeg-LGPL-2.1.txt"
@@ -159,9 +160,11 @@ target="${1:-$default_target}"
 if [[ "$target" == universal-apple-darwin ]]; then
   build aarch64-apple-darwin
   build x86_64-apple-darwin
-  lipo -create "$destination/photosys-ffmpeg-aarch64-apple-darwin" \
-    "$destination/photosys-ffmpeg-x86_64-apple-darwin" \
-    -output "$destination/photosys-ffmpeg-universal-apple-darwin"
+  for program in ffmpeg ffprobe; do
+    lipo -create "$destination/photosys-$program-aarch64-apple-darwin" \
+      "$destination/photosys-$program-x86_64-apple-darwin" \
+      -output "$destination/photosys-$program-universal-apple-darwin"
+  done
 else
   build "$target"
 fi

@@ -1,5 +1,6 @@
 pub(crate) mod ai_search;
 pub(crate) mod albums;
+pub(crate) mod details;
 mod favorites;
 #[cfg(test)]
 mod index_benchmark;

@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use nom_exif::{MediaKind, MediaSource};
 
+pub(crate) mod probe;
+
 pub(crate) const CONVERSION_LIMIT: u64 = 16 * 1024 * 1024;
 const CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -23,14 +25,24 @@ pub(crate) fn is_heif(path: &Path) -> bool {
         })
 }
 
-fn executable() -> Result<PathBuf, String> {
-    let companion = if cfg!(windows) {
-        "photosys-ffmpeg.exe"
-    } else {
-        "photosys-ffmpeg"
-    };
+fn media_command(name: &str) -> Result<Command, String> {
     let program = std::env::current_exe().map_err(|error| error.to_string())?;
-    Ok(companion_for(&program, companion))
+    let companion = format!("photosys-{name}{}", std::env::consts::EXE_SUFFIX);
+    let mut command = Command::new(companion_for(&program, &companion));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-max_alloc",
+        "268435456",
+    ]);
+    Ok(command)
 }
 
 fn companion_for(program: &Path, companion: &str) -> PathBuf {
@@ -59,23 +71,8 @@ pub(crate) fn convert(
     cancelled: Option<&AtomicBool>,
 ) -> Result<(File, u64), String> {
     let limit_arg = CONVERSION_LIMIT.to_string();
-    let mut command = Command::new(executable()?);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-max_alloc",
-        "268435456",
-        "-filter_threads",
-        "2",
-    ]);
+    let mut command = media_command("ffmpeg")?;
+    command.args(["-nostdin", "-filter_threads", "2"]);
     let (source, protocol, demuxer, stdin) = match input {
         Input::Mov(path) => (path, "file", "mov", Stdio::null()),
         // Unlike pipe:, fd: can seek in a regular file, including to a trailing MOV index.
@@ -97,7 +94,7 @@ pub(crate) fn convert(
         .spawn()
         .map_err(|error| format!("无法启动随应用安装的媒体解码器。{error}"))?;
 
-    if !wait(&mut child, cancelled)?.success() {
+    if !wait(&mut child, cancelled, CONVERSION_TIMEOUT)?.success() {
         return Err("媒体文件无法解码。".into());
     }
     let file = File::open(output).map_err(|_| "媒体文件无法解码。")?;
@@ -112,20 +109,22 @@ pub(crate) fn convert(
     Ok((file, size))
 }
 
-pub(crate) fn video_jpeg(file: &File, path: &Path, edge: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn video_demuxer(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let demuxer = if extension.eq_ignore_ascii_case("mkv") || extension.eq_ignore_ascii_case("webm")
-    {
+    if extension.eq_ignore_ascii_case("mkv") || extension.eq_ignore_ascii_case("webm") {
         "matroska"
     } else {
         "mov"
-    };
+    }
+}
+
+pub(crate) fn video_jpeg(file: &File, path: &Path, edge: u32) -> Result<Vec<u8>, String> {
     let input = Input::Video {
         file: file.try_clone().map_err(|error| error.to_string())?,
-        demuxer,
+        demuxer: video_demuxer(path),
     };
     let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
     // Accurate rounding keeps colors intact when swscale converts to full-range JPEG.
@@ -161,8 +160,12 @@ pub(crate) fn video_jpeg(file: &File, path: &Path, edge: u32) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn wait(child: &mut Child, cancelled: Option<&AtomicBool>) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + CONVERSION_TIMEOUT;
+fn wait(
+    child: &mut Child,
+    cancelled: Option<&AtomicBool>,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
     let error = loop {
         if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break CANCELLED.to_owned();
@@ -170,7 +173,7 @@ fn wait(child: &mut Child, cancelled: Option<&AtomicBool>) -> Result<ExitStatus,
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
-            Ok(None) => break "媒体解码超过 30 秒。".into(),
+            Ok(None) => break format!("媒体处理超过 {} 秒。", timeout.as_secs()),
             Err(error) => break format!("媒体解码异常结束。{error}"),
         }
     };
@@ -270,7 +273,10 @@ mod tests {
     fn cancels_and_reaps_an_active_decoder() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let cancelled = AtomicBool::new(true);
-        assert_eq!(wait(&mut child, Some(&cancelled)).unwrap_err(), CANCELLED);
+        assert_eq!(
+            wait(&mut child, Some(&cancelled), CONVERSION_TIMEOUT).unwrap_err(),
+            CANCELLED
+        );
         assert!(!child.try_wait().unwrap().unwrap().success());
     }
 }

@@ -128,6 +128,7 @@ pub fn run() {
             library::albums::album_items,
             library::albums::albums_edit,
             library::library_issues,
+            library::details::library_media_details,
             library::library_preview,
             library::library_live_video,
             library::set_library_favorite,

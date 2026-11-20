@@ -185,7 +185,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: npm run tauri build -- ${{ matrix.tauri_args }} -- --locked
 
-      - name: Verify FFmpeg in Linux packages
+      - name: Verify media tools in Linux packages
         if: runner.os == 'Linux'
         run: |
           bundle="$PWD/src-tauri/target/release/bundle"
@@ -193,8 +193,10 @@ jobs:
           cd "$scratch"
           dpkg-deb -x "$bundle"/deb/*.deb deb
           deb/usr/bin/photosys-ffmpeg -version
+          deb/usr/bin/photosys-ffprobe -version
           "$bundle"/appimage/*.AppImage --appimage-extract >/dev/null
           squashfs-root/usr/bin/photosys-ffmpeg -version
+          squashfs-root/usr/bin/photosys-ffprobe -version
           test -f squashfs-root/usr/lib/gstreamer-1.0/libgstvpx.so
           python "$GITHUB_WORKSPACE/scripts/check-ai-runtime.py" deb
           python "$GITHUB_WORKSPACE/scripts/check-ai-runtime.py" squashfs-root
@@ -207,6 +209,8 @@ jobs:
           lipo "$app/Contents/MacOS/$executable" -verify_arch arm64 x86_64
           lipo "$app/Contents/MacOS/photosys-ffmpeg" -verify_arch arm64 x86_64
           "$app/Contents/MacOS/photosys-ffmpeg" -version
+          lipo "$app/Contents/MacOS/photosys-ffprobe" -verify_arch arm64 x86_64
+          "$app/Contents/MacOS/photosys-ffprobe" -version
           lipo "$app/Contents/Resources/onnxruntime/aarch64/libonnxruntime.dylib" -verify_arch arm64
           lipo "$app/Contents/Resources/onnxruntime/x86_64/libonnxruntime.dylib" -verify_arch x86_64
           python scripts/check-ai-runtime.py "$app/Contents/Resources/onnxruntime"
@@ -220,7 +224,7 @@ jobs:
           $unpacked = Join-Path $env:RUNNER_TEMP photosys-installer
           & "$env:ProgramFiles/7-Zip/7z.exe" x $installer.FullName "-o$unpacked" -y
           if ($LASTEXITCODE -ne 0) { throw "Could not extract the PhotoSys installer" }
-          foreach ($name in @('photosys.exe', 'photosys-ffmpeg.exe', 'photosys-pmtiles.exe',
+          foreach ($name in @('photosys.exe', 'photosys-ffmpeg.exe', 'photosys-ffprobe.exe', 'photosys-pmtiles.exe',
                               'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
             $file = Get-Item -LiteralPath (Join-Path $unpacked $name) -ErrorAction SilentlyContinue
             if (-not $file -or $file.PSIsContainer -or $file.Length -eq 0) {
@@ -229,6 +233,8 @@ jobs:
           }
           & (Join-Path $unpacked 'photosys-ffmpeg.exe') -version
           if ($LASTEXITCODE -ne 0) { throw "Bundled FFmpeg failed to start" }
+          & (Join-Path $unpacked 'photosys-ffprobe.exe') -version
+          if ($LASTEXITCODE -ne 0) { throw "Bundled FFprobe failed to start" }
           & (Join-Path $unpacked 'photosys-pmtiles.exe') version
           if ($LASTEXITCODE -ne 0) { throw "Bundled PMTiles failed to start" }
           python scripts/check-ai-runtime.py $unpacked --dll-directory $unpacked --require-directml

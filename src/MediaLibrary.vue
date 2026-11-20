@@ -10,6 +10,7 @@ import "element-plus/es/components/input/style/css";
 import "element-plus/es/components/option/style/css";
 import "element-plus/es/components/select/style/css";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
+import MediaDetailsInfo from "./MediaDetailsInfo.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import DatabaseBackup from "./DatabaseBackup.vue";
@@ -18,14 +19,13 @@ import PeoplePanel from "./PeoplePanel.vue";
 import AlbumsPanel from "./AlbumsPanel.vue";
 import AlbumPicker from "./AlbumPicker.vue";
 import type { Album, AlbumEditResult } from "./albums";
-import type { Item, Page, Kind, Sort, LibraryMode } from "./libraryTypes";
+import type { Item, Page, Kind, Sort, LibraryMode, MediaDetails } from "./libraryTypes";
 import { useAlbumSelection } from "./albumSelection";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
 const LocationMap = defineAsyncComponent(() => import("./LocationMap.vue"));
 import { shortLocation, type Coordinates, type LocationMode, type Selection } from "./locations";
 import type { Person, PeopleStatus, Month } from "./people";
 import type { IndexStatus } from "./aiSearch";
-import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
 type FileAction = "open" | "reveal" | "copy";
@@ -282,6 +282,11 @@ watch([summary, issuesOpen, issuePage], async ([scan, open, page], _, onCleanup)
 });
 
 const detail = shallowRef<Item>();
+const detailBody = ref<HTMLElement>();
+const detailInformation = ref<HTMLElement>();
+const mediaDetails = shallowRef<MediaDetails>();
+const mediaDetailsLoading = ref(false);
+const mediaDetailsError = ref("");
 const dialog = ref<HTMLDialogElement>();
 const detailImage = ref("");
 const detailPeople = ref<string[]>([]);
@@ -303,6 +308,10 @@ const liveVideoUrl = ref("");
 const liveVideoLoading = ref(false);
 const liveVideoError = ref("");
 let detailRequest = 0;
+type MetadataRequest = { scanId: number; fileId: number };
+let activeMetadata: MetadataRequest | undefined;
+let pendingMetadata: MetadataRequest | undefined;
+let readingMetadata = false;
 const canRotate = computed(() => detail.value?.kind === "photo" && detail.value.previewAvailable &&
   previewReady.value && !previewError.value && !detailNavigating.value && !rotationSaving.value &&
   !liveVideoLoading.value && !liveVideoUrl.value);
@@ -540,6 +549,39 @@ watch([detail, peopleRevision], async (_, __, cleanup) => {
   } catch (cause) { if (current) detailError.value = `无法读取人物标注。${String(cause)}`; }
 });
 
+watch([() => summary.value?.scanId, () => detail.value?.id], ([scanId, fileId]) => {
+  activeMetadata = scanId !== undefined && fileId !== undefined ? { scanId, fileId } : undefined;
+  pendingMetadata = activeMetadata;
+  mediaDetails.value = undefined;
+  mediaDetailsError.value = "";
+  mediaDetailsLoading.value = !!activeMetadata;
+  if (detailBody.value) detailBody.value.scrollTop = 0;
+  if (detailInformation.value) detailInformation.value.scrollTop = 0;
+  void readLatestMetadata();
+});
+
+async function readLatestMetadata() {
+  if (readingMetadata) return;
+  readingMetadata = true;
+  try {
+    // Keep at most one request running and skip items already passed during navigation.
+    while (pendingMetadata) {
+      const request = pendingMetadata;
+      pendingMetadata = undefined;
+      try {
+        const result = await invoke<MediaDetails>("library_media_details", request);
+        if (activeMetadata === request) mediaDetails.value = result;
+      } catch (cause) {
+        if (activeMetadata === request) mediaDetailsError.value = String(cause);
+      } finally {
+        if (activeMetadata === request) mediaDetailsLoading.value = false;
+      }
+    }
+  } finally {
+    readingMetadata = false;
+  }
+}
+
 async function loadDetail(item: Item, thumbnail = "") {
   const scanId = summary.value?.scanId;
   if (scanId === undefined) return;
@@ -678,6 +720,8 @@ function clearLiveVideo() {
 onBeforeUnmount(() => {
   clearTimeout(searchTimer);
   detailRequest++;
+  activeMetadata = undefined;
+  pendingMetadata = undefined;
   clearLiveVideo();
 });
 
@@ -977,7 +1021,7 @@ async function performFileAction(action: FileAction) {
         <span role="status">第 {{ detailPosition + 1 }} / {{ detailPage?.total ?? 0 }} 项</span>
         <button type="button" class="secondary" :disabled="detailNavigating || rotationSaving || detailPosition + 1 >= (detailPage?.total ?? 0)" @click="moveDetail(1)">下一项</button>
       </nav>
-      <div class="detail-body">
+      <div ref="detailBody" class="detail-body">
         <div class="detail-viewer">
           <p v-if="detailNavigating" class="status" role="status">正在切换媒体…</p>
           <video v-else-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
@@ -989,34 +1033,40 @@ async function performFileAction(action: FileAction) {
           <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
           <p v-else-if="!detail.previewAvailable && !detailNavigating" class="viewer-placeholder">此媒体暂不支持预览，可用系统默认应用打开。</p>
         </div>
-        <aside class="detail-information" aria-label="媒体信息与操作">
-          <h3 class="information-heading">{{ detail.kind === 'video' ? '视频信息' : '照片信息' }}</h3>
+        <aside ref="detailInformation" class="detail-information" aria-label="媒体信息与操作">
+          <div class="information-header">
+            <h3>{{ detail.isLivePhoto ? '实况照片信息' : detail.kind === 'video' ? '视频信息' : '照片信息' }}</h3>
+            <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
+              @click="playLivePhoto">
+              {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
+            </button>
+          </div>
+          <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
           <div v-if="detail.kind === 'photo' && detail.previewAvailable && !liveVideoUrl" class="rotation-actions">
             <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(-90)">向左旋转 90°</button>
             <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(90)">向右旋转 90°</button>
             <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
           </div>
           <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
+          <MediaDetailsInfo :item="detail" :details="mediaDetails" :loading="mediaDetailsLoading" :error="mediaDetailsError" />
+          <section class="detail-location">
+            <h4>位置</h4>
+            <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
+            <template v-if="detail.location">
+              <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
+              <button v-if="!albumsMode" type="button" class="secondary" @click="locateDetail">在地图中查看</button>
+            </template>
+          </section>
           <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
           <details v-if="summary && detail.kind === 'photo'" class="detail-people">
             <summary>照片中的人物 / 修改分组</summary>
             <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
               @changed="detailPeopleChanged" />
           </details>
-          <div class="detail-location">
-            <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
-            <template v-if="detail.location">
-              <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
-              <button v-if="!albumsMode" type="button" class="secondary" @click="locateDetail">在地图中查看</button>
-            </template>
-          </div>
-          <p class="detail-path">{{ detail.relativePath }}</p>
-          <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
-          <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
-            @click="playLivePhoto">
-            {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
-          </button>
-          <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
+          <dl class="detail-file-path">
+            <dt>相对路径</dt>
+            <dd>{{ detail.relativePath }}</dd>
+          </dl>
           <div class="detail-actions">
             <button type="button" :disabled="!!fileAction || detailNavigating" @click="performFileAction('open')">
               {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
@@ -1107,21 +1157,27 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
 .detail-header h2 { flex: 1; min-width: 0; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-navigation { justify-content: center; padding: 0 24px 16px; margin: 0; font-size: 13px; color: var(--muted); }
 .detail-navigation span { font-variant-numeric: tabular-nums; }
-.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: min(72vh, 820px); border-top: 1px solid var(--border); }
+.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: min(72vh, 820px); border-top: 1px solid var(--border); }
 .detail-viewer { display: grid; place-items: center; min-width: 0; min-height: 0; overflow: hidden; background: var(--viewer); color: var(--viewer-text); }
 .detail-viewer .status, .viewer-placeholder { padding: 24px; color: var(--viewer-text); text-align: center; }
 .detail-viewer .error { padding: 24px; color: var(--viewer-error); }
 .detail-viewer :deep(.rotatable-image.detail) { width: 100%; height: 100%; max-height: none; aspect-ratio: auto !important; background: var(--viewer); }
 .detail-image { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; background: var(--viewer); }
 .detail-information { min-width: 0; overflow-y: auto; padding: 24px; border-left: 1px solid var(--border); background: var(--surface); }
-.information-heading { margin: 0 0 20px; font-size: 14px; font-weight: 600; }
-.detail-location, .detail-path, .detail-information .status { font-size: 13px; }
-.detail-location { margin: 16px 0; color: var(--text-secondary); }
-.detail-path { padding-top: 16px; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
-.rotation-actions { gap: 8px; }
+.information-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 14px; }
+.information-header h3 { margin: 0; font-size: 16px; font-weight: 650; }
+.information-header button { padding: 6px 10px; min-height: 32px; font-size: 13px; }
+.detail-location, .detail-information .status { font-size: 13px; }
+.detail-location { padding-block: 14px; border-top: 1px solid var(--border); }
+.detail-location h4 { margin: 0 0 9px; font-size: 13px; font-weight: 650; }
+.detail-location p { margin: 0 0 6px; color: var(--text-secondary); }
+.detail-location p:last-child { margin-bottom: 0; }
+.rotation-actions { gap: 8px; margin-bottom: 14px; }
 .rotation-actions button { flex: 1; padding-inline: 8px; font-size: 12px; }
 .rotation-actions .status { flex-basis: 100%; }
 .detail-people { margin-top: 16px; padding-block: 16px; border-block: 1px solid var(--border); font-size: 13px; }
+.detail-file-path { display: block; margin: 14px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.detail-file-path dd { margin: 4px 0 0; font-size: inherit; font-weight: 500; }
 .detail-actions { align-items: stretch; flex-direction: column; gap: 8px; margin-top: 16px; }
 @media (max-width: 1199px) {
   .directory-toolbar { flex-basis: 100%; }

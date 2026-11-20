@@ -16,5 +16,38 @@ export interface Item {
   favorite: boolean;
   rotation: Rotation;
 }
+
+export interface MediaDimensions { width: number; height: number; }
+export interface PhotoDetails {
+  dimensions: MediaDimensions | null;
+  capturedAt: string | null;
+  make: string | null;
+  model: string | null;
+  lens: string | null;
+  focalLengthMm: number | null;
+  aperture: number | null;
+  exposureSeconds: number | null;
+  iso: number | null;
+}
+export interface VideoDetails {
+  dimensions: MediaDimensions | null;
+  createdAt: string | null;
+  durationSeconds: number | null;
+  averageFrameRate: number | null;
+  codec: string | null;
+  bitRate: number | null;
+  hasAudio: boolean | null;
+  audioCodec: string | null;
+  sampleRate: number | null;
+  channels: number | null;
+}
+export interface MediaDetails {
+  modifiedAt: string | null;
+  photo: PhotoDetails | null;
+  video: VideoDetails | null;
+  liveVideo: VideoDetails | null;
+  partial: boolean;
+}
+
 export interface Page<T> { page: number; total: number; items: T[]; }
 export type LibraryMode = "library" | "people" | "albums";
