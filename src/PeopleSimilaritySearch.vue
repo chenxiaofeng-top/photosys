@@ -7,12 +7,11 @@ const props = defineProps<{
   scanId: number;
   person: Person;
   revision: number;
-  defaultThreshold: number;
   writable: boolean;
   busy: boolean;
 }>();
 const emit = defineEmits<{ changed: []; working: [busy: boolean]; preview: [fileId: number] }>();
-const threshold = ref<number | string>(Number(props.defaultThreshold.toPrecision(7)));
+const threshold = ref<number | string>(0.65);
 const result = shallowRef<SimilarFaceResults>();
 const selected = ref<number[]>([]);
 const error = ref("");
@@ -24,8 +23,22 @@ const valid = computed(() => typeof threshold.value === "number" && threshold.va
 const faces = computed(() => result.value?.faces);
 const selectedFaces = computed(() => faces.value?.items.filter(face => selected.value.includes(face.faceId)) ?? []);
 const selectedFiles = computed(() => new Set(selectedFaces.value.map(face => face.fileId)));
+const allPageSelected = computed(() => !!faces.value?.items.length &&
+  faces.value.items.every(face => selectedFiles.value.has(face.fileId)));
 let request = 0;
 let mounted = true;
+
+function selectPage() {
+  const files = new Set(selectedFiles.value);
+  const choices = [...selected.value];
+  // Candidates already arrive in descending similarity order.
+  for (const face of faces.value?.items ?? []) {
+    if (files.has(face.fileId)) continue;
+    files.add(face.fileId);
+    choices.push(face.faceId);
+  }
+  selected.value = choices;
+}
 
 function clearResults() {
   request++;
@@ -35,7 +48,7 @@ function clearResults() {
 }
 
 watch(threshold, () => { clearResults(); error.value = ""; message.value = ""; }, { flush: "sync" });
-watch(() => props.revision, () => {
+watch([() => props.revision, () => props.person.avatarFaceId], () => {
   const hadResults = !!result.value || loading.value;
   clearResults();
   message.value = hadResults && !saving.value ? "人物数据已更新，请重新筛选。" : "";
@@ -121,10 +134,12 @@ async function confirm() {
     <template v-if="faces?.total">
       <div class="similarity-actions">
         <span role="status">共 {{ faces.total }} 张候选<span v-if="writable"> · 已选 {{ selected.length }} 张</span></span>
+        <button v-if="writable" type="button" class="secondary" :disabled="busy || saving || allPageSelected" @click="selectPage">全选本页</button>
+        <button v-if="writable" type="button" class="secondary" :disabled="busy || saving || !selected.length" @click="selected = []">取消选择</button>
         <button v-if="writable" type="button" :disabled="busy || saving || !selected.length" @click="confirm">
           {{ saving ? '正在归组…' : '确认所选为同一人' }}
         </button>
-        <span v-else class="muted">此相册只读。</span>
+        <span v-if="!writable" class="muted">此相册只读。</span>
       </div>
       <ul class="similar-faces">
         <li v-for="face in faces.items" :key="face.faceId" :class="{ checked: selected.includes(face.faceId) }">

@@ -1,5 +1,6 @@
 //! Local person metadata and resumable face analysis. Original media is never changed.
 mod grouping;
+mod pending;
 mod query;
 mod similarity;
 mod store;
@@ -17,10 +18,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use std::{
     collections::HashSet,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Instant,
 };
 pub(crate) use store::SCHEMA_VERSION;
@@ -36,7 +34,6 @@ pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, Stri
     SERIAL.lock().map_err(error)
 }
 static ACTIVE: Active = Active::new();
-static EDIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IndexStatus {
@@ -236,14 +233,6 @@ pub(super) fn update_with_run(
     state.failed = 0;
     let records = store.records()?;
     let rotations = { current(&*session()?, scan_id)?.rotations.clone() };
-    let policy = grouping::Policy::effective(Some(&store))?;
-    let (mut groups, mut edits) = {
-        let _edit = MUTATION.lock().map_err(error)?;
-        (
-            grouping::Groups::load(scan_id, policy.clone())?,
-            EDIT_GENERATION.load(Ordering::Relaxed),
-        )
-    };
     let mut jobs = Vec::new();
     for item in scan
         .items
@@ -332,7 +321,7 @@ pub(super) fn update_with_run(
                     if library.rotations.get(&item.file.id).copied().unwrap_or(0) != rotation {
                         continue;
                     }
-                    let ids = run.measure(Stage::Write, || {
+                    run.measure(Stage::Write, || {
                         store.save_for_model(
                             &path,
                             &item.file.stamp.portable_key(),
@@ -342,16 +331,6 @@ pub(super) fn update_with_run(
                         )
                     })?;
                     drop(guard);
-                    run.measure(Stage::Group, || {
-                        assign_with_edits(
-                            scan_id,
-                            &mut store,
-                            &mut groups,
-                            &policy,
-                            &mut edits,
-                            &ids,
-                        )
-                    })?;
                     drop(_edit);
                     if result.is_ok() {
                         state.indexed += 1;
@@ -379,39 +358,10 @@ pub(super) fn update_with_run(
                 .collect::<HashSet<_>>(),
         )?;
     }
-    // Reuse existing features to organize faces detected before automatic grouping was enabled.
-    if policy.allowed() && !interrupted() {
-        let ids = grouping::Groups::pending_ids(scan_id)?;
-        for chunk in ids.chunks(64) {
-            if interrupted() {
-                break;
-            }
-            let _edit = MUTATION.lock().map_err(error)?;
-            run.measure(Stage::Group, || {
-                assign_with_edits(scan_id, &mut store, &mut groups, &policy, &mut edits, chunk)
-            })?;
-        }
-    }
     drop(active);
     let mut final_state = status(scan_id)?;
     final_state.reused = state.reused;
     Ok(final_state)
-}
-// Caller holds MUTATION so representative reload and assignment see the same manual edits.
-fn assign_with_edits(
-    scan_id: u64,
-    store: &mut Store,
-    groups: &mut grouping::Groups,
-    policy: &grouping::Policy,
-    edits: &mut u64,
-    ids: &[i64],
-) -> Result<(), String> {
-    let current_edits = EDIT_GENERATION.load(Ordering::Relaxed);
-    if *edits != current_edits {
-        *groups = grouping::Groups::load(scan_id, policy.clone())?;
-        *edits = current_edits;
-    }
-    groups.assign(store, ids)
 }
 #[tauri::command]
 pub(crate) async fn people_update_index(
@@ -468,15 +418,12 @@ fn save_grouping_parameters(
     feature_version: &str,
     parameters: grouping::Parameters,
 ) -> Result<(), String> {
-    let _serial = SERIAL
-        .try_lock()
-        .map_err(|_| "请等待当前人物分析或补分结束。")?;
+    let _serial = SERIAL.try_lock().map_err(|_| "请等待当前人物分析结束。")?;
     let _edit = lock_edits()?;
     let session = session()?;
     let scan = &current(&session, scan_id)?.scan;
     let store = Store::open(scan, true)?.ok_or("无法打开人物数据库。")?;
     grouping::Policy::save(&store, feature_version, parameters)?;
-    EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -494,51 +441,80 @@ pub(crate) async fn people_save_grouping(
     .map_err(error)?
 }
 
-fn regroup_pending(
+#[tauri::command]
+pub(crate) async fn people_pending_groups(
     scan_id: u64,
-    token: Option<String>,
-) -> Result<grouping::PendingPreview, String> {
-    let _serial = SERIAL
-        .try_lock()
-        .map_err(|_| "请等待当前人物分析或补分结束。")?;
-    let _edit = lock_edits()?;
-    let plan = grouping::pending_plan(
-        scan_id,
-        EDIT_GENERATION.load(Ordering::Relaxed),
-        token.is_none(),
-    )?;
-    if let Some(token) = token {
-        if plan.preview.token != token {
-            return Err(grouping::PREVIEW_CHANGED.into());
-        }
-        if !plan.assignments.is_empty() {
-            let scan = scan(scan_id)?;
-            for file_id in plan.files {
-                let item = scan.item(file_id)?;
-                scan.root
-                    .open_matching(&item.file)
-                    .map_err(|_| grouping::PREVIEW_CHANGED.to_string())?;
-            }
-            let session = session()?;
-            current(&session, scan_id)?;
-            let mut store = Store::open(&scan, true)?.ok_or("无法打开人物数据库。")?;
-            store.apply_pending_groups(&plan.assignments)?;
-            EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        }
-    } else {
-        scan(scan_id)?;
-    }
-    Ok(plan.preview)
+    page: usize,
+) -> Result<pending::Overview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        let _edit = lock_edits()?;
+        pending::overview(scan_id, page)
+    })
+    .await
+    .map_err(error)?
 }
 
 #[tauri::command]
-pub(crate) async fn people_regroup_pending(
+pub(crate) async fn people_pending_faces(
     scan_id: u64,
-    preview_token: Option<String>,
-) -> Result<grouping::PendingPreview, String> {
+    page: usize,
+    view: pending::View,
+) -> Result<Page<FaceView>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        regroup_pending(scan_id, preview_token)
+        let _edit = lock_edits()?;
+        query::pending_faces(scan_id, page, &view)
+    })
+    .await
+    .map_err(error)?
+}
+
+fn edit_pending_group(
+    scan_id: u64,
+    view: pending::View,
+    selection: pending::Selection,
+    person_id: Option<i64>,
+    name: Option<String>,
+    ignore: bool,
+) -> Result<(), String> {
+    let _edit = lock_edits()?;
+    let selected = pending::selected(scan_id, &view, selection)?;
+    let guard = session()?;
+    let scan = &current(&guard, scan_id)?.scan;
+    for &(_, file_id) in &selected {
+        let item = scan.item(file_id)?;
+        scan.root
+            .open_matching(&item.file)
+            .map_err(|_| pending::CHANGED.to_string())?;
+    }
+    let face_ids = selected.into_iter().map(|(face_id, _)| face_id).collect();
+    let edit = if ignore {
+        Edit::Ignore { face_ids }
+    } else {
+        Edit::Assign {
+            face_ids,
+            person_id,
+            name,
+        }
+    };
+    Store::open(scan, true)?
+        .ok_or("无法打开人物数据库。")?
+        .edit_pending_group(edit)
+}
+
+#[tauri::command]
+pub(crate) async fn people_edit_pending_group(
+    scan_id: u64,
+    view: pending::View,
+    selection: pending::Selection,
+    person_id: Option<i64>,
+    name: Option<String>,
+    ignore: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        edit_pending_group(scan_id, view, selection, person_id, name, ignore)
     })
     .await
     .map_err(error)?
@@ -593,9 +569,7 @@ pub(crate) async fn people_confirm_similar_faces(
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
         let _edit = lock_edits()?;
-        similarity::confirm(scan_id, criteria, &anchor_token, &selected)?;
-        EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        similarity::confirm(scan_id, criteria, &anchor_token, &selected)
     })
     .await
     .map_err(error)?
@@ -644,12 +618,17 @@ pub(crate) async fn people_edit(
         } else {
             match &edit {
                 Edit::Assign { face_ids, .. }
+                | Edit::Unassign { face_ids }
                 | Edit::Ignore { face_ids }
                 | Edit::Restore { face_ids } => {
                     if face_ids.is_empty() || face_ids.len() > 1000 {
                         return Err("请选择 1～1000 张人脸。".into());
                     }
-                    query::validate_faces(scan_id, face_ids, matches!(&edit, Edit::Assign { .. }))?;
+                    query::validate_faces(
+                        scan_id,
+                        face_ids,
+                        matches!(&edit, Edit::Assign { .. } | Edit::Unassign { .. }),
+                    )?;
                 }
                 _ => {}
             }
@@ -659,7 +638,6 @@ pub(crate) async fn people_edit(
                 .ok_or("无法打开人物数据库。")?
                 .edit(edit)?;
         }
-        EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })
     .await
@@ -741,9 +719,7 @@ pub(crate) async fn people_undo(scan_id: u64) -> Result<(), String> {
         let _edit = MUTATION.lock().map_err(error)?;
         let s = session()?;
         let scan = &current(&s, scan_id)?.scan;
-        Store::open(scan, true)?.ok_or("没有人物索引。")?.undo()?;
-        EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Store::open(scan, true)?.ok_or("没有人物索引。")?.undo()
     })
     .await
     .map_err(error)?

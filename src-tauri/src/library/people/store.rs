@@ -5,12 +5,17 @@ use crate::ai::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    time::Duration,
+};
 
 pub(super) struct Store {
     pub connection: Connection,
 }
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 const SCHEMA:&str="
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0,important INTEGER NOT NULL DEFAULT 0);
@@ -49,7 +54,7 @@ struct FaceState {
     rejections: Vec<i64>,
 }
 #[derive(Default, Serialize, Deserialize)]
-struct Undo {
+pub(super) struct Undo {
     people: Vec<PersonState>,
     faces: Vec<FaceState>,
     created: Vec<i64>,
@@ -80,6 +85,9 @@ pub(crate) enum Edit {
         person_id: Option<i64>,
         name: Option<String>,
     },
+    Unassign {
+        face_ids: Vec<i64>,
+    },
     Ignore {
         face_ids: Vec<i64>,
     },
@@ -92,6 +100,9 @@ pub(crate) enum Edit {
     RestorePeople {
         person_ids: Vec<i64>,
     },
+    DeletePeople {
+        person_ids: Vec<i64>,
+    },
 }
 fn name(s: &str) -> Result<String, String> {
     let s = s.trim();
@@ -102,6 +113,158 @@ fn name(s: &str) -> Result<String, String> {
     }
 }
 impl Store {
+    // The same evidence is used for the writable migration and the read-only projection.
+    pub(super) fn classify_legacy(
+        &self,
+        ignored: &str,
+        important: &str,
+    ) -> Result<Vec<(i64, String, Undo)>, String> {
+        let c = &self.connection;
+        let mut q = c
+            .prepare("SELECT id,description,payload FROM edits ORDER BY id")
+            .map_err(error)?;
+        let mut edits = q
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(error)?
+            .map(|row| {
+                let (id, description, json) = row.map_err(error)?;
+                let undo = serde_json::from_str::<Undo>(&json).map_err(error)?;
+                Ok((id, description, undo))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut evidence = HashSet::new();
+        let mut confirmed = HashMap::new();
+        let mut dispositions = HashMap::new();
+        for (_, description, undo) in &mut edits {
+            evidence.extend(undo.created.iter().copied());
+            let manages_person = matches!(
+                description.as_str(),
+                "修改人物名称"
+                    | "标记重要人物"
+                    | "取消重要人物标记"
+                    | "忽略人物"
+                    | "恢复忽略的人物"
+                    | "合并人物"
+            );
+            for person in &undo.people {
+                if manages_person
+                    || !person.name.trim().is_empty()
+                    || person.important
+                    || person.ignored
+                {
+                    evidence.insert(person.id);
+                }
+            }
+            let is_disposition =
+                matches!(description.as_str(), "忽略人脸或旧标注" | "恢复忽略的人脸");
+            for face in &mut undo.faces {
+                let previous = face.person_id;
+                if let Some(person) = previous {
+                    let manually_assigned =
+                        face.manual && dispositions.get(&face.id) != Some(&person);
+                    if manually_assigned || confirmed.get(&face.id) == Some(&person) {
+                        evidence.insert(person);
+                        face.manual = true;
+                    } else {
+                        face.person_id = None;
+                    }
+                }
+                if is_disposition {
+                    if face.person_id.is_none()
+                        && let Some(person) = previous
+                    {
+                        dispositions.insert(face.id, person);
+                    }
+                } else {
+                    dispositions.remove(&face.id);
+                    confirmed.remove(&face.id);
+                }
+            }
+            for &(face, person) in &undo.pending_assignments {
+                evidence.insert(person);
+                confirmed.insert(face, person);
+                dispositions.remove(&face);
+            }
+        }
+
+        c.execute_batch("CREATE TEMP TABLE legacy_people(id INTEGER PRIMARY KEY);
+            CREATE TEMP TABLE legacy_confirmations(id INTEGER PRIMARY KEY,person_id INTEGER NOT NULL);
+            CREATE TEMP TABLE legacy_dispositions(id INTEGER PRIMARY KEY,person_id INTEGER NOT NULL);")
+            .map_err(error)?;
+        for (table, pairs) in [
+            ("legacy_confirmations", confirmed),
+            ("legacy_dispositions", dispositions),
+        ] {
+            let mut insert = c
+                .prepare(&format!("INSERT INTO temp.{table} VALUES(?1,?2)"))
+                .map_err(error)?;
+            for (face, person) in pairs {
+                insert.execute(params![face, person]).map_err(error)?;
+            }
+        }
+        let mut insert = c
+            .prepare("INSERT OR IGNORE INTO temp.legacy_people VALUES(?1)")
+            .map_err(error)?;
+        for person in evidence {
+            insert.execute([person]).map_err(error)?;
+        }
+        c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO temp.legacy_people
+            SELECT id FROM main.people WHERE trim(name)!='' OR ({ignored}) OR ({important});
+            INSERT OR IGNORE INTO temp.legacy_people
+            SELECT f.person_id FROM main.faces f LEFT JOIN temp.legacy_dispositions d
+                ON d.id=f.id AND d.person_id=f.person_id
+            WHERE f.manual=1 AND f.person_id IS NOT NULL AND d.id IS NULL;"
+        ))
+        .map_err(error)?;
+        let mut known = c
+            .prepare("SELECT EXISTS(SELECT 1 FROM temp.legacy_people WHERE id=?1)")
+            .map_err(error)?;
+        for (_, _, undo) in &mut edits {
+            for person in &mut undo.people {
+                if !known
+                    .query_row([person.id], |row| row.get::<_, bool>(0))
+                    .map_err(error)?
+                {
+                    person.archived = true;
+                }
+            }
+        }
+        Ok(edits)
+    }
+
+    fn migrate_automatic_groups(&self) -> Result<(), String> {
+        let edits = self.classify_legacy("ignored", "important")?;
+        self.connection.execute_batch("UPDATE main.faces AS f SET manual=1
+            WHERE EXISTS(SELECT 1 FROM temp.legacy_confirmations c WHERE c.id=f.id AND c.person_id=f.person_id);
+            UPDATE main.faces AS f SET person_id=NULL WHERE f.person_id IS NOT NULL
+            AND NOT EXISTS(SELECT 1 FROM temp.legacy_confirmations c WHERE c.id=f.id AND c.person_id=f.person_id)
+            AND (f.manual=0 OR EXISTS(SELECT 1 FROM temp.legacy_dispositions d WHERE d.id=f.id AND d.person_id=f.person_id));
+            UPDATE main.people SET archived=1 WHERE id NOT IN(SELECT id FROM temp.legacy_people);").map_err(error)?;
+        let mut update = self
+            .connection
+            .prepare("UPDATE edits SET payload=?2 WHERE id=?1")
+            .map_err(error)?;
+        for (id, _, undo) in edits {
+            update
+                .execute(params![id, serde_json::to_string(&undo).map_err(error)?])
+                .map_err(error)?;
+        }
+        self.connection
+            .execute_batch(
+                "DROP TABLE temp.legacy_people;
+            DROP TABLE temp.legacy_confirmations; DROP TABLE temp.legacy_dispositions;",
+            )
+            .map_err(error)
+    }
+
     fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool, String> {
         c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
@@ -182,6 +345,9 @@ impl Store {
                         "ALTER TABLE people ADD COLUMN important INTEGER NOT NULL DEFAULT 0;",
                     )
                     .map_err(error)?;
+                }
+                if version < 5 {
+                    store.migrate_automatic_groups()?;
                 }
                 c.pragma_update(None, "user_version", SCHEMA_VERSION)
                     .map_err(error)?;
@@ -434,6 +600,16 @@ impl Store {
             .map_err(error)?;
         Ok(state)
     }
+    fn person_faces(&self, person_id: i64) -> Result<Vec<FaceState>, String> {
+        let mut query = self
+            .connection
+            .prepare("SELECT id FROM faces WHERE person_id=?1")
+            .map_err(error)?;
+        let ids = query
+            .query_map([person_id], |row| row.get::<_, i64>(0))
+            .map_err(error)?;
+        ids.map(|id| self.face(id.map_err(error)?)).collect()
+    }
     pub fn edit(&mut self, edit: Edit) -> Result<(), String> {
         self.edit_checked(edit, |_| Ok(()))
     }
@@ -442,16 +618,27 @@ impl Store {
         edit: Edit,
         check: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<(), String> {
+        self.apply_edit(edit, false, check)
+    }
+    pub fn edit_pending_group(&mut self, edit: Edit) -> Result<(), String> {
+        self.apply_edit(edit, true, |_| Ok(()))
+    }
+    fn apply_edit<T>(
+        &mut self,
+        edit: Edit,
+        pending_group: bool,
+        check: impl FnOnce(&Self) -> Result<T, String>,
+    ) -> Result<(), String> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(error)?;
         let _validated = check(self)?;
-        self.apply(edit)?;
+        self.apply(edit, pending_group)?;
         tx.commit().map_err(error)
     }
-    fn apply(&self, edit: Edit) -> Result<(), String> {
+    fn apply(&self, edit: Edit, pending_group: bool) -> Result<(), String> {
         let mut undo = Undo::default();
         let description;
         match edit {
@@ -508,18 +695,7 @@ impl Store {
                         .map_err(error)?;
                 }
                 undo.people.extend([source, target]);
-                let mut q = self
-                    .connection
-                    .prepare("SELECT id FROM faces WHERE person_id=?1")
-                    .map_err(error)?;
-                let ids = q
-                    .query_map([source_id], |r| r.get::<_, i64>(0))
-                    .map_err(error)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(error)?;
-                for id in ids {
-                    undo.faces.push(self.face(id)?);
-                }
+                undo.faces = self.person_faces(source_id)?;
                 self.connection
                     .execute(
                         "UPDATE faces SET person_id=?2,manual=1 WHERE person_id=?1",
@@ -536,9 +712,10 @@ impl Store {
                 person_id,
                 name: n,
             } => {
-                if face_ids.is_empty() || face_ids.len() > 1000 {
+                if face_ids.is_empty() || (!pending_group && face_ids.len() > 1000) {
                     return Err("请选择 1～1000 张人脸。".into());
                 }
+                let needs_pending = pending_group || person_id.is_none();
                 let target = if let Some(id) = person_id {
                     if self.person(id)?.ignored {
                         return Err("归属目标已被忽略，请选择其他人物。".into());
@@ -566,6 +743,9 @@ impl Store {
                     if !active {
                         return Err("旧标注需与当前检出的人脸核对，请在当前人脸上选择人物。".into());
                     }
+                    if needs_pending && (old.person_id.is_some() || old.ignored || old.review) {
+                        return Err("请选择仍在待整理中的当前人脸。".into());
+                    }
                     if let Some(previous) = old.person_id
                         && previous != target
                     {
@@ -592,12 +772,37 @@ impl Store {
                 }
                 description = "调整人脸归属";
             }
-            Edit::Ignore { face_ids } => return self.disposition(face_ids, false),
-            Edit::Restore { face_ids } => return self.disposition(face_ids, true),
+            Edit::Unassign { face_ids } => {
+                if face_ids.is_empty() || face_ids.len() > 1000 {
+                    return Err("请选择 1～1000 张人脸。".into());
+                }
+                let mut seen = HashSet::new();
+                for id in face_ids.into_iter().filter(|id| seen.insert(*id)) {
+                    let old = self.face(id)?;
+                    let Some(previous) = old.person_id.filter(|_| !old.ignored && !old.review)
+                    else {
+                        return Err("请选择已归入人物的当前人脸。".into());
+                    };
+                    self.connection
+                        .execute(
+                            "INSERT OR IGNORE INTO rejections VALUES(?1,?2)",
+                            params![id, previous],
+                        )
+                        .map_err(error)?;
+                    self.connection
+                        .execute("UPDATE faces SET person_id=NULL,manual=1 WHERE id=?1", [id])
+                        .map_err(error)?;
+                    undo.faces.push(old);
+                }
+                description = "移回待整理";
+            }
+            Edit::Ignore { face_ids } => return self.disposition(face_ids, false, pending_group),
+            Edit::Restore { face_ids } => return self.disposition(face_ids, true, false),
             Edit::IgnorePeople { person_ids } => return self.people_disposition(person_ids, true),
             Edit::RestorePeople { person_ids } => {
                 return self.people_disposition(person_ids, false);
             }
+            Edit::DeletePeople { person_ids } => return self.delete_people(person_ids),
         }
         self.save_undo(description, undo)
     }
@@ -632,36 +837,36 @@ impl Store {
         )
     }
 
-    pub fn apply_pending_groups(&mut self, assignments: &[(i64, i64)]) -> Result<(), String> {
-        if assignments.is_empty() {
-            return Ok(());
+    fn delete_people(&self, person_ids: Vec<i64>) -> Result<(), String> {
+        if person_ids.is_empty() || person_ids.len() > 1000 {
+            return Err("请选择 1～1000 个人物。".into());
         }
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.connection,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(error)?;
-        {
-            let mut update = tx.prepare(
-                "UPDATE faces SET person_id=?2 WHERE id=?1 AND active=1 AND ignored=0 AND manual=0 AND review=0 AND person_id IS NULL"
-            ).map_err(error)?;
-            for &(id, person) in assignments {
-                if update.execute(params![id, person]).map_err(error)? != 1 {
-                    return Err(super::grouping::PREVIEW_CHANGED.into());
-                }
+        let mut undo = Undo::default();
+        let mut seen = std::collections::HashSet::new();
+        for id in person_ids.into_iter().filter(|id| seen.insert(*id)) {
+            let person = self.person(id)?;
+            if person.ignored {
+                return Err("请先恢复已忽略的人物再删除。".into());
             }
+            undo.people.push(person);
+            undo.faces.extend(self.person_faces(id)?);
+            self.connection
+                .execute(
+                    "UPDATE faces SET person_id=NULL,
+                     manual=CASE WHEN active=1 AND ignored=0 THEN 1 ELSE manual END
+                     WHERE person_id=?1",
+                    [id],
+                )
+                .map_err(error)?;
+            self.connection
+                .execute("UPDATE people SET archived=1 WHERE id=?1", [id])
+                .map_err(error)?;
         }
-        self.save_undo(
-            "补分待整理人脸",
-            Undo {
-                pending_assignments: assignments.to_vec(),
-                ..Undo::default()
-            },
-        )?;
-        tx.commit().map_err(error)
+        self.save_undo("删除人物", undo)
     }
-    fn disposition(&self, ids: Vec<i64>, restore: bool) -> Result<(), String> {
-        if ids.is_empty() || ids.len() > 1000 {
+
+    fn disposition(&self, ids: Vec<i64>, restore: bool, pending_group: bool) -> Result<(), String> {
+        if ids.is_empty() || (!pending_group && ids.len() > 1000) {
             return Err("请选择 1～1000 张人脸。".into());
         }
         let mut undo = Undo::default();
@@ -670,7 +875,11 @@ impl Store {
             if !seen.insert(id) {
                 continue;
             }
-            undo.faces.push(self.face(id)?);
+            let old = self.face(id)?;
+            if pending_group && (old.person_id.is_some() || old.ignored || old.review) {
+                return Err("请选择仍在待整理中的当前人脸。".into());
+            }
+            undo.faces.push(old);
             self.connection.execute("UPDATE faces SET ignored=?2,manual=1,review=CASE WHEN active=0 AND ?2=0 THEN 1 ELSE 0 END WHERE id=?1",params![id,!restore]).map_err(error)?;
         }
         self.save_undo(
@@ -724,9 +933,7 @@ impl Store {
         }
         if !u.pending_assignments.is_empty() {
             let mut update = tx
-                .prepare(
-                    "UPDATE faces SET person_id=NULL WHERE id=?1 AND person_id=?2 AND manual=0",
-                )
+                .prepare("UPDATE faces SET person_id=NULL,manual=0 WHERE id=?1 AND person_id=?2")
                 .map_err(error)?;
             for (face, person) in u.pending_assignments {
                 update.execute(params![face, person]).map_err(error)?;

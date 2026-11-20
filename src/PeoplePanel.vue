@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
+import PeoplePending from "./PeoplePending.vue";
 import PeopleGroupingSettings from "./PeopleGroupingSettings.vue";
 import PeopleSimilaritySearch from "./PeopleSimilaritySearch.vue";
 import { personName, type Page, type Person, type PeopleStatus } from "./people";
@@ -30,6 +31,10 @@ const singlePhotoOnly = ref(false);
 const selectedIds = ref<number[]>([]);
 const managedHidden = shallowRef<Person>();
 const dispositionMessage = ref("");
+const peopleTab = ref<HTMLButtonElement>();
+const deleteDialog = ref<HTMLDialogElement>();
+const deletion = shallowRef<{ scanId: number; personIds: number[]; name?: string }>();
+const deleteError = ref("");
 const rename = ref("");
 const mergeSearch = ref("");
 const mergeTargets = shallowRef<Page<Person>>();
@@ -69,6 +74,7 @@ watch(() => props.scanId, (id, old) => {
   request++; indexTask.value = false; state.value = undefined; error.value = ""; page.value = 0; scope.value = "people"; search.value = ""; committedSearch.value = ""; issuesOpen.value = false; issuePage.value = 0; cancelling.value = false;
   unnamedOnly.value = false; singlePhotoOnly.value = false; managedHidden.value = undefined; dispositionMessage.value = "";
   selectedDetails.value = undefined; similarityPerson.value = undefined;
+  deleteDialog.value?.close();
   if (old !== undefined) void invoke("people_cancel_index", { scanId: old }).catch(() => {});
   if (id !== undefined) void refresh(true);
 }, { immediate: true });
@@ -179,6 +185,36 @@ async function setPeopleIgnored(personIds: number[], ignored: boolean) {
     saving.value = false;
   }
 }
+async function requestDelete(personIds: number[], person?: Person) {
+  if (editDisabled.value || !personIds.length || deleteDialog.value?.open) return;
+  deletion.value = { scanId: props.scanId, personIds: [...personIds], name: person ? personName(person) : undefined };
+  deleteError.value = "";
+  await nextTick();
+  if (mounted && deletion.value?.scanId === props.scanId) deleteDialog.value?.showModal();
+}
+async function deletePeople() {
+  const target = deletion.value;
+  if (!target || target.scanId !== props.scanId || editDisabled.value) return;
+  saving.value = true;
+  deleteError.value = "";
+  error.value = "";
+  dispositionMessage.value = "";
+  try {
+    await invoke("people_edit", { scanId: target.scanId, edit: { kind: "deletePeople", personIds: target.personIds } });
+    if (!mounted || target.scanId !== props.scanId) return;
+    deleteDialog.value?.close();
+    if (props.selected && target.personIds.includes(props.selected.id)) emit("select", undefined);
+    selectedIds.value = [];
+    dispositionMessage.value = `已删除 ${target.personIds.length} 个人物。`;
+    emit("changed");
+    await nextTick();
+    if (target.scanId === props.scanId) peopleTab.value?.focus();
+  } catch (cause) {
+    if (mounted && target.scanId === props.scanId) deleteError.value = String(cause);
+  } finally {
+    saving.value = false;
+  }
+}
 function openPerson(person: Person) {
   if (scope.value === "ignoredPeople") managedHidden.value = person;
   else emit("select", person);
@@ -196,12 +232,12 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
       <button v-if="!selected" type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>
     </div>
     <progress v-if="running && state?.total" :value="state.indexed + state.failed" :max="state.total" aria-label="人物分析进度"></progress>
-    <p v-if="state" class="muted" role="status">{{ state.autoGrouping ? '自动分组已开启。不确定的人脸保留在待整理。' : '自动分组未开启，可在待整理中手动指定人物。' }}</p>
+    <p v-if="state" class="muted" role="status">{{ state.autoGrouping ? '自动分组已开启。相似人脸会在「待整理」中成组，确认后才会归入人物。' : '自动分组未开启，可在「待整理」中选人脸并手动新增人物。' }}</p>
     <p v-if="state?.message" class="notice" role="status">{{ state.message }}</p>
     <p v-if="state && !state.writable" class="notice">此相册只读，可以浏览已有的人物和时间线。</p>
     <PeopleGroupingSettings v-if="state?.groupingSettings" :scan-id="scanId" :settings="state.groupingSettings"
-      :pending="state.pendingFaces" :revision="revision" :writable="state.writable" :busy="running || libraryBusy || saving || similarityBusy"
-      @changed="emit('changed')" @working="groupingBusy = $event" @preview="emit('preview', $event)" />
+      :writable="state.writable" :busy="running || libraryBusy || saving || similarityBusy"
+      @changed="emit('changed')" @working="groupingBusy = $event" />
     </section>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="dispositionMessage" role="status">{{ dispositionMessage }}</p>
@@ -218,20 +254,23 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
         </button>
         <button type="button" class="secondary" :disabled="editDisabled || !state?.undoDescription" @click="mutate('undo')">{{ state?.undoDescription ? `撤销：${state.undoDescription}` : '暂无可撤销操作' }}</button>
       </div>
-      <PeopleSimilaritySearch v-if="similarityPerson" :scan-id="scanId" :person="similarityPerson" :revision="revision"
-        :default-threshold="state?.groupingSettings?.parameters.threshold ?? 0.65" :writable="state?.writable ?? false"
+      <PeopleSimilaritySearch v-if="similarityPerson" :scan-id="scanId" :person="activePerson" :revision="revision"
+        :writable="state?.writable ?? false"
         :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @working="similarityBusy = $event" @preview="emit('preview', $event)" />
       <details class="person-management"><summary>修改分组 / 管理人物与人脸</summary>
         <form class="people-actions" @submit.prevent="mutate('rename')"><label>人物名称 <input v-model="rename" maxlength="80" placeholder="例如：妈妈" :disabled="editDisabled" /></label><button type="submit" :disabled="editDisabled">保存名称</button></form>
-        <button type="button" class="secondary" :disabled="editDisabled" @click="setPeopleIgnored([activePerson.id], true)">忽略此人</button>
+        <div class="people-actions">
+          <button type="button" class="secondary" :disabled="editDisabled" @click="setPeopleIgnored([activePerson.id], true)">忽略此人</button>
+          <button type="button" class="secondary" :disabled="editDisabled" @click="requestDelete([activePerson.id], activePerson)">删除此人</button>
+        </div>
         <div class="people-actions"><label>查找合并目标 <input v-model="mergeSearch" maxlength="80" placeholder="输入另一人物的名称" /></label><label>合并到 <select v-model="mergeTarget" :disabled="editDisabled"><option value="">选择人物</option><option v-for="p in mergeTargets?.items.filter(p => p.id !== activePerson!.id)" :key="p.id" :value="String(p.id)">{{ personName(p) }}</option></select></label><button type="button" class="secondary" :disabled="editDisabled || !mergeTarget" @click="mutate('merge')">合并人物</button></div>
-        <p class="muted">勾选误分的人脸，可移入已有人物或拆成新人物；同一人的重复分组可合并。人工修改优先，后续自动分析不会覆盖，可撤销。</p>
+        <p class="muted">勾选误分的人脸，可移入已有人物或移回待整理。同一人的重复分组可合并，操作可撤销。</p>
         <PeopleFaceEditor :scan-id="scanId" :person-id="activePerson.id" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy || similarityBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
       </details>
     </template>
     <template v-else>
       <nav class="people-tabs" aria-label="人物分类">
-        <button type="button" :class="{ secondary: scope !== 'people' }" :aria-pressed="scope === 'people'" @click="scope = 'people'">人物</button>
+        <button ref="peopleTab" type="button" :class="{ secondary: scope !== 'people' }" :aria-pressed="scope === 'people'" @click="scope = 'people'">人物</button>
         <button type="button" :class="{ secondary: scope !== 'pending' }" :aria-pressed="scope === 'pending'" @click="scope = 'pending'">待整理（{{ state?.pendingFaces ?? 0 }}）</button>
         <button type="button" :class="{ secondary: !ignoredScope }" :aria-pressed="ignoredScope" @click="scope = 'ignoredPeople'">已忽略</button>
       </nav>
@@ -254,12 +293,15 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
           <label><input v-model="singlePhotoOnly" type="checkbox" /> 仅出现在一张照片</label>
         </div>
         <p v-if="loading" role="status">正在读取人物…</p>
-        <p v-else-if="people && !people.total" class="muted">{{ scope === 'ignoredPeople' ? '没有符合条件的已忽略人物。' : state?.enabled ? '没有符合条件的人物。' : '建立人物索引后，可为自动分组的人物命名。' }}</p>
+        <p v-else-if="people && !people.total" class="muted">{{ scope === 'ignoredPeople' ? '没有符合条件的已忽略人物。' : state?.enabled ? '没有符合条件的人物。' : '建立人物索引后，可从「待整理」选择人脸并新增人物。' }}</p>
         <div v-if="people?.items.length && state?.writable" class="people-actions">
           <button type="button" class="secondary" :disabled="editDisabled" @click="selectedIds = people!.items.map(person => person.id)">选择本页</button>
           <button v-if="selectedIds.length" type="button" class="secondary" :disabled="editDisabled" @click="selectedIds = []">取消选择</button>
           <button type="button" :disabled="editDisabled || !selectedIds.length" @click="setPeopleIgnored(selectedIds, scope === 'people')">
             {{ scope === 'people' ? '忽略所选人物' : '恢复所选人物' }}{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
+          </button>
+          <button v-if="scope === 'people'" type="button" class="secondary" :disabled="editDisabled || loading || !selectedIds.length" @click="requestDelete(selectedIds)">
+            删除所选人物{{ selectedIds.length ? `（${selectedIds.length}）` : '' }}
           </button>
         </div>
         <ul v-if="people?.items.length" class="person-grid">
@@ -278,8 +320,19 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
         </ul>
         <nav v-if="people && people.total > 24" class="people-actions" aria-label="人物分页"><button type="button" class="secondary" :disabled="loading || people.page === 0" @click="page = people!.page - 1">上一页</button><span>{{ people.page + 1 }} / {{ Math.ceil(people.total / 24) }}</span><button type="button" class="secondary" :disabled="loading || (people.page + 1) * 24 >= people.total" @click="page = people!.page + 1">下一页</button></nav>
       </template>
-      <PeopleFaceEditor v-else :scan-id="scanId" :scope="scope === 'pending' ? 'pending' : 'ignored'" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
+      <PeoplePending v-else-if="scope === 'pending'" :scan-id="scanId" :revision="revision" :writable="state?.writable ?? false" :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
+      <PeopleFaceEditor v-else :scan-id="scanId" scope="ignored" :revision="revision" :writable="state?.writable" :busy="saving || libraryBusy || groupingBusy" @changed="emit('changed')" @preview="emit('preview', $event)" />
     </template>
+    <dialog ref="deleteDialog" class="delete-person-dialog" aria-labelledby="delete-person-title" aria-describedby="delete-person-description"
+      @cancel.prevent="!saving && deleteDialog?.close()" @close="deletion = undefined">
+      <h2 id="delete-person-title">{{ deletion?.name ? `删除「${deletion.name}」？` : `删除选中的 ${deletion?.personIds.length ?? 0} 个人物？` }}</h2>
+      <p id="delete-person-description">人物分组将被移除，组内可整理的人脸会回到「待整理」。原照片会保留，可以撤销此操作。</p>
+      <p v-if="deleteError" class="error" role="alert">{{ deleteError }}</p>
+      <div class="people-actions">
+        <button type="button" class="secondary" autofocus :disabled="saving" @click="deleteDialog?.close()">取消</button>
+        <button type="button" class="danger" :disabled="editDisabled || !deletion" @click="deletePeople">{{ saving ? '正在删除…' : '确认删除' }}</button>
+      </div>
+    </dialog>
     <details v-if="state?.failed" :open="issuesOpen" @toggle="issuesOpen = ($event.target as HTMLDetailsElement).open"><summary>人物分析问题（{{ state.failed }}）</summary><ul><li v-for="issue in issues?.items" :key="issue.path">{{ issue.path }} · {{ issue.reason }}</li></ul><nav v-if="issues && issues.total > 24" class="people-actions" aria-label="人物分析问题分页"><button type="button" class="secondary" :disabled="issues.page === 0" @click="issuePage = issues!.page - 1">上一页</button><span>{{ issues.page + 1 }} / {{ Math.ceil(issues.total / 24) }}</span><button type="button" class="secondary" :disabled="(issues.page + 1) * 24 >= issues.total" @click="issuePage = issues!.page + 1">下一页</button></nav></details>
   </section>
 </template>
@@ -307,5 +360,8 @@ onBeforeUnmount(() => { mounted = false; request++; void invoke("people_cancel_i
 .notice { padding: .75rem 1rem; border-radius: .75rem; background: var(--warning-soft); color: var(--warning); font-size: .875rem; }
 .person-management { margin: 1rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); }
 .detail-title h2 { margin: 0; }
+.delete-person-dialog { box-sizing: border-box; width: 30rem; }
+.delete-person-dialog h2 { margin-top: 0; overflow-wrap: anywhere; }
+.delete-person-dialog .people-actions { justify-content: flex-end; margin-bottom: 0; }
 progress { width: 100%; }
 </style>

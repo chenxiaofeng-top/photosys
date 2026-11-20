@@ -53,6 +53,7 @@ pub(crate) enum Stage {
     Prepare,
     Inference,
     Write,
+    #[allow(dead_code)] // Keep the historical grouping slot in indexing timing reports.
     Group,
     DecodeWait,
     InferenceWait,

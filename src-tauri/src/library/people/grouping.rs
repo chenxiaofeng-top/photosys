@@ -5,7 +5,6 @@ use crate::ai::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 #[derive(Clone, Deserialize)]
@@ -177,10 +176,12 @@ pub(super) struct Groups {
     anchors: HashMap<u64, Anchor>,
     policy: Policy,
     ignored: HashSet<i64>,
+    #[cfg(test)]
     ignored_parameters: Parameters,
     enabled: bool,
 }
 
+#[cfg(test)]
 enum Match {
     Existing(i64),
     New,
@@ -201,9 +202,8 @@ pub(super) fn vector(bytes: &[u8]) -> Option<Vec<f32>> {
 }
 
 pub(super) const SUGGESTION_CHANGED: &str = "人脸或建议已变化，请重新查看归组建议。";
-pub(super) const PREVIEW_CHANGED: &str = "补分结果已变化，请重新预览。";
 pub(super) const PENDING_FACE: &str =
-    "f.active=1 AND f.ignored=0 AND f.manual=0 AND f.review=0 AND f.person_id IS NULL
+    "f.active=1 AND f.ignored=0 AND f.review=0 AND f.person_id IS NULL
      AND f.vector IS NOT NULL AND m.error IS NULL";
 
 pub(super) struct SuggestionSource {
@@ -293,7 +293,7 @@ pub(super) fn suggestions(scan_id: u64, ids: &[i64]) -> Result<FaceSuggestions, 
     if sources.is_empty() {
         return Ok(result);
     }
-    let policy = query::with(scan_id, Policy::effective)?;
+    let policy = Policy::shipped();
     let enabled = policy.allowed();
     let groups = Groups::create(scan_id, policy, enabled, false)?;
     if !groups.enabled {
@@ -338,118 +338,21 @@ pub(super) fn suggestions(scan_id: u64, ids: &[i64]) -> Result<FaceSuggestions, 
     Ok(result)
 }
 
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PendingPreview {
-    pub(super) token: String,
-    visible_matches: usize,
-    ignored_matches: usize,
-    samples: Vec<PendingSample>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingSample {
-    face_id: i64,
-    file_id: usize,
-    thumbnail: String,
-    person_id: i64,
-    person_name: String,
-    person_ignored: bool,
-}
-
-#[derive(Default)]
-pub(super) struct PendingPlan {
-    pub preview: PendingPreview,
-    pub assignments: Vec<(i64, i64)>,
-    pub files: HashSet<usize>,
-}
-
-pub(super) fn pending_plan(
-    scan_id: u64,
-    edit_generation: u64,
-    samples: bool,
-) -> Result<PendingPlan, String> {
-    let policy = query::with(scan_id, Policy::effective)?;
-    if !policy.allowed() {
-        return Err(policy.reason);
-    }
-    let groups = Groups::load(scan_id, policy)?;
-    let mut digest = Sha256::new();
-    digest.update(scan_id.to_le_bytes());
-    digest.update(edit_generation.to_le_bytes());
-    digest.update(groups.policy.threshold.to_le_bytes());
-    digest.update(groups.policy.margin.to_le_bytes());
-    digest.update(groups.policy.version.as_bytes());
-    let mut plan = PendingPlan::default();
-    if !groups.anchors.is_empty() {
-        query::with(scan_id, |store| {
-            let Some(store) = store else {
-                return Ok(());
-            };
-            let mut pending = store
-                .connection
-                .prepare(&format!(
-                    "SELECT f.id,f.file_id,f.path,f.vector FROM visible_faces f
-                 JOIN media m ON m.path=f.path WHERE m.version=?1 AND {PENDING_FACE} ORDER BY f.id"
-                ))
-                .map_err(error)?;
-            let mut sample = store.connection.prepare(
-                "SELECT f.thumbnail,p.name FROM faces f CROSS JOIN person_groups p WHERE f.id=?1 AND p.id=?2"
-            ).map_err(error)?;
-            let mut rows = pending.query([&groups.policy.version]).map_err(error)?;
-            let mut reserved = HashSet::new();
-            while let Some(row) = rows.next().map_err(error)? {
-                let face_id: i64 = row.get(0).map_err(error)?;
-                let file_id = row.get::<_, i64>(1).map_err(error)? as usize;
-                let path: Vec<u8> = row.get(2).map_err(error)?;
-                let bytes: Vec<u8> = row.get(3).map_err(error)?;
-                let Some(vector) = vector(&bytes) else {
-                    continue;
-                };
-                let Match::Existing(person_id) = groups.matching(&vector)? else {
-                    continue;
-                };
-                if reserved.contains(&(file_id, person_id))
-                    || target_blocked(&store.connection, person_id, &path, face_id)?
-                {
-                    continue;
-                }
-                reserved.insert((file_id, person_id));
-                let person_ignored = groups.ignored.contains(&person_id);
-                let count = if person_ignored {
-                    &mut plan.preview.ignored_matches
-                } else {
-                    &mut plan.preview.visible_matches
-                };
-                if samples && *count < 4 {
-                    let (thumbnail, person_name) = sample
-                        .query_row(params![face_id, person_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                        .map_err(error)?;
-                    plan.preview.samples.push(PendingSample {
-                        face_id,
-                        file_id,
-                        thumbnail: query::image(thumbnail),
-                        person_id,
-                        person_name,
-                        person_ignored,
-                    });
-                }
-                *count += 1;
-                plan.assignments.push((face_id, person_id));
-                plan.files.insert(file_id);
-                digest.update(face_id.to_le_bytes());
-                digest.update(person_id.to_le_bytes());
-                digest.update([u8::from(person_ignored)]);
-            }
-            Ok(())
-        })?;
-    }
-    plan.preview.token = format!("{:x}", digest.finalize());
-    Ok(plan)
+pub(super) fn representative_index() -> Result<Index, String> {
+    Index::new(&IndexOptions {
+        dimensions: crate::ai::catalog::active(crate::ai::ModelKind::People).dimension,
+        metric: MetricKind::Cos,
+        quantization: ScalarKind::F32,
+        connectivity: 16,
+        expansion_add: 128,
+        expansion_search: 128,
+        ..Default::default()
+    })
+    .map_err(error)
 }
 
 impl Groups {
+    #[cfg(test)]
     pub fn load(scan_id: u64, policy: Policy) -> Result<Self, String> {
         let enabled = policy.allowed();
         Self::create(scan_id, policy, enabled, true)
@@ -464,21 +367,14 @@ impl Groups {
         enabled: bool,
         include_ignored: bool,
     ) -> Result<Self, String> {
-        let index = Index::new(&IndexOptions {
-            dimensions: crate::ai::catalog::active(crate::ai::ModelKind::People).dimension,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 128,
-            ..Default::default()
-        })
-        .map_err(error)?;
+        let index = representative_index()?;
+        #[cfg(test)]
         let defaults = Policy::for_version(&policy.version);
         let mut g = Self {
             index,
             anchors: HashMap::new(),
             ignored: HashSet::new(),
+            #[cfg(test)]
             ignored_parameters: Parameters {
                 threshold: policy.threshold.max(defaults.threshold),
                 margin: policy.margin.max(defaults.margin),
@@ -547,6 +443,7 @@ impl Groups {
         Ok(ranked)
     }
 
+    #[cfg(test)]
     fn matching(&self, vector: &[f32]) -> Result<Match, String> {
         let ranked = self.ranked(vector)?;
         let Some(&(person, score)) = ranked.first() else {
@@ -571,6 +468,7 @@ impl Groups {
         })
     }
 
+    #[cfg(test)]
     pub fn assign(&mut self, s: &mut Store, ids: &[i64]) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -578,7 +476,8 @@ impl Groups {
         let tx = s.connection.transaction().map_err(error)?;
         // A manual edit can occur while inference is running. Recheck all mutable state here.
         let pending_sql = format!(
-            "SELECT f.path,f.vector FROM faces f JOIN media m ON m.path=f.path WHERE f.id=?1 AND m.version=?2 AND {PENDING_FACE}"
+            "SELECT f.path,f.vector FROM faces f JOIN media m ON m.path=f.path
+             WHERE f.id=?1 AND m.version=?2 AND {PENDING_FACE} AND f.manual=0"
         );
         for id in ids {
             let row: Option<(Vec<u8>, Vec<u8>)> = tx
@@ -613,6 +512,7 @@ impl Groups {
         tx.commit().map_err(error)?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn pending_ids(scan_id: u64) -> Result<Vec<i64>, String> {
         query::with(scan_id, |s| {
             let Some(s) = s else {

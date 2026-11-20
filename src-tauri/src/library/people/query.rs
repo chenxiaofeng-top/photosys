@@ -1,6 +1,7 @@
 //! Reusable read connection with an indexed, per-scan in-memory media catalog.
 use super::{
     super::{self as library, Filter, ItemView, Kind, Page, Sort, favorites},
+    pending,
     store::Store,
 };
 use crate::ai::{error, faces::GEOMETRY_VERSION};
@@ -29,6 +30,7 @@ struct Reader {
     rotations: HashMap<usize, u16>,
     geometry_expression: String,
     schema_version: u32,
+    legacy_data_version: Option<i64>,
 }
 pub(super) fn with<T>(
     scan_id: u64,
@@ -46,10 +48,13 @@ pub(super) fn with<T>(
             r.scan_id != scan_id
                 || r.geometry_expression != r.store.geometry_expression()?
                 || r.schema_version != r.store.schema_version()?
+                || (r.legacy_data_version.is_some()
+                    && r.legacy_data_version != Some(data_version(&r.store)?))
         }
         None => true,
     };
     if reset {
+        pending::invalidate()?;
         *reader = None;
         if let Some(store) = Store::open(&scan, false)? {
             store.connection.execute_batch("CREATE TEMP TABLE current_media(path BLOB PRIMARY KEY,file_id INTEGER NOT NULL,captured TEXT,favorite INTEGER NOT NULL,rotation INTEGER NOT NULL,stamp BLOB NOT NULL) WITHOUT ROWID; BEGIN;").map_err(error)?;
@@ -87,8 +92,33 @@ pub(super) fn with<T>(
             } else {
                 "0"
             };
+            let legacy_data_version = if schema_version < 5 {
+                let version = data_version(&store)?;
+                store.classify_legacy(ignored, important)?;
+                store
+                    .connection
+                    .execute_batch(
+                        "CREATE TEMP VIEW faces AS
+                    SELECT f.id,f.path,f.bbox,f.confidence,f.vector,f.thumbnail,
+                      CASE WHEN c.id IS NOT NULL OR (f.manual=1 AND d.id IS NULL)
+                        THEN f.person_id END AS person_id,
+                      (f.manual=1 OR c.id IS NOT NULL) AS manual,f.ignored,f.active,f.review
+                    FROM main.faces f LEFT JOIN temp.legacy_confirmations c
+                      ON c.id=f.id AND c.person_id=f.person_id
+                    LEFT JOIN temp.legacy_dispositions d ON d.id=f.id AND d.person_id=f.person_id;",
+                    )
+                    .map_err(error)?;
+                Some(version)
+            } else {
+                None
+            };
+            let archived = if legacy_data_version.is_some() {
+                "(archived OR id NOT IN(SELECT id FROM temp.legacy_people))"
+            } else {
+                "archived"
+            };
             store.connection.execute_batch(&format!(
-                "CREATE TEMP VIEW person_groups AS SELECT id,name,archived,{ignored} AS ignored,{important} AS important FROM main.people;"
+                "CREATE TEMP VIEW person_groups AS SELECT id,name,{archived} AS archived,{ignored} AS ignored,{important} AS important FROM main.people;"
             )).map_err(error)?;
             store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND ({geometry})='{GEOMETRY_VERSION}';")).map_err(error)?;
             store.connection.execute_batch(&format!("
@@ -111,10 +141,14 @@ pub(super) fn with<T>(
                 rotations: saved_rotations.clone(),
                 geometry_expression: geometry,
                 schema_version,
+                legacy_data_version,
             });
         }
     }
     if let Some(r) = reader.as_mut() {
+        if r.rotations != saved_rotations {
+            pending::invalidate()?;
+        }
         for &id in r.favorites.symmetric_difference(&saved_favorites) {
             r.store
                 .connection
@@ -150,6 +184,13 @@ pub(super) fn with<T>(
     library::scan(scan_id)?;
     Ok(result)
 }
+fn data_version(store: &Store) -> Result<i64, String> {
+    store
+        .connection
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .map_err(error)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersonView {
@@ -311,6 +352,25 @@ pub(super) fn faces(
     file_id: Option<usize>,
     page: usize,
 ) -> Result<Page<FaceView>, String> {
+    faces_filtered(scan_id, scope, person_id, file_id, page, None)
+}
+
+pub(super) fn pending_faces(
+    scan_id: u64,
+    page: usize,
+    view: &pending::View,
+) -> Result<Page<FaceView>, String> {
+    faces_filtered(scan_id, FaceScope::Pending, None, None, page, Some(view))
+}
+
+fn faces_filtered(
+    scan_id: u64,
+    scope: FaceScope,
+    person_id: Option<i64>,
+    file_id: Option<usize>,
+    page: usize,
+    view: Option<&pending::View>,
+) -> Result<Page<FaceView>, String> {
     let scan = library::scan(scan_id)?;
     with(scan_id, |store| {
         let Some(s) = store else {
@@ -325,16 +385,32 @@ pub(super) fn faces(
         } else {
             "FROM face_cards f LEFT JOIN person_groups p ON p.id=f.person_id"
         };
-        // All statements bind both placeholders, even scopes which do not use them.
+        let (group_condition, group_id) = if let Some(view) = view {
+            pending::check_view(s, scan_id, view)?;
+            (
+                match view.group_id {
+                    Some(_) => {
+                        "EXISTS(SELECT 1 FROM temp.pending_group_members g WHERE g.face_id=f.id AND g.group_id=?4)"
+                    }
+                    None => {
+                        "NOT EXISTS(SELECT 1 FROM temp.pending_group_members g WHERE g.face_id=f.id) AND ?4 IS NULL"
+                    }
+                },
+                view.group_id,
+            )
+        } else {
+            ("?4 IS NULL", None)
+        };
+        // Bind all placeholders for every scope.
         let condition = format!(
-            "({}) AND (?1 IS NULL OR ?1 IS NOT NULL) AND (?2 IS NULL OR ?2 IS NOT NULL)",
+            "({}) AND (?1 IS NULL OR ?1 IS NOT NULL) AND (?2 IS NULL OR ?2 IS NOT NULL) AND ({group_condition})",
             face_where(scope)
         );
         let total = s
             .connection
             .query_row(
                 &format!("SELECT COUNT(*) {join} WHERE {condition}"),
-                params![person_id, file_id.map(|id| id as i64)],
+                params![person_id, file_id.map(|id| id as i64), 0, group_id],
                 |r| r.get::<_, i64>(0).map(|v| v as usize),
             )
             .map_err(error)?;
@@ -342,7 +418,12 @@ pub(super) fn faces(
         let mut q=s.connection.prepare(&format!("SELECT f.id,f.file_id,f.person_id,p.name,f.thumbnail,f.bbox,f.manual,f.ignored,COALESCE(p.ignored,0),f.valid=0 {join} WHERE {condition} ORDER BY f.review DESC,f.id LIMIT 24 OFFSET ?3")).map_err(error)?;
         let rows = q
             .query_map(
-                params![person_id, file_id.map(|id| id as i64), offset as i64],
+                params![
+                    person_id,
+                    file_id.map(|id| id as i64),
+                    offset as i64,
+                    group_id
+                ],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
