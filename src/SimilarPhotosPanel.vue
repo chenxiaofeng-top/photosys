@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, nextTick, ref, shallowRef, watch } from "vue";
+import SimilarPhotoDetails from "./SimilarPhotoDetails.vue";
 import SimilarPhotoPreview from "./SimilarPhotoPreview.vue";
 import { formatBytes } from "./formatBytes";
 
@@ -69,7 +70,20 @@ interface TrashResult {
   affectedGroups: Group[];
 }
 
+interface TrashRequest {
+  mode: "single" | "batch";
+  photos: Photo[];
+}
+
+interface GroupRefresh {
+  mode: TrashRequest["mode"];
+  groupId: number;
+  affectedIds: number[];
+  keepComparison: boolean;
+}
+
 const pageSize = 25;
+const compareLimit = 4;
 const labels = { variant: "同图变体", burst: "疑似连拍" };
 const emit = defineEmits<{ busyChange: [busy: boolean] }>();
 const directory = ref("");
@@ -77,7 +91,8 @@ const choosing = ref(false);
 const activeScan = ref<number>();
 const cancelling = ref(false);
 const trashing = ref(false);
-const busy = computed(() => choosing.value || activeScan.value !== undefined || trashing.value);
+const refreshingGroups = ref(false);
+const busy = computed(() => choosing.value || activeScan.value !== undefined || trashing.value || refreshingGroups.value);
 watch(busy, (value) => emit("busyChange", value), { flush: "sync" });
 
 const progress = shallowRef<Progress>();
@@ -94,16 +109,21 @@ const expanded = shallowRef<Group>();
 const memberPage = ref(0);
 const members = shallowRef<Page<Member>>();
 const memberError = ref("");
-const left = shallowRef<Photo>();
-const right = shallowRef<Photo>();
+const compared = shallowRef<Member[]>([]);
+const comparedIds = computed(() => new Set(compared.value.map(({ photo }) => photo.id)));
+const viewing = shallowRef<{ member: Member; trigger: HTMLButtonElement }>();
+let fillComparisonTo: number | undefined;
 const selected = shallowRef(new Map<number, Photo>());
 const selectedBytes = computed(() => [...selected.value.values()].reduce((total, photo) => total + photo.size, 0));
 const confirmation = ref<HTMLDialogElement>();
+const trashRequest = shallowRef<TrashRequest>();
+const confirmationBytes = computed(() => trashRequest.value?.photos.reduce((total, photo) => total + photo.size, 0) ?? 0);
 const resultsSection = ref<HTMLElement>();
 const outcomes = shallowRef<TrashOutcome[]>([]);
 const trashError = ref("");
+const singleTrashError = ref("");
 const revision = ref(0);
-let refreshGroup: { preferredId?: number } | undefined;
+let refreshGroup: GroupRefresh | undefined;
 const statusLabels = { moved: "已移入回收站", skipped: "已跳过", failed: "失败" };
 const outcomeCounts = computed(() => {
   const counts = { moved: 0, skipped: 0, failed: 0 };
@@ -117,13 +137,16 @@ const issues = shallowRef<Page<Issue>>();
 const issueError = ref("");
 
 function closeGroup() {
+  viewing.value = undefined;
   selected.value = new Map();
   confirmation.value?.close();
+  trashRequest.value = undefined;
   expanded.value = undefined;
   members.value = undefined;
   memberPage.value = 0;
-  left.value = undefined;
-  right.value = undefined;
+  compared.value = [];
+  fillComparisonTo = undefined;
+  singleTrashError.value = "";
 }
 
 function resetResults() {
@@ -201,23 +224,44 @@ async function cancelScan() {
 
 function toggleGroup(group: Group) {
   if (busy.value) return;
-  if (expanded.value?.id === group.id) {
-    closeGroup();
-    return;
-  }
+  const wasOpen = expanded.value?.id === group.id;
   closeGroup();
-  expanded.value = group;
-  memberPage.value = 0;
-  left.value = group.representative;
-  right.value = undefined;
+  if (!wasOpen) openGroup(group);
 }
 
-function selectPhoto(photo: Photo, side: "left" | "right") {
-  if (busy.value) return;
-  const target = side === "left" ? left : right;
-  const other = side === "left" ? right : left;
-  if (other.value?.id === photo.id) other.value = target.value;
-  target.value = photo;
+function openGroup(group: Group) {
+  fillComparisonTo = compareLimit;
+  expanded.value = group;
+}
+
+function comparisonDisabled(photo: Photo) {
+  return busy.value || (!comparedIds.value.has(photo.id) && compared.value.length >= compareLimit);
+}
+
+function comparisonSection() {
+  return resultsSection.value?.querySelector<HTMLElement>("#similar-comparison");
+}
+
+function openPhotoDetails(member: Member, event: MouseEvent) {
+  if (busy.value || viewing.value) return;
+  viewing.value = { member, trigger: event.currentTarget as HTMLButtonElement };
+}
+
+function closePhotoDetails() {
+  const trigger = viewing.value?.trigger;
+  viewing.value = undefined;
+  trigger?.focus({ preventScroll: true });
+}
+
+async function toggleComparison(member: Member, fromCard = false) {
+  if (comparisonDisabled(member.photo)) return;
+  compared.value = comparedIds.value.has(member.photo.id)
+    ? compared.value.filter(({ photo }) => photo.id !== member.photo.id)
+    : [...compared.value, member];
+  if (fromCard) {
+    await nextTick();
+    comparisonSection()?.focus();
+  }
 }
 
 function selectionDisabled(photo: Photo) {
@@ -233,30 +277,89 @@ function toggleSelection(photo: Photo) {
   selected.value = selection;
 }
 
-async function trashSelection() {
+function canTrashOne(photo: Photo) {
+  return !busy.value && !photo.hardLink && (expanded.value?.count ?? 0) > 1
+    && comparedIds.value.has(photo.id);
+}
+
+function openTrashConfirmation(photo?: Photo) {
+  const dialog = confirmation.value;
+  if (!dialog || dialog.open || busy.value || !expanded.value) return;
+  if (photo ? !canTrashOne(photo) : !selected.value.size) return;
+  trashRequest.value = photo
+    ? { mode: "single", photos: [photo] }
+    : { mode: "batch", photos: [...selected.value.values()] };
+  dialog.showModal();
+}
+
+function clearTrashRequest() {
+  if (!confirmation.value?.open) trashRequest.value = undefined;
+}
+
+async function focusTrashResult(single: boolean) {
+  await nextTick();
+  (single ? comparisonSection() ?? resultsSection.value : resultsSection.value)
+    ?.focus({ preventScroll: !single });
+}
+
+async function trashPhotos() {
   const current = summary.value;
   const group = expanded.value;
-  if (!current || !group || busy.value || !selected.value.size || !confirmation.value?.open) return;
-  const fileIds = [...selected.value.keys()];
+  const request = trashRequest.value;
+  if (!current || !group || !request || busy.value || !confirmation.value?.open) return;
+  const single = request.mode === "single";
+  if (single && !canTrashOne(request.photos[0])) return;
+  const fileIds = request.photos.map(({ id }) => id);
   confirmation.value.close();
   trashing.value = true;
   trashError.value = "";
+  singleTrashError.value = "";
   outcomes.value = [];
   try {
     const result = await invoke<TrashResult>("trash_similar", { scanId: current.scanId, groupId: group.id, fileIds });
     summary.value = { ...current, groups: result.totalGroups };
     outcomes.value = result.outcomes;
-    closeGroup();
-    refreshGroup = { preferredId: result.affectedGroups.find((group) =>
-      filter.value === "all" || (filter.value === "variant" ? group.hasVariant : group.hasBurst),
-    )?.id };
+    if (single) {
+      const outcome = result.outcomes.find(({ id }) => id === fileIds[0]);
+      if (outcome?.status !== "moved") {
+        singleTrashError.value = outcome?.reason || "照片未移入回收站，请重试。";
+        return;
+      }
+    }
+
+    const remainingGroup = result.affectedGroups.find(({ id }) => id === group.id);
+    const keepComparison = single && !!remainingGroup && fileIds[0] !== group.representative.id;
+    if (keepComparison) {
+      fillComparisonTo = compared.value.length;
+      compared.value = compared.value.filter(({ photo }) => photo.id !== fileIds[0]);
+      const selection = new Map(selected.value);
+      selection.delete(fileIds[0]);
+      if (selection.size === remainingGroup.count) selection.delete(remainingGroup.representative.id);
+      selected.value = selection;
+      if (members.value) {
+        members.value = {
+          total: remainingGroup.count,
+          items: members.value.items.filter(({ photo }) => photo.id !== fileIds[0]),
+        };
+      }
+    } else {
+      closeGroup();
+    }
+    if (!result.totalGroups) return;
+    refreshGroup = {
+      mode: request.mode,
+      groupId: group.id,
+      affectedIds: result.affectedGroups.map(({ id }) => id),
+      keepComparison,
+    };
+    refreshingGroups.value = true;
     revision.value++;
   } catch (cause) {
-    trashError.value = String(cause);
+    if (single) singleTrashError.value = String(cause);
+    else trashError.value = String(cause);
   } finally {
     trashing.value = false;
-    await nextTick();
-    resultsSection.value?.focus({ preventScroll: true });
+    if (!refreshingGroups.value) await focusTrashResult(single);
   }
 }
 
@@ -266,13 +369,16 @@ function pageCount(total: number) {
 
 function changeGroupPage(page: number) {
   if (busy.value) return;
+  refreshGroup = undefined;
   closeGroup();
   groupPage.value = page;
 }
 
 watch(filter, () => changeGroupPage(0), { flush: "sync" });
 watch([scanId, filter, groupPage, revision], async ([id, kind, page], _, onCleanup) => {
-  groups.value = undefined;
+  const refresh = refreshGroup;
+  if (refresh) refreshingGroups.value = true;
+  else groups.value = undefined;
   groupError.value = "";
   if (id === undefined) return;
   let current = true;
@@ -286,14 +392,28 @@ watch([scanId, filter, groupPage, revision], async ([id, kind, page], _, onClean
         return;
       }
       groups.value = result;
-      if (refreshGroup) {
-        const group = result.items.find((group) => group.id === refreshGroup?.preferredId) ?? result.items[0];
+      if (refresh) {
+        const group = result.items.find(({ id }) => id === refresh.groupId)
+          ?? result.items.find(({ id }) => refresh.affectedIds.includes(id))
+          ?? (refresh.mode === "batch" ? result.items[0] : undefined);
+        if (group && refresh.keepComparison && group.id === refresh.groupId) {
+          memberPage.value = Math.min(memberPage.value, pageCount(group.count) - 1);
+          expanded.value = group;
+        } else {
+          closeGroup();
+          if (group) openGroup(group);
+        }
         refreshGroup = undefined;
-        if (group) toggleGroup(group);
+        refreshingGroups.value = false;
+        await focusTrashResult(refresh.mode === "single");
       }
     }
   } catch (cause) {
-    if (current) groupError.value = String(cause);
+    if (current) {
+      groupError.value = String(cause);
+      refreshingGroups.value = false;
+      if (refresh) await focusTrashResult(refresh.mode === "single");
+    }
   }
 });
 
@@ -307,7 +427,12 @@ watch([scanId, expanded, memberPage], async ([id, group, page], _, onCleanup) =>
     const result = await invoke<Page<Member>>("similar_members", { scanId: id, groupId: group.id, page });
     if (current) {
       members.value = result;
-      if (!right.value && page === 0) right.value = result.items[1]?.photo;
+      if (fillComparisonTo !== undefined) {
+        const available = result.items.filter(({ photo }) => !comparedIds.value.has(photo.id));
+        const slots = Math.max(0, fillComparisonTo - compared.value.length);
+        compared.value = [...compared.value, ...available.slice(0, slots)];
+        fillComparisonTo = undefined;
+      }
     }
   } catch (cause) {
     if (current) memberError.value = String(cause);
@@ -360,7 +485,7 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
       <p v-if="trashing" role="status">正在核验照片并移到回收站…</p>
     </form>
 
-    <section v-if="summary" ref="resultsSection" tabindex="-1" aria-labelledby="similar-results" :aria-busy="trashing">
+    <section v-if="summary" ref="resultsSection" tabindex="-1" aria-labelledby="similar-results" :aria-busy="trashing || refreshingGroups">
       <h2 id="similar-results">扫描结果</h2>
       <dl aria-live="polite">
         <div><dt>成功检查</dt><dd>{{ summary.checked }}</dd></div>
@@ -437,54 +562,78 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
             </div>
 
             <div v-if="expanded?.id === group.id" class="group-content">
+              <section id="similar-comparison" tabindex="-1" aria-labelledby="similar-compare-heading">
+                <div class="compare-header">
+                  <h4 id="similar-compare-heading">照片对比</h4>
+                  <p class="selection-total" role="status">已对比 {{ compared.length }} / {{ compareLimit }} 张</p>
+                </div>
+                <p v-if="singleTrashError" class="error" role="alert">{{ singleTrashError }}</p>
+                <ul v-if="compared.length" class="compare" :class="{ 'single-card': compared.length === 1 }">
+                  <li v-for="member in compared" :key="member.photo.id" class="compare-card photo-info">
+                    <div class="compare-preview">
+                      <SimilarPhotoPreview :scan-id="summary.scanId" :file-id="member.photo.id" :name="member.photo.name" detail />
+                      <button type="button" class="compare-open" aria-haspopup="dialog" :disabled="busy"
+                        :aria-label="`放大查看 ${member.photo.relativePath}`" @click="openPhotoDetails(member, $event)">
+                        <span>放大查看</span>
+                      </button>
+                    </div>
+                    <div class="compare-meta">
+                      <h5 :title="member.photo.relativePath">{{ member.photo.name }}</h5>
+                      <p>{{ member.kind ? labels[member.kind] : "代表图" }} · {{ member.photo.width }} × {{ member.photo.height }} · {{ formatBytes(member.photo.size) }}</p>
+                      <p v-if="member.photo.capturedAt">拍摄于 {{ member.photo.capturedAt }}</p>
+                    </div>
+                    <div class="compare-actions">
+                      <button type="button" class="secondary" :disabled="busy"
+                        :aria-label="`移出对比 ${member.photo.relativePath}`" @click="toggleComparison(member, true)">
+                        移出对比
+                      </button>
+                      <span v-if="member.photo.hardLink" class="selection-total">硬链接，保留</span>
+                      <button v-else type="button" class="secondary compare-trash" :disabled="!canTrashOne(member.photo)"
+                        :aria-label="`移到回收站 ${member.photo.relativePath}`" @click="openTrashConfirmation(member.photo)">
+                        移到回收站
+                      </button>
+                    </div>
+                  </li>
+                </ul>
+                <p v-else-if="members" class="selection-total">点击下方缩略图，选择要对比的照片。</p>
+              </section>
+
               <div class="actions">
                 <button type="button" class="secondary" :disabled="busy || !selected.size" @click="selected = new Map()">清除勾选</button>
-                <button type="button" class="danger" :disabled="busy || !selected.size" @click="confirmation?.showModal()">移到回收站</button>
+                <button type="button" class="danger" :disabled="busy || !selected.size" @click="openTrashConfirmation()">将勾选项移到回收站</button>
               </div>
               <p class="selection-total" role="status">已勾选 {{ selected.size }} 张，共 {{ formatBytes(selectedBytes) }}；本组保留 {{ group.count - selected.size }} 张。</p>
               <p id="similar-selection-rule">请手动勾选要移到回收站的照片，每组至少保留一张。代表图也可勾选，硬链接照片保留。</p>
-              <div class="compare" aria-label="并排对比">
-                <div v-for="(photo, side) in { left, right }" :key="side" class="photo-info">
-                  <h4>{{ side === "left" ? "左图" : "右图" }}</h4>
-                  <template v-if="photo">
-                    <SimilarPhotoPreview :scan-id="summary.scanId" :file-id="photo.id" :name="photo.name" detail />
-                    <p><strong>{{ photo.name }}</strong></p>
-                    <p>{{ photo.relativePath }}</p>
-                    <p>{{ photo.width }} × {{ photo.height }} · {{ formatBytes(photo.size) }}</p>
-                    <p v-if="photo.capturedAt">拍摄于 {{ photo.capturedAt }}</p>
-                  </template>
-                </div>
-              </div>
               <p v-if="memberError" class="error" role="alert">{{ memberError }}</p>
               <button v-if="memberError" type="button" class="secondary" :disabled="busy" @click="expanded = { ...group }">重新加载组内照片</button>
-              <ul v-else-if="members" class="member-list">
-                <li v-for="{ photo, kind } in members.items" :key="photo.id">
-                  <label class="photo-selection">
-                    <input type="checkbox" :checked="selected.has(photo.id)" :disabled="selectionDisabled(photo)"
-                      :aria-label="`勾选 ${photo.relativePath} 移到回收站`" aria-describedby="similar-selection-rule"
-                      @change="toggleSelection(photo)" />
-                  </label>
-                  <SimilarPhotoPreview :scan-id="summary.scanId" :file-id="photo.id" :name="photo.name" />
-                  <div class="photo-info">
-                    <strong>{{ photo.name }}</strong>
-                    <p>{{ photo.relativePath }}</p>
-                    <p>{{ kind ? labels[kind] : "代表图" }} · {{ photo.width }} × {{ photo.height }} · {{ formatBytes(photo.size) }}</p>
-                    <p v-if="photo.capturedAt">拍摄于 {{ photo.capturedAt }}</p>
-                    <p v-if="photo.hardLink">硬链接，保留</p>
-                    <p v-else-if="!selected.has(photo.id) && selected.size === group.count - 1">本组保留项</p>
-                    <div class="actions">
-                      <button type="button" class="secondary" :aria-label="`${photo.name} 设为左图`"
-                        :disabled="busy || left?.id === photo.id" @click="selectPhoto(photo, 'left')">
-                        {{ left?.id === photo.id ? "当前左图" : "设为左图" }}
-                      </button>
-                      <button type="button" class="secondary" :aria-label="`${photo.name} 设为右图`"
-                        :disabled="busy || right?.id === photo.id" @click="selectPhoto(photo, 'right')">
-                        {{ right?.id === photo.id ? "当前右图" : "设为右图" }}
-                      </button>
+              <template v-else-if="members">
+                <p v-if="compared.length === compareLimit && group.count > compareLimit" class="selection-total">
+                  点击已选缩略图或「移出对比」可腾出位置，再点击另一张缩略图加入对比。
+                </p>
+                <ul class="member-list">
+                  <li v-for="{ photo, kind } in members.items" :key="photo.id">
+                    <label class="photo-selection">
+                      <input type="checkbox" :checked="selected.has(photo.id)" :disabled="selectionDisabled(photo)"
+                        :aria-label="`勾选 ${photo.relativePath} 移到回收站`" aria-describedby="similar-selection-rule"
+                        @change="toggleSelection(photo)" />
+                    </label>
+                    <div class="member-thumb">
+                      <SimilarPhotoPreview :scan-id="summary.scanId" :file-id="photo.id" :name="photo.name" aria-hidden="true" />
+                      <button type="button" class="compare-thumb" :aria-label="`对比 ${photo.relativePath}`"
+                        :aria-pressed="comparedIds.has(photo.id)" :disabled="comparisonDisabled(photo)"
+                        @click="toggleComparison({ photo, kind })"></button>
                     </div>
-                  </div>
-                </li>
-              </ul>
+                    <div class="photo-info">
+                      <strong>{{ photo.name }}</strong><span v-if="comparedIds.has(photo.id)" class="compare-tag">对比中</span>
+                      <p>{{ photo.relativePath }}</p>
+                      <p>{{ kind ? labels[kind] : "代表图" }} · {{ photo.width }} × {{ photo.height }} · {{ formatBytes(photo.size) }}</p>
+                      <p v-if="photo.capturedAt">拍摄于 {{ photo.capturedAt }}</p>
+                      <p v-if="photo.hardLink">硬链接，保留</p>
+                      <p v-else-if="!selected.has(photo.id) && selected.size === group.count - 1">本组保留项</p>
+                    </div>
+                  </li>
+                </ul>
+              </template>
               <p v-else role="status">正在加载组内照片…</p>
               <nav v-if="pageCount(group.count) > 1" class="actions" aria-label="组内照片分页">
                 <button type="button" class="secondary" :disabled="busy || memberPage === 0" @click="memberPage--">上一页</button>
@@ -502,18 +651,25 @@ watch([scanId, issuesOpen, issuePage], async ([id, open, page], _, onCleanup) =>
       </template>
     </section>
 
-    <dialog ref="confirmation" class="trash-dialog" aria-labelledby="similar-trash-heading" aria-describedby="similar-trash-summary">
-      <h2 id="similar-trash-heading">确认移到回收站</h2>
+    <SimilarPhotoDetails v-if="viewing && summary" :key="viewing.member.photo.id"
+      :scan-id="summary.scanId" :photo="viewing.member.photo"
+      :match-label="viewing.member.kind ? labels[viewing.member.kind] : '代表图'" @close="closePhotoDetails" />
+
+    <dialog ref="confirmation" class="trash-dialog" aria-labelledby="similar-trash-heading" aria-describedby="similar-trash-summary" @close="clearTrashRequest">
+      <h2 id="similar-trash-heading">{{ trashRequest?.mode === "single" ? "将这张照片移到回收站？" : "确认移到回收站" }}</h2>
       <p id="similar-trash-summary">
-        将移入 {{ selected.size }} 张照片，逻辑大小共 {{ formatBytes(selectedBytes) }}；本组保留 {{ (expanded?.count ?? 0) - selected.size }} 张。可从系统回收站恢复。
+        将移入 {{ trashRequest?.photos.length ?? 0 }} 张照片，逻辑大小共 {{ formatBytes(confirmationBytes) }}；本组保留 {{ (expanded?.count ?? 0) - (trashRequest?.photos.length ?? 0) }} 张。可从系统回收站恢复。
       </p>
       <p class="current-file">扫描目录 {{ directory }}</p>
       <div class="trash-preview" tabindex="0" aria-label="将移到回收站的照片">
-        <ul><li v-for="photo in selected.values()" :key="photo.id">{{ photo.relativePath }}</li></ul>
+        <ul><li v-for="photo in trashRequest?.photos" :key="photo.id">
+          <strong v-if="trashRequest?.mode === 'single'">{{ photo.name }}</strong>
+          <span v-if="trashRequest?.mode !== 'single' || photo.relativePath !== photo.name">{{ photo.relativePath }}</span>
+        </li></ul>
       </div>
       <div class="actions">
         <button type="button" class="secondary" autofocus @click="confirmation?.close()">取消</button>
-        <button type="button" class="danger" :disabled="busy || !selected.size" @click="trashSelection">确认移到回收站</button>
+        <button type="button" class="danger" :disabled="busy || !trashRequest" @click="trashPhotos">确认移到回收站</button>
       </div>
     </dialog>
   </div>
@@ -559,8 +715,7 @@ select {
   overflow-wrap: anywhere;
 }
 
-.photo-info h3,
-.photo-info h4 {
+.photo-info h3 {
   margin: 0 0 0.4rem;
 }
 
@@ -575,11 +730,118 @@ select {
   padding-top: 0.75rem;
 }
 
+#similar-comparison {
+  container-type: inline-size;
+}
+
+.compare-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.compare-header > * {
+  margin: 0;
+}
+
 .compare {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  margin: 0.75rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.compare.single-card {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@container (max-width: 22rem) {
+  .compare {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.compare-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  padding: 0.65rem;
+  background: var(--surface-subtle);
+}
+
+.compare-preview {
+  position: relative;
+}
+
+.compare-preview > .photo-preview {
+  height: clamp(8rem, 25dvh, 15rem);
+  aspect-ratio: auto;
+}
+
+button.compare-open {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: end;
+  justify-content: end;
+  width: 100%;
+  padding: 0.5rem;
+  cursor: zoom-in;
+}
+
+button.compare-open,
+button.compare-open:hover:not(:disabled),
+button.compare-open:disabled {
+  background: transparent;
+}
+
+.compare-open span {
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.35rem;
+  background: var(--viewer);
+  color: var(--viewer-text);
+  font-size: 0.75rem;
+}
+
+.compare-open:disabled span {
+  opacity: 0.6;
+}
+
+.compare-meta h5 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.compare-meta p {
+  margin: 0.25rem 0 0;
+}
+
+.compare-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: auto;
+}
+
+.compare-actions button {
+  padding-inline: 0.6rem;
+}
+
+button.compare-trash:not(:disabled) {
+  margin-inline-start: auto;
+  color: var(--danger);
+}
+
+button.compare-trash:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .member-list {
@@ -593,9 +855,36 @@ select {
   padding: 0.65rem 0;
 }
 
-.member-list li > .photo-preview {
+.member-thumb {
+  position: relative;
   width: 4rem;
   flex: none;
+}
+
+button.compare-thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  padding: 0;
+  border: 2px solid transparent;
+  background: transparent;
+}
+
+button.compare-thumb:hover:not(:disabled),
+button.compare-thumb[aria-pressed="true"],
+button.compare-thumb[aria-pressed="true"]:disabled {
+  border-color: var(--accent);
+  background: transparent;
+}
+
+button.compare-thumb:disabled {
+  background: transparent;
+}
+
+.compare-tag {
+  margin-inline-start: 0.4rem;
+  color: var(--accent);
+  font-size: 0.75rem;
 }
 
 .photo-selection {
@@ -638,11 +927,12 @@ select {
   border-block: 1px solid var(--border);
 }
 
+.trash-preview li > strong {
+  display: block;
+}
+
 .trash-dialog .actions {
   justify-content: end;
 }
 
-.member-list .actions {
-  margin: 0;
-}
 </style>

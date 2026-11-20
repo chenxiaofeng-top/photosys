@@ -10,13 +10,14 @@ use tokio::sync::Semaphore;
 
 use super::{STATE_ERROR, Scan, live, previews::CHANGED, scan};
 use crate::{
+    duplicates::{Candidate, Root},
     media_codec::{self, probe},
     media_date::{
         EmbeddedMetadata, Media, read_embedded_metadata, valid_video_creation_time, valid_year,
     },
 };
 
-static DETAILS_SLOTS: Semaphore = Semaphore::const_new(2);
+pub(crate) static DETAILS_SLOTS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,43 +72,45 @@ struct VideoDetails {
 
 impl Scan {
     fn media_details(&self, file_id: usize) -> Result<MediaDetails, String> {
-        let item = self.item(file_id)?;
-        let mut file = self.root.open_matching(&item.file).map_err(|_| CHANGED)?;
-        let path = &item.file.relative;
-        let mut details = MediaDetails {
-            modified_at: file
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .map(|time| {
-                    DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
-                }),
-            ..Default::default()
-        };
-        let mut parser = MediaParser::new();
-        match Media::from_path(path) {
-            Some(Media::Photo) => {
-                let is_isobmff = media_codec::is_heif(path)
-                    || path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("avif"));
-                let photo = photo_details(&mut file, is_isobmff, &mut parser);
-                details.partial = photo.dimensions.is_none();
-                details.photo = Some(photo);
-            }
-            Some(Media::Video) => {
-                let (video, partial) = video_details(&mut file, path, &mut parser);
-                details.video = Some(video);
-                details.partial = partial;
-            }
-            Some(Media::LivePhoto) => live_details(&mut file, &mut parser, &mut details),
-            None => return Err("无法识别媒体格式。".into()),
-        }
-        self.root
-            .verify_read(&file, &item.file)
-            .map_err(|_| CHANGED)?;
-        Ok(details)
+        read_media_details(&self.root, &self.item(file_id)?.file)
     }
+}
+
+pub(crate) fn read_media_details(
+    root: &Root,
+    candidate: &Candidate,
+) -> Result<MediaDetails, String> {
+    let mut file = root.open_matching(candidate).map_err(|_| CHANGED)?;
+    let path = &candidate.relative;
+    let mut details = MediaDetails {
+        modified_at: file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(|time| DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)),
+        ..Default::default()
+    };
+    let mut parser = MediaParser::new();
+    match Media::from_path(path) {
+        Some(Media::Photo) => {
+            let is_isobmff = media_codec::is_heif(path)
+                || path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("avif"));
+            let photo = photo_details(&mut file, is_isobmff, &mut parser);
+            details.partial = photo.dimensions.is_none();
+            details.photo = Some(photo);
+        }
+        Some(Media::Video) => {
+            let (video, partial) = video_details(&mut file, path, &mut parser);
+            details.video = Some(video);
+            details.partial = partial;
+        }
+        Some(Media::LivePhoto) => live_details(&mut file, &mut parser, &mut details),
+        None => return Err("无法识别媒体格式。".into()),
+    }
+    root.verify_read(&file, candidate).map_err(|_| CHANGED)?;
+    Ok(details)
 }
 
 fn live_details(file: &mut File, parser: &mut MediaParser, details: &mut MediaDetails) {

@@ -29,6 +29,7 @@ import type { IndexStatus } from "./aiSearch";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
 type FileAction = "open" | "reveal" | "copy";
+type LibraryView = "grid" | "timeline";
 
 interface Issue {
   path: string;
@@ -87,6 +88,29 @@ const aiIndex = ref<IndexStatus>();
 const aiPanel = ref<InstanceType<typeof AiSearchSettings>>();
 const aiRevision = ref(0);
 const sort = ref<Sort>("dateDesc");
+const timelineSort = ref<"dateDesc" | "dateAsc">("dateDesc");
+const libraryViewKey = "photosys.libraryView";
+const libraryView = ref<LibraryView>("grid");
+try {
+  if (window.localStorage.getItem(libraryViewKey) === "timeline") libraryView.value = "timeline";
+} catch { /* The current session can still change views. */ }
+
+const canChooseLibraryView = computed(() => props.mode === "library" && searchMode.value === "filename");
+const libraryTimeline = computed(() => canChooseLibraryView.value && libraryView.value === "timeline");
+const activeSort = computed<Sort>({
+  get: () => libraryTimeline.value ? timelineSort.value : sort.value,
+  set: (value) => {
+    if (!libraryTimeline.value) sort.value = value;
+    else if (value === "dateDesc" || value === "dateAsc") timelineSort.value = value;
+  },
+});
+
+function setLibraryView(value: LibraryView) {
+  libraryView.value = value;
+  try { window.localStorage.setItem(libraryViewKey, value); }
+  catch { /* The current session can still change views. */ }
+}
+
 const selectedPerson = shallowRef<Person>();
 const peopleVisited = ref(false);
 const peopleRevision = ref(0);
@@ -164,7 +188,7 @@ const addedAlbum = shallowRef<Album>();
 const albumError = ref("");
 const albumPicker = ref<InstanceType<typeof AlbumPicker>>();
 const { selected: selectedFiles, selecting, clear: clearSelection, toggle: toggleSelection, selectPage, stop: stopSelection } = useAlbumSelection([
-  summary, filter, sort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
+  summary, filter, activeSort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
 ]);
 const requestedPage = ref(0);
 const revision = ref(0);
@@ -182,6 +206,9 @@ watch(() => props.mode, (mode, oldMode) => {
 }, { immediate: true });
 
 const results = shallowRef<Page<Item>>();
+// Only group results from a library request that used the current timeline order.
+const loadedLibrarySort = ref<Sort>();
+const timelineResultsReady = computed(() => !libraryTimeline.value || loadedLibrarySort.value === activeSort.value);
 // A page request may have started before a rotation was saved (for example when
 // closing a detail on another page). Keep its eventual response up to date.
 const savedRotations = new Map<number, Rotation>();
@@ -231,16 +258,20 @@ async function fetchPage(scanId: number, currentFilter: typeof filter.value, cur
   }
   return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
 }
-watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([filter, activeSort], () => { requestedPage.value = 0; }, { flush: "sync" });
+watch([summary, filter, activeSort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
+  const requestedLibrarySort = canChooseLibraryView.value ? currentSort : undefined;
   let receiving = true;
   onCleanup(() => { receiving = false; });
   itemsLoading.value = true;
   itemsError.value = "";
   try {
     const result = await fetchPage(scan.scanId, currentFilter, currentSort, page);
-    if (receiving) results.value = withSavedRotations(result);
+    if (receiving) {
+      loadedLibrarySort.value = requestedLibrarySort;
+      results.value = withSavedRotations(result);
+    }
   } catch (cause) {
     if (receiving) {
       results.value = undefined;
@@ -513,7 +544,7 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-watch([summary, filter, sort, revision, searchMode, selectedPerson, () => props.mode, selectedAlbum], () => {
+watch([summary, filter, activeSort, revision, searchMode, selectedPerson, () => props.mode, selectedAlbum], () => {
   pendingFocus = undefined;
   dialog.value?.close();
   resetDetail();
@@ -633,7 +664,7 @@ async function moveDetail(delta: -1 | 1) {
     detailError.value = "";
     detailStatus.value = "";
     try {
-      nextPage = await fetchPage(scanId, filter.value, sort.value, targetPage);
+      nextPage = await fetchPage(scanId, filter.value, activeSort.value, targetPage);
       if (request !== detailRequest || !dialog.value?.open) return;
       nextPage = withSavedRotations(nextPage);
     } catch (cause) {
@@ -895,12 +926,21 @@ async function performFileAction(action: FileAction) {
           </div>
           <span v-if="!albumsMode && locationLabel" class="location-selection">{{ locationLabel }} <button type="button" class="secondary" @click="locationSelection = null">清除</button></span>
           <ElCheckbox v-model="favoritesOnly" class="favorite-filter">仅收藏</ElCheckbox>
+          <div v-if="canChooseLibraryView" class="filter-field">
+            <span id="library-view-label">显示方式</span>
+            <div class="library-view-options" role="group" aria-labelledby="library-view-label">
+              <button type="button" class="secondary" :aria-pressed="libraryView === 'grid'" :disabled="busy" @click="setLibraryView('grid')">网格</button>
+              <button type="button" class="secondary" :aria-pressed="libraryTimeline" :disabled="busy" @click="setLibraryView('timeline')">时间轴</button>
+            </div>
+          </div>
           <div v-if="searchMode === 'filename'" class="filter-field sort-field">
             <span id="sort-label">排序</span>
-            <ElSelect v-model="sort" class="sort-select" aria-label="排序">
+            <ElSelect v-model="activeSort" class="sort-select" aria-label="排序">
               <ElOption label="拍摄日期：从新到旧" value="dateDesc" /><ElOption label="拍摄日期：从旧到新" value="dateAsc" />
-              <ElOption v-if="!peopleMode" label="名称：升序" value="nameAsc" /><ElOption v-if="!peopleMode" label="名称：降序" value="nameDesc" />
-              <ElOption v-if="!peopleMode" label="文件大小：从大到小" value="sizeDesc" /><ElOption v-if="!peopleMode" label="文件大小：从小到大" value="sizeAsc" />
+              <template v-if="!peopleMode && !libraryTimeline">
+                <ElOption label="名称：升序" value="nameAsc" /><ElOption label="名称：降序" value="nameDesc" />
+                <ElOption label="文件大小：从大到小" value="sizeDesc" /><ElOption label="文件大小：从小到大" value="sizeAsc" />
+              </template>
             </ElSelect>
           </div>
           <span v-else class="relevance-note">按内容相关度排序 · 最多 200 张</span>
@@ -931,7 +971,7 @@ async function performFileAction(action: FileAction) {
           <template v-else>{{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}</template>
         </template>
       </p>
-      <div v-if="itemsLoading && !results?.items.length" class="library-empty" role="status">
+      <div v-if="itemsLoading && (!timelineResultsReady || !results?.items.length)" class="library-empty" role="status">
         <ElIcon class="empty-icon is-loading" aria-hidden="true"><Loading /></ElIcon>
         <h2>正在加载媒体…</h2>
         <p>精彩回忆，即将呈现。</p>
@@ -951,9 +991,11 @@ async function performFileAction(action: FileAction) {
         <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
-      <ul v-if="results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
+      <ul v-if="timelineResultsReady && results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
         <template v-for="(item, index) in results.items" :key="`${summary.scanId}:${item.id}`">
-        <li v-if="peopleMode && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">{{ monthTitle(item.capturedOn) }}</li>
+        <li v-if="(peopleMode || libraryTimeline) && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">
+          <h2>{{ monthTitle(item.capturedOn) }}</h2>
+        </li>
         <li class="card" :class="{ 'card-selected': selecting && selectedFiles.has(item.id) }">
           <label v-if="selecting && !peopleMode" class="media-select"><input type="checkbox" :checked="selectedFiles.has(item.id)" :disabled="busy || itemsLoading || searchPending" :aria-label="`选择 ${item.name}`" @change="toggleSelection(item.id)" />选择</label>
           <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
@@ -1104,6 +1146,9 @@ async function performFileAction(action: FileAction) {
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 16px; }
 .filter-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .filter-field > span { color: var(--muted); white-space: nowrap; font-size: 13px; }
+.library-view-options { display: inline-flex; gap: 4px; }
+.library-view-options button { min-height: 32px; padding: 4px 10px; white-space: nowrap; font-size: 13px; }
+.library-view-options button[aria-pressed="true"]:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .kind-select, .date-select, .location-select { width: 120px; }
 .sort-select { width: 200px; }
 .sort-field { margin-left: auto; }
@@ -1148,7 +1193,7 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
 .timeline-months { display: flex; flex-wrap: wrap; gap: 8px; max-height: 160px; overflow-y: auto; margin: 20px 0; }
 .timeline-months button { font-size: 13px; }
 .timeline-months [aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.timeline-heading { grid-column: 1 / -1; margin-top: 20px; font-size: 20px; font-weight: 600; color: var(--text); }
+.timeline-heading { grid-column: 1 / -1; margin-top: 20px; }
 .timeline-intro { color: var(--muted); }
 .people-tools .filters { margin-top: 0; }
 .media-library > details { margin-top: 24px; }

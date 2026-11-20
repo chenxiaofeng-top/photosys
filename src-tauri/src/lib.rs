@@ -155,6 +155,7 @@ pub fn run() {
             similar::similar_groups,
             similar::similar_members,
             similar::similar_issues,
+            similar::similar_media_details,
             similar::similar_preview
         ])
         .run(tauri::generate_context!())

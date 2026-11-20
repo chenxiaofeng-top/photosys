@@ -4,8 +4,9 @@ import { formatBytes } from "./formatBytes";
 import type { Item, MediaDetails, MediaDimensions, VideoDetails } from "./libraryTypes";
 
 const props = defineProps<{
-  item: Item;
+  item: Pick<Item, "name" | "size" | "capturedOn">;
   details?: MediaDetails;
+  photoDimensions?: MediaDimensions;
   loading: boolean;
   error: string;
 }>();
@@ -65,7 +66,7 @@ function videoRows(video: VideoDetails, embedded = false): Row[] {
 }
 
 const groups = computed(() => {
-  const { item, details } = props;
+  const { item, details, photoDimensions } = props;
   const photo = details?.photo;
   const video = details?.video;
   const extension = item.name.slice(item.name.lastIndexOf(".") + 1).toLowerCase();
@@ -73,9 +74,13 @@ const groups = computed(() => {
   const base: Group = {
     title: "基本信息",
     rows: [
-      { label: time ? (video ? "媒体创建时间" : "拍摄时间") : "媒体日期", value: time ? embeddedTime(time) : item.capturedOn ?? "日期未知" },
+      {
+        label: time || photoDimensions ? (video ? "媒体创建时间" : "拍摄时间") : "媒体日期",
+        value: time ? embeddedTime(time) : item.capturedOn ?? "日期未知",
+      },
       { label: "文件格式", value: formatNames[extension] ?? extension.toUpperCase() },
       { label: "文件大小", value: formatBytes(item.size) },
+      { label: "尺寸", value: !photo?.dimensions && photoDimensions ? dimensions(photoDimensions) : null },
       { label: "修改时间", value: details?.modifiedAt ? localTime.format(new Date(details.modifiedAt)) : null },
     ],
   };
