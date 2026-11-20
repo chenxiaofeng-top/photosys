@@ -19,6 +19,8 @@ use super::{
     catalog::ModelSpec,
     device::{SessionDevice, SessionStatus},
     error,
+    image_input::{self, Filter},
+    indexing::{GPU_QUERIES, Inference},
 };
 
 pub(crate) struct Runtime {
@@ -50,10 +52,27 @@ pub(crate) fn tokenizer(vocab: &Path) -> Result<Tokenizer, String> {
 }
 
 fn session(path: &Path, device: &SessionDevice, directml: bool) -> Result<Session, String> {
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .saturating_div(2)
-        .clamp(1, 4);
+    let logical = std::thread::available_parallelism().map_or(1, usize::from);
+    let threads = (logical / 2).clamp(1, 4);
+    #[cfg(test)]
+    let threads = if !directml
+        && logical >= 12
+        && matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(
+                "cn_clip_vision.onnx"
+                    | "face_detection_yunet_2023mar.onnx"
+                    | "face_recognition_sface_2021dec.onnx"
+            )
+        ) {
+        std::env::var("PHOTOSYS_AI_BENCHMARK_CPU_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| matches!(value, 2 | 4 | 6 | 8))
+            .unwrap_or(threads)
+    } else {
+        threads
+    };
     let builder = Session::builder()
         .map_err(error)?
         .with_intra_threads(threads)
@@ -139,6 +158,13 @@ pub(super) struct InferenceSession {
     inputs: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Work<'a> {
+    Normal,
+    Search,
+    Index(Inference<'a>),
+}
+
 impl InferenceSession {
     pub(super) fn open(path: PathBuf, device: &SessionDevice) -> Result<Self, String> {
         let mut status = device.status.clone();
@@ -178,6 +204,7 @@ impl InferenceSession {
         &self,
         inputs: Vec<(String, DynValue)>,
         output: Option<&str>,
+        work: Work<'_>,
         read: impl Fn(SessionOutputs<'_>) -> Result<T, String>,
     ) -> Result<T, String> {
         let options = output
@@ -188,34 +215,45 @@ impl InferenceSession {
             .transpose()
             .map_err(error)?;
         // Borrow the input tensors so the CPU can retry the same tensors after a GPU failure.
-        let execute = |session: &mut Session| {
+        let execute = |session: &mut Session, directml| {
             let inputs: Vec<_> = inputs
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
                 .collect();
-            match &options {
+            let run = || match &options {
                 Some(options) => session.run_with_options(inputs, options),
                 None => session.run(inputs),
-            }
-            .map_err(error)
-            .and_then(&read)
+            };
+            let output = match work {
+                Work::Search if directml => {
+                    // Once the text session is locked, index work can safely yield
+                    // here even for models sharing a session between text and photos.
+                    let _query = GPU_QUERIES.start()?;
+                    Some(run())
+                }
+                Work::Index(inference) => inference.execute(directml, run)?,
+                _ => Some(run()),
+            };
+            Ok::<_, String>(output.map(|result| result.map_err(error).and_then(&read)))
         };
 
         let mut active = self.active.lock().map_err(error)?;
         if active.session.is_none() {
             active.session = Some(session(&self.path, &self.device, false)?);
         }
-        match execute(active.session.as_mut().unwrap()) {
-            Err(e) if active.status.directml => {
+        let directml = active.status.directml;
+        let cancelled = || "AI 分析已停止。".to_string();
+        match execute(active.session.as_mut().unwrap(), directml)?.ok_or_else(cancelled)? {
+            Err(e) if directml => {
                 active.status.directml = false;
                 active.status.fallback = Some(format!("DirectML 推理失败。{e}"));
                 // Drop the GPU session before loading CPU weights.
                 active.session = None;
                 self.device.notify_fallback();
                 let mut cpu = session(&self.path, &self.device, false)?;
-                let result = execute(&mut cpu);
+                let result = execute(&mut cpu, false);
                 active.session = Some(cpu);
-                result
+                result?.ok_or_else(cancelled)?
             }
             result => result,
         }
@@ -256,21 +294,17 @@ pub(crate) fn normalize_dim(mut vector: Vec<f32>, dimension: usize) -> Result<Ve
 /// Matches the pinned ChineseCLIPImageProcessor: RGB, square resize, no center crop.
 #[cfg(test)]
 pub(crate) fn pixels(image: RgbImage, rotation: u16) -> Vec<f32> {
-    pixels_at(image, rotation, 224)
+    pixels_at(&image, rotation, 224, true)
 }
 
-fn pixels_at(image: RgbImage, rotation: u16, edge: usize) -> Vec<f32> {
-    let image = match rotation {
-        90 => image::imageops::rotate90(&image),
-        180 => image::imageops::rotate180(&image),
-        270 => image::imageops::rotate270(&image),
-        _ => image,
-    };
-    let image = image::imageops::resize(
-        &image,
+fn pixels_at(image: &RgbImage, rotation: u16, edge: usize, optimized: bool) -> Vec<f32> {
+    let image = image_input::resize_for_model(
+        image,
+        rotation,
         edge as u32,
         edge as u32,
-        image::imageops::FilterType::CatmullRom,
+        Filter::CatmullRom,
+        optimized,
     );
     let mean = [0.48145466, 0.4578275, 0.40821073];
     let std = [0.26862954, 0.261_302_6, 0.275_777_1];
@@ -338,6 +372,9 @@ impl Runtime {
         }
         Ok(sessions)
     }
+    pub(crate) fn uses_directml_for_index(&self) -> Result<bool, String> {
+        Ok(self.vision.status()?.directml)
+    }
     #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
     pub(crate) fn end_profiles(&self) -> Vec<String> {
         let mut paths = vec![self.vision.end_profile()];
@@ -384,7 +421,7 @@ impl Runtime {
             }
         }
         let output = self.text.is_none().then_some("text_embeds");
-        session.run(inputs, output, |outputs| {
+        session.run(inputs, output, Work::Search, |outputs| {
             normalize_dim(
                 outputs[0]
                     .try_extract_tensor::<f32>()
@@ -395,13 +432,26 @@ impl Runtime {
             )
         })
     }
-    pub(crate) fn prepare_image(&self, image: RgbImage, rotation: u16) -> Vec<f32> {
-        pixels_at(image, rotation, self.spec.image_size)
+    pub(crate) fn prepare_image(
+        &self,
+        image: &RgbImage,
+        rotation: u16,
+        optimized: bool,
+    ) -> Vec<f32> {
+        pixels_at(image, rotation, self.spec.image_size, optimized)
     }
     pub(crate) fn encode_image(&self, image: RgbImage, rotation: u16) -> Result<Vec<f32>, String> {
-        self.encode_pixels(self.prepare_image(image, rotation))
+        self.encode_pixels(self.prepare_image(&image, rotation, true))
     }
     pub(crate) fn encode_pixels(&self, pixels: Vec<f32>) -> Result<Vec<f32>, String> {
+        self.encode_indexed_pixels(pixels, None)
+    }
+
+    pub(crate) fn encode_indexed_pixels(
+        &self,
+        pixels: Vec<f32>,
+        inference: Option<Inference<'_>>,
+    ) -> Result<Vec<f32>, String> {
         let session = &self.vision;
         let e = self.spec.image_size;
         let mut inputs = vec![(
@@ -431,16 +481,21 @@ impl Runtime {
             inputs[0].0 = session.inputs()[0].clone();
         }
         let output = self.text.is_none().then_some("image_embeds");
-        session.run(inputs, output, |outputs| {
-            normalize_dim(
-                outputs[0]
-                    .try_extract_tensor::<f32>()
-                    .map_err(error)?
-                    .1
-                    .to_vec(),
-                self.spec.dimension,
-            )
-        })
+        session.run(
+            inputs,
+            output,
+            inference.map_or(Work::Normal, Work::Index),
+            |outputs| {
+                normalize_dim(
+                    outputs[0]
+                        .try_extract_tensor::<f32>()
+                        .map_err(error)?
+                        .1
+                        .to_vec(),
+                    self.spec.dimension,
+                )
+            },
+        )
     }
 }
 
@@ -508,7 +563,9 @@ mod tests {
                     .contains("初始化失败")
             );
             assert_eq!(
-                session.run(smoke_input(), None, smoke_output).unwrap(),
+                session
+                    .run(smoke_input(), None, Work::Normal, smoke_output)
+                    .unwrap(),
                 [0., 0., 3.]
             );
 
@@ -527,7 +584,9 @@ mod tests {
                 active.status.directml = true;
             }
             assert_eq!(
-                session.run(smoke_input(), None, smoke_output).unwrap(),
+                session
+                    .run(smoke_input(), None, Work::Normal, smoke_output)
+                    .unwrap(),
                 [0., 0., 3.]
             );
             assert!(!session.status().unwrap().directml);
@@ -540,7 +599,9 @@ mod tests {
                     .contains("推理失败")
             );
             assert_eq!(
-                session.run(smoke_input(), None, smoke_output).unwrap(),
+                session
+                    .run(smoke_input(), None, Work::Normal, smoke_output)
+                    .unwrap(),
                 [0., 0., 3.]
             );
         }
@@ -561,7 +622,9 @@ mod tests {
             device.profile_dir = Some(directory.path().to_path_buf());
             let session = InferenceSession::open(model, &device).unwrap();
             assert_eq!(
-                session.run(smoke_input(), None, smoke_output).unwrap(),
+                session
+                    .run(smoke_input(), None, Work::Normal, smoke_output)
+                    .unwrap(),
                 [0., 0., 3.]
             );
             super::super::super::device_tests::assert_directml_profile(&session.end_profile());

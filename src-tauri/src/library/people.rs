@@ -190,6 +190,7 @@ pub(super) fn update_with_run(
         drop(active);
         return status(scan_id);
     };
+    let decodes = scan.ai_decodes.join(mode)?;
     state.queued = false;
     let _ = progress.send(state.clone());
     let generation = MODEL_GENERATION.load(Ordering::Relaxed);
@@ -202,7 +203,7 @@ pub(super) fn update_with_run(
         drop(active);
         return status(scan_id);
     }
-    let Some(runtime) = mode.infer(cancel, load)? else {
+    let Some(runtime) = mode.load_model(cancel, || run.measure(Stage::ModelLoad, load))? else {
         drop(active);
         return status(scan_id);
     };
@@ -214,6 +215,7 @@ pub(super) fn update_with_run(
     if runtime.spec.id != state.model_id {
         return Err("人物模型已变化，请重试。".into());
     }
+    let optimized = mode.optimized(|| runtime.uses_directml_for_index())?;
     let mut store = Store::open(&scan, true)?.ok_or("无法创建人物索引。")?;
     store
         .connection
@@ -267,13 +269,24 @@ pub(super) fn update_with_run(
     if !jobs.is_empty() && !interrupted() {
         let mut last = Instant::now();
         mode.with_prepared(
+            optimized,
             jobs.into_iter(),
             |(item, path, rotation)| {
                 if interrupted() {
                     return None;
                 }
-                let image = super::ai_search::decode_with_slot(&scan, item, cancel, run)?;
-                Some((item, path, rotation, image))
+                let prepared = super::ai_search::decode_with_slot(
+                    &scan, item, &decodes, cancel, run,
+                )?
+                .map(|image| {
+                    let input = optimized.then(|| {
+                        run.measure(Stage::Prepare, || {
+                            FaceRuntime::prepare_detection(image.image(), rotation, true)
+                        })
+                    });
+                    (image, input)
+                });
+                Some((item, path, rotation, prepared))
             },
             |prepared| {
                 for (item, path, rotation, image) in prepared {
@@ -281,19 +294,26 @@ pub(super) fn update_with_run(
                         break;
                     }
                     let result = match image {
-                        Ok((image, _permit)) => {
-                            let Some(result) = mode.infer(cancel, || {
-                                run.measure(Stage::Inference, || {
-                                    runtime.analyze(image, rotation, cancel)
+                        Ok((image, input)) => {
+                            let input = input.unwrap_or_else(|| {
+                                run.measure(Stage::Prepare, || {
+                                    FaceRuntime::prepare_detection(image.image(), rotation, false)
                                 })
-                            })?
-                            else {
-                                break;
-                            };
-                            result
+                            });
+                            runtime.analyze_prepared(
+                                image.image(),
+                                rotation,
+                                input,
+                                cancel,
+                                Some(run.inference(mode, cancel)),
+                            )
                         }
                         Err(error) => Err(error),
                     };
+                    if result.is_ok() && !super::ai_search::index_file_current(&scan, item.file.id)
+                    {
+                        continue;
+                    }
                     let _edit = lock_edits()?;
                     if interrupted() {
                         break;

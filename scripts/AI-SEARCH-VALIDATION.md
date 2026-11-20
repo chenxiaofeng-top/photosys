@@ -126,7 +126,44 @@ Intel macOS 使用上游 1.22.0 CPU 库，其他平台使用 1.24.2；Rust 绑�
 $env:PHOTOSYS_MODEL_OPTIONS_DIR = 'D:\path\to\model-options'
 $env:PHOTOSYS_MODEL_OPTIONS_PORTRAIT = 'D:\path\to\portrait.jpg'
 $env:PHOTOSYS_AI_BENCHMARK_BACKEND = 'cpu'
-$env:PHOTOSYS_AI_BENCHMARK_MODE = 'concurrent'
+$env:PHOTOSYS_AI_BENCHMARK_MODE = 'pipeline'
+$env:PHOTOSYS_AI_BENCHMARK_WORKLOAD = 'both'
+$env:PHOTOSYS_AI_BENCHMARK_PHOTOS = '1000'
+$env:PHOTOSYS_AI_BENCHMARK_TRIALS = '3'
 cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib benchmark_index_pipeline -- --ignored --nocapture --test-threads=1
 cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib maintenance_stops_both_indexes_and_preserves_completed_work -- --ignored --nocapture --test-threads=1
 ```
+
+`PHOTOSYS_AI_BENCHMARK_WORKLOAD` 可设为 `both`、`search` 或 `people`。`PHOTOSYS_AI_BENCHMARK_PHOTOS` 默认为 40，使用 1,000 张时保持单人、多人、图案和 48 MP HEIC 的比例。每轮从空白索引开始，随后复扫并验证所有结果均被复用。输出包括模型加载与预热时间、实际解码次数、共享次数、解码与 GPU 等待时间、向量及人脸结果指纹。更改线程数时使用独立测试进程，可用 `PHOTOSYS_AI_BENCHMARK_CPU_THREADS` 在至少 12 个逻辑线程的 CPU 测试机上试跑 2、4、6 或 8 个推理线程。
+
+### 等价缩放、共享解码与推理调度
+
+在同一台 Windows x64 测试机上，使用发布构建、默认模型和同一组 40 张照片各测三轮。CPU 对照在单任务流水线中试验快速预处理，DirectML 允许两项索引同时运行。耗时为三轮中位数，P95 合并三轮采样。可设置 `PHOTOSYS_AI_BENCHMARK_OPTIMIZED_CPU=1` 复现 CPU 试验路径。
+
+| 后端与任务 | 建库耗时（秒） | 缩略图 P95（毫秒） | 搜索 P95（毫秒） | 进程峰值工作集（MiB） |
+| --- | ---: | ---: | ---: | ---: |
+| CPU 内容 | 15.44 → 11.08 | 20.70 → 23.29 | 107.53 → 97.38 | 1,042 → 1,022 |
+| CPU 人物 | 6.24 → 5.06 | 27.39 → 26.61 | 139.84 → 136.84 | 1,192 → 1,021 |
+| CPU 两项 | 22.44 → 16.55 | 18.58 → 22.80 | 134.19 → 118.10 | 1,220 → 1,032 |
+| DirectML 内容 | 5.56 → 3.18 | 20.87 → 21.99 | 35.33 → 29.83 | 1,439 → 1,440 |
+| DirectML 人物 | 3.75 → 2.82 | 26.36 → 23.00 | 31.72 → 31.54 | 1,439 → 1,439 |
+| DirectML 两项（最终配对复测） | 6.68 → 4.11 | 23.20 → 24.45 | 31.24 → 32.28 | 1,466 → 1,440 |
+
+每个后端和任务的前后索引指纹逐项一致。部分 40 张 CPU 场景的缩略图 P95 增幅超过 10%。该规模会反复浏览同一组已缓存的缩略图，建库时间会影响采样中缓存命中的比例。
+
+在加入 Windows 后台线程优先级调整之前，2、4、6、8 个 CPU 推理线程的双项建库中位数分别为 23.72、17.86、17.41、18.23 秒。6 线程的搜索 P95 为 154.88 毫秒，超过基线 134.19 毫秒的 110%。8 线程的搜索 P95 为 212.87 毫秒。默认继续使用最多 4 个线程。
+
+CPU 双索引扩大到 150 张照片再测三轮，缩略图循环超出缓存容量。试验路径的建库中位耗时从 63.91 秒降至 62.08 秒，缩略图 P95 从 26.60 升至 28.03 毫秒，搜索 P95 从 95.29 升至 133.45 毫秒。CPU 默认保留原流水线，快速路径随既有 CPU 并发开关试用。最终默认 CPU 配置在 40 张复测中的建库中位耗时为 21.62 秒，缩略图和搜索 P95 为 20.37 和 128.52 毫秒。
+
+同机另测 1,000 张照片的 DirectML 双索引，其中 100 张为 48 MP HEIC。前后各运行三轮。
+
+| 指标 | 基线 | 优化后 |
+| --- | ---: | ---: |
+| 建库中位耗时 | 166.24 秒 | 96.12 秒 |
+| 缩略图 P95 | 24.89 毫秒 | 22.47 毫秒 |
+| 搜索 P95 | 35.08 毫秒 | 36.46 毫秒 |
+| 进程峰值工作集 | 1,478 MiB | 1,440 MiB |
+| 采样显存峰值减去测试开始时的显存 | 1,011 MiB | 1,091 MiB |
+| 实际解码次数（每轮） | 2,000 | 1,898 |
+
+纯索引提速阶段的搜索 P95 曾达到 46.61 毫秒。加入前台搜索优先调度后，GPU 索引会让已开始的文字推理先完成，每次等待有 60 毫秒上限。最终三轮均分析 1,000 张照片并得到同一指纹，含 1,200 个人脸及其归组。无变化复扫复用全部结果，耗时 110–126 毫秒。人物写入和归组的累计耗时最多占当轮墙钟时间的 13.6%，SQLite 继续逐张提交。

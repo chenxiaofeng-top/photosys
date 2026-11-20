@@ -1069,6 +1069,7 @@ fn benchmark_people_catalogs() {
             items,
             issues: Vec::new(),
             previews: Mutex::default(),
+            ai_decodes: Default::default(),
         };
         *session().unwrap() = Some(library::Session::from_scan(
             catalog,

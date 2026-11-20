@@ -26,10 +26,10 @@ fn index_entry(cache: &mut Cache, item: &Item, rotation: u16, value: Result<Vec<
 }
 
 #[test]
-fn pending_index_batch_discards_results_after_rotation() {
+fn pending_index_batch_discards_rotated_or_replaced_photos() {
     let _session = TEST_SESSION.lock().unwrap();
     let album = tempfile::tempdir().unwrap();
-    for name in ["keep.png", "rotate.png"] {
+    for name in ["keep.png", "rotate.png", "replace.png"] {
         image::RgbImage::new(2, 2)
             .save(album.path().join(name))
             .unwrap();
@@ -61,12 +61,15 @@ fn pending_index_batch_discards_results_after_rotation() {
         .unwrap();
     tauri::async_runtime::block_on(super::super::set_library_rotation(id, rotated.file.id, 90))
         .unwrap();
+    image::RgbImage::new(5, 5)
+        .save(album.path().join("replace.png"))
+        .unwrap();
     let mut state = IndexStatus {
-        indexed: 2,
+        indexed: 3,
         ..Default::default()
     };
     save_current_batch(
-        id,
+        &scan,
         MODEL_GENERATION.load(Ordering::Relaxed),
         &mut cache,
         &mut batch,
@@ -274,6 +277,7 @@ fn synthetic_album(path: &Path, count: usize) -> (Arc<Scan>, Vec<f32>) {
         items,
         issues: Vec::new(),
         previews: Mutex::default(),
+        ai_decodes: Default::default(),
     };
     let favorites = scan
         .items

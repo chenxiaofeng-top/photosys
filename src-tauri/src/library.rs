@@ -256,6 +256,7 @@ pub(crate) struct Scan {
     items: Vec<Item>,
     issues: Vec<Issue>,
     previews: Mutex<previews::Cache>,
+    ai_decodes: crate::ai::indexing::DecodePool,
 }
 
 impl Scan {
@@ -351,6 +352,7 @@ impl Scan {
             items,
             issues,
             previews: Mutex::default(),
+            ai_decodes: Default::default(),
         }
     }
 }

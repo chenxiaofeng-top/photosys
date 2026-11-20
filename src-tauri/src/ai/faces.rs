@@ -2,13 +2,11 @@
 use super::{
     device::{SessionDevice, SessionStatus},
     error,
-    inference::InferenceSession,
+    image_input::{self, Filter, RgbView},
+    indexing::Inference,
+    inference::{InferenceSession, Work},
 };
-use image::{
-    RgbImage,
-    codecs::jpeg::JpegEncoder,
-    imageops::{self, FilterType},
-};
+use image::{RgbImage, codecs::jpeg::JpegEncoder};
 use ort::{session::SessionOutputs, value::Tensor};
 use std::{
     path::Path,
@@ -44,6 +42,12 @@ pub(crate) struct FaceRuntime {
     recognizer: InferenceSession,
     pub(crate) spec: &'static super::catalog::ModelSpec,
 }
+pub(crate) struct DetectorInput {
+    pixels: Vec<f32>,
+    width: u32,
+    height: u32,
+    scale: f32,
+}
 #[cfg(test)]
 pub(crate) fn normalize(v: Vec<f32>) -> Result<Vec<f32>, String> {
     normalize_dim(v, DIM)
@@ -63,14 +67,6 @@ pub(crate) fn normalize_dim(mut v: Vec<f32>, dimension: usize) -> Result<Vec<f32
 }
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
-}
-pub(crate) fn rotate(image: RgbImage, rotation: u16) -> RgbImage {
-    match rotation {
-        90 => imageops::rotate90(&image),
-        180 => imageops::rotate180(&image),
-        270 => imageops::rotate270(&image),
-        _ => image,
-    }
 }
 fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let w = ((a[0] + a[2]).min(b[0] + b[2]) - a[0].max(b[0])).max(0.0);
@@ -106,12 +102,13 @@ pub(crate) fn transform(points: &[[f32; 2]; 5]) -> Result<[f64; 4], String> {
     b /= d;
     Ok([a, b, tx - a * sx + b * sy, ty - b * sx - a * sy])
 }
-pub(crate) fn align(image: &RgbImage, points: &[[f32; 2]; 5]) -> Result<RgbImage, String> {
+fn align(image: RgbView<'_>, points: &[[f32; 2]; 5]) -> Result<RgbImage, String> {
     let [a, b, tx, ty] = transform(points)?;
     let d = a * a + b * b;
     if d < 1e-12 {
         return Err("无法对齐人脸。".into());
     }
+    let (width, height) = image.dimensions();
     Ok(RgbImage::from_fn(112, 112, |x, y| {
         let u = x as f64 - tx;
         let v = y as f64 - ty;
@@ -132,8 +129,8 @@ pub(crate) fn align(image: &RgbImage, points: &[[f32; 2]; 5]) -> Result<RgbImage
             ] {
                 let px = x0 + ox;
                 let py = y0 + oy;
-                if px >= 0 && py >= 0 && px < image.width() as i64 && py < image.height() as i64 {
-                    sum += image.get_pixel(px as u32, py as u32)[c] as f64 * w;
+                if px >= 0 && py >= 0 && px < i64::from(width) && py < i64::from(height) {
+                    sum += image.pixel(px as u32, py as u32)[c] as f64 * w;
                 }
             }
             rgb[c] = sum.round().clamp(0., 255.) as u8;
@@ -182,32 +179,55 @@ impl FaceRuntime {
     pub(super) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
         Ok(vec![self.detector.status()?, self.recognizer.status()?])
     }
+    pub(crate) fn uses_directml_for_index(&self) -> Result<bool, String> {
+        Ok(self.detector.status()?.directml && self.recognizer.status()?.directml)
+    }
     #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
     pub(crate) fn end_profiles(&self) -> Vec<String> {
         vec![self.detector.end_profile(), self.recognizer.end_profile()]
     }
     pub(crate) fn detect(&self, image: &RgbImage) -> Result<Vec<Detection>, String> {
-        let scale = (EDGE as f32 / image.width() as f32).min(EDGE as f32 / image.height() as f32);
-        let w = (image.width() as f32 * scale)
-            .round()
-            .clamp(1., EDGE as f32) as u32;
-        let h = (image.height() as f32 * scale)
-            .round()
-            .clamp(1., EDGE as f32) as u32;
-        let resized = imageops::resize(image, w, h, FilterType::Triangle);
+        self.detect_prepared(Self::prepare_detection(image, 0, true), None)
+    }
+    pub(crate) fn prepare_detection(
+        image: &RgbImage,
+        rotation: u16,
+        optimized: bool,
+    ) -> DetectorInput {
+        let view = RgbView::new(image, rotation);
+        let (width, height) = view.dimensions();
+        let scale = (EDGE as f32 / width as f32).min(EDGE as f32 / height as f32);
+        let w = (width as f32 * scale).round().clamp(1., EDGE as f32) as u32;
+        let h = (height as f32 * scale).round().clamp(1., EDGE as f32) as u32;
+        let resized =
+            image_input::resize_for_model(image, rotation, w, h, Filter::Triangle, optimized);
         let mut pixels = vec![0.; 3 * EDGE * EDGE];
         for (x, y, p) in resized.enumerate_pixels() {
             for c in 0..3 {
                 pixels[c * EDGE * EDGE + y as usize * EDGE + x as usize] = p[2 - c] as f32;
             }
         }
-        let input = Tensor::from_array(([1, 3, EDGE, EDGE], pixels))
+        DetectorInput {
+            pixels,
+            width: w,
+            height: h,
+            scale,
+        }
+    }
+    fn detect_prepared(
+        &self,
+        prepared: DetectorInput,
+        inference: Option<Inference<'_>>,
+    ) -> Result<Vec<Detection>, String> {
+        let input = Tensor::from_array(([1, 3, EDGE, EDGE], prepared.pixels))
             .map_err(error)?
             .into_dyn();
-        self.detector
-            .run(vec![("input".into(), input)], None, |out| {
-                Self::decode_detections(out, w, h, scale)
-            })
+        self.detector.run(
+            vec![("input".into(), input)],
+            None,
+            inference.map_or(Work::Normal, Work::Index),
+            |out| Self::decode_detections(out, prepared.width, prepared.height, prepared.scale),
+        )
     }
     fn decode_detections(
         out: SessionOutputs<'_>,
@@ -294,6 +314,13 @@ impl FaceRuntime {
         Ok(kept)
     }
     pub(crate) fn encode(&self, image: &RgbImage) -> Result<Vec<f32>, String> {
+        self.encode_indexed(image, None)
+    }
+    fn encode_indexed(
+        &self,
+        image: &RgbImage,
+        inference: Option<Inference<'_>>,
+    ) -> Result<Vec<f32>, String> {
         if image.dimensions() != (112, 112) {
             return Err("人脸输入大小错误。".into());
         }
@@ -311,36 +338,54 @@ impl FaceRuntime {
             .map_err(error)?
             .into_dyn();
         let name = self.recognizer.inputs()[0].clone();
-        self.recognizer.run(vec![(name, input)], None, |out| {
-            normalize_dim(
-                out[0]
-                    .try_extract_tensor::<f32>()
-                    .map_err(error)?
-                    .1
-                    .to_vec(),
-                self.spec.dimension,
-            )
-        })
+        self.recognizer.run(
+            vec![(name, input)],
+            None,
+            inference.map_or(Work::Normal, Work::Index),
+            |out| {
+                normalize_dim(
+                    out[0]
+                        .try_extract_tensor::<f32>()
+                        .map_err(error)?
+                        .1
+                        .to_vec(),
+                    self.spec.dimension,
+                )
+            },
+        )
     }
+    #[cfg(test)]
     pub(crate) fn analyze(
         &self,
         image: RgbImage,
         rotation: u16,
         cancel: &AtomicBool,
     ) -> Result<Vec<Face>, String> {
-        let image = rotate(image, rotation);
-        let detections = self.detect(&image)?;
+        let prepared = Self::prepare_detection(&image, rotation, true);
+        self.analyze_prepared(&image, rotation, prepared, cancel, None)
+    }
+    pub(crate) fn analyze_prepared(
+        &self,
+        image: &RgbImage,
+        rotation: u16,
+        prepared: DetectorInput,
+        cancel: &AtomicBool,
+        inference: Option<Inference<'_>>,
+    ) -> Result<Vec<Face>, String> {
+        let image = RgbView::new(image, rotation);
+        let (width, height) = image.dimensions();
+        let detections = self.detect_prepared(prepared, inference)?;
         let mut faces = Vec::new();
         for d in detections {
             if cancel.load(Ordering::Relaxed) {
                 return Err("已停止人物分析。".into());
             }
-            let aligned = align(&image, &d.points)?;
+            let aligned = align(image, &d.points)?;
             let eyes = ((d.points[1][0] - d.points[0][0]).powi(2)
                 + (d.points[1][1] - d.points[0][1]).powi(2))
             .sqrt();
             let vector = if d.bbox[2].min(d.bbox[3]) >= 32. && eyes >= 10. {
-                Some(self.encode(&aligned)?)
+                Some(self.encode_indexed(&aligned, inference)?)
             } else {
                 None
             };
@@ -348,8 +393,8 @@ impl FaceRuntime {
             JpegEncoder::new_with_quality(&mut thumbnail, 80)
                 .encode_image(&aligned)
                 .map_err(error)?;
-            let iw = image.width() as f32;
-            let ih = image.height() as f32;
+            let iw = width as f32;
+            let ih = height as f32;
             faces.push(Face {
                 bbox: [
                     d.bbox[0] / iw,
@@ -375,7 +420,7 @@ mod tests {
         assert!(t[1].abs() < 1e-6);
         assert!(transform(&[[0., 0.]; 5]).is_err());
         let im = RgbImage::from_fn(112, 112, |x, y| image::Rgb([x as u8, y as u8, 30]));
-        let out = align(&im, &TEMPLATE).unwrap();
+        let out = align(RgbView::new(&im, 0), &TEMPLATE).unwrap();
         assert_eq!(im, out);
     }
     #[test]
@@ -456,7 +501,7 @@ mod reference_tests {
                     bbox
                 );
                 let points: [[f32; 2]; 5] = serde_json::from_value(e["points"].clone()).unwrap();
-                let aligned = align(&im, &points).unwrap();
+                let aligned = align(RgbView::new(&im, 0), &points).unwrap();
                 let expected_image = image::open(path.join(e["aligned"].as_str().unwrap()))
                     .unwrap()
                     .to_rgb8();
@@ -474,7 +519,7 @@ mod reference_tests {
                 println!("alignment MAE={mae:.4}; embedding cosine={score:.8}");
                 assert!(score > 0.995);
                 let pipeline = runtime
-                    .encode(&align(&im, &detected.points).unwrap())
+                    .encode(&align(RgbView::new(&im, 0), &detected.points).unwrap())
                     .unwrap();
                 let pipeline_score = cosine(&pipeline, &theirs);
                 println!("full pipeline cosine={pipeline_score:.8}");

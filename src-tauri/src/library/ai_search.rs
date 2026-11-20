@@ -18,7 +18,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::ai::DIM;
-use crate::ai::indexing::{Active, Mode, Permit, Run, Stage};
+use crate::ai::indexing::{Active, DecodeAccess, Decoded, Mode, Run, Stage};
 use crate::ai::{self, FEATURE_VERSION, MODEL_GENERATION, error};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -333,21 +333,26 @@ pub(super) fn decode(
 pub(super) fn decode_with_slot(
     scan: &Scan,
     item: &Item,
+    decodes: &DecodeAccess<'_>,
     cancel: &AtomicBool,
     run: &Run,
-) -> Option<Result<(image::RgbImage, Permit<'static>), String>> {
-    match ai::indexing::image_slot(cancel) {
-        Ok(Some(permit)) => Some(
-            run.measure(Stage::Decode, || decode(scan, item, cancel))
-                .map(|image| (image, permit)),
-        ),
-        Ok(None) => None,
-        Err(error) => Some(Err(error)),
-    }
+) -> Option<Result<Decoded, String>> {
+    decodes.decode(
+        &item.file,
+        cancel,
+        run,
+        || {
+            scan.root
+                .open_matching(&item.file)
+                .map(drop)
+                .map_err(|_| STALE_SCAN.into())
+        },
+        || decode(scan, item, cancel),
+    )
 }
 
 fn save_current_batch(
-    scan_id: u64,
+    scan: &Scan,
     generation: u64,
     cache: &mut Cache,
     batch: &mut Vec<(usize, IndexEntry)>,
@@ -356,8 +361,15 @@ fn save_current_batch(
     if batch.is_empty() {
         return Ok(());
     }
+    batch.retain(|(file_id, entry)| {
+        if entry.3.is_ok() && !index_file_current(scan, *file_id) {
+            state.indexed -= 1;
+            return false;
+        }
+        true
+    });
     let guard = session()?;
-    let Ok(library) = current(&guard, scan_id) else {
+    let Ok(library) = current(&guard, scan.id) else {
         batch.clear();
         return Ok(());
     };
@@ -376,6 +388,11 @@ fn save_current_batch(
     let result = cache.save(&valid);
     drop(guard);
     result
+}
+
+pub(super) fn index_file_current(scan: &Scan, file_id: usize) -> bool {
+    scan.item(file_id)
+        .is_ok_and(|item| scan.root.open_matching(&item.file).is_ok())
 }
 
 #[cfg(test)]
@@ -424,6 +441,7 @@ pub(super) fn update_with_run(
         drop(active);
         return status(scan_id);
     };
+    let decodes = scan.ai_decodes.join(mode)?;
     state.queued = false;
     let _ = progress.send(state.clone());
     let interrupted = || {
@@ -435,7 +453,8 @@ pub(super) fn update_with_run(
         drop(active);
         return status(scan_id);
     }
-    let Some(runtime) = mode.infer(cancel, load_model)? else {
+    let Some(runtime) = mode.load_model(cancel, || run.measure(Stage::ModelLoad, load_model))?
+    else {
         drop(active);
         return status(scan_id);
     };
@@ -447,6 +466,7 @@ pub(super) fn update_with_run(
     if runtime.spec.id != state.model_id {
         return Err("模型已变化，请重试索引。".into());
     }
+    let optimized = mode.optimized(|| runtime.uses_directml_for_index())?;
     let mut cache = Cache::open(&scan, true)?.ok_or("无法创建 AI 索引。")?;
     cache
         .connection
@@ -484,13 +504,16 @@ pub(super) fn update_with_run(
     if !jobs.is_empty() && !interrupted() {
         let mut batch = Vec::with_capacity(8);
         mode.with_prepared(
+            optimized,
             jobs.into_iter(),
             |(item, path, rotation)| {
                 if interrupted() {
                     return None;
                 }
-                let input = decode_with_slot(&scan, item, cancel, run)?.map(|(image, _permit)| {
-                    run.measure(Stage::Prepare, || runtime.prepare_image(image, rotation))
+                let input = decode_with_slot(&scan, item, &decodes, cancel, run)?.map(|image| {
+                    run.measure(Stage::Prepare, || {
+                        runtime.prepare_image(image.image(), rotation, optimized)
+                    })
                 });
                 Some((item, path, rotation, input))
             },
@@ -501,13 +524,7 @@ pub(super) fn update_with_run(
                     }
                     let result = match input {
                         Ok(input) => {
-                            let Some(result) = mode.infer(cancel, || {
-                                run.measure(Stage::Inference, || runtime.encode_pixels(input))
-                            })?
-                            else {
-                                break;
-                            };
-                            result
+                            runtime.encode_indexed_pixels(input, Some(run.inference(mode, cancel)))
                         }
                         Err(error) => Err(error),
                     };
@@ -526,7 +543,7 @@ pub(super) fn update_with_run(
                     if batch.len() == 8 {
                         run.measure(Stage::Write, || {
                             save_current_batch(
-                                scan_id, generation, &mut cache, &mut batch, &mut state,
+                                &scan, generation, &mut cache, &mut batch, &mut state,
                             )
                         })?;
                     }
@@ -534,7 +551,7 @@ pub(super) fn update_with_run(
                     let _ = progress.send(state.clone());
                 }
                 run.measure(Stage::Write, || {
-                    save_current_batch(scan_id, generation, &mut cache, &mut batch, &mut state)
+                    save_current_batch(&scan, generation, &mut cache, &mut batch, &mut state)
                 })
             },
         )?;

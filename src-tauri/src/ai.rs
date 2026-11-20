@@ -6,6 +6,7 @@ pub(crate) mod inference;
 mod model;
 pub(crate) use catalog::initialize as initialize_choices;
 pub(crate) mod faces;
+mod image_input;
 pub(crate) mod index_policy;
 pub(crate) mod indexing;
 mod packages;

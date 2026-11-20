@@ -2,7 +2,7 @@ use super::*;
 use crate::ai::{
     ModelKind, catalog,
     faces::FaceRuntime,
-    indexing::{Mode, Run, Timings},
+    indexing::{Measurements, Mode, Run, Timings},
     inference::{Runtime, initialize_from},
 };
 use image::{RgbImage, imageops};
@@ -15,7 +15,7 @@ fn filter() -> Filter {
         .unwrap()
 }
 
-fn fixture_album(path: &Path, portrait: &Path, people: &FaceRuntime) -> usize {
+fn fixture_album(path: &Path, portrait: &Path, people: &FaceRuntime, count: usize) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let single = image::open(portrait).unwrap().to_rgb8();
     let detected = people.detect(&single).unwrap();
@@ -39,25 +39,29 @@ fn fixture_album(path: &Path, portrait: &Path, people: &FaceRuntime) -> usize {
         people.detect(&group).unwrap().len() >= 2,
         "group fixture needs multiple faces"
     );
-    for index in 0..12 {
-        fs::copy(portrait, path.join(format!("portrait-{index:02}.jpg"))).unwrap();
-        fs::copy(
-            fixtures.join("portrait-reference.jpg"),
-            path.join(format!("pattern-{index:02}.jpg")),
-        )
-        .unwrap();
-        if index != 0 {
-            fs::copy(&group_file, path.join(format!("group-{index:02}.jpg"))).unwrap();
+    let pattern = fixtures.join("portrait-reference.jpg");
+    let heic = fixtures.join("portrait-48mp-grid.heic");
+    for index in 0..count {
+        let (source, stem, extension, number) = match index % 10 {
+            0..=2 => (portrait, "portrait", "jpg", (index / 10) * 3 + index % 10),
+            3..=5 => (
+                &*pattern,
+                "pattern",
+                "jpg",
+                (index / 10) * 3 + index % 10 - 3,
+            ),
+            6..=8 => (
+                &*group_file,
+                "group",
+                "jpg",
+                (index / 10) * 3 + index % 10 - 6,
+            ),
+            _ => (&*heic, "high-resolution", "heic", index / 10),
+        };
+        if stem != "group" || number != 0 {
+            fs::copy(source, path.join(format!("{stem}-{number:02}.{extension}"))).unwrap();
         }
     }
-    for index in 0..4 {
-        fs::copy(
-            fixtures.join("portrait-48mp-grid.heic"),
-            path.join(format!("high-resolution-{index:02}.heic")),
-        )
-        .unwrap();
-    }
-    40
 }
 
 fn cpu_models(root: &Path) -> (Runtime, FaceRuntime) {
@@ -99,13 +103,21 @@ fn gpu_models(root: &Path) -> (Runtime, FaceRuntime) {
     }
 }
 
-fn index_both(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    Search,
+    People,
+    Both,
+}
+
+fn index(
     id: u64,
     mode: Mode,
     automatic: bool,
     search: &Arc<Runtime>,
     people: &Arc<FaceRuntime>,
-) -> ([usize; 3], [usize; 3], [f64; 5], [f64; 5]) {
+    workload: Workload,
+) -> ([usize; 3], [usize; 3], Measurements, Measurements) {
     let search_run = Run {
         mode,
         timings: Some(Timings::default()),
@@ -138,20 +150,33 @@ fn index_both(
         .unwrap();
         [status.indexed, status.failed, status.reused]
     };
-    let (search, people) = if matches!(mode, Mode::ConcurrentCpu | Mode::ConcurrentDirectMl) {
-        thread::scope(|scope| {
-            let worker = scope.spawn(index_people);
-            (index_search(), worker.join().unwrap())
-        })
-    } else {
-        (index_search(), index_people())
+    let (search, people) = match workload {
+        Workload::Search => (index_search(), [0; 3]),
+        Workload::People => ([0; 3], index_people()),
+        Workload::Both if matches!(mode, Mode::ConcurrentCpu | Mode::ConcurrentDirectMl) => {
+            thread::scope(|scope| {
+                let worker = scope.spawn(index_people);
+                (index_search(), worker.join().unwrap())
+            })
+        }
+        Workload::Both => (index_search(), index_people()),
     };
     (
         search,
         people,
-        search_run.timings.unwrap().millis(),
-        people_run.timings.unwrap().millis(),
+        search_run.timings.unwrap().measurements(),
+        people_run.timings.unwrap().measurements(),
     )
+}
+
+fn index_both(
+    id: u64,
+    mode: Mode,
+    automatic: bool,
+    search: &Arc<Runtime>,
+    people: &Arc<FaceRuntime>,
+) -> ([usize; 3], [usize; 3], Measurements, Measurements) {
+    index(id, mode, automatic, search, people, Workload::Both)
 }
 
 fn p95(samples: &mut [f64]) -> f64 {
@@ -196,25 +221,30 @@ fn foreground(scan: Arc<Scan>, search: &Runtime, stop: mpsc::Receiver<()>) -> (V
     (preview_times, search_times)
 }
 
-fn snapshot(album: &Path) -> (usize, String) {
+fn snapshot(album: &Path, workload: Workload) -> (usize, String) {
     let mut hash = Sha256::new();
-    let search = Connection::open(album.join(".photosys/ai.sqlite")).unwrap();
-    let mut statement = search
-        .prepare("SELECT path,vector FROM embeddings ORDER BY path")
-        .unwrap();
-    for row in statement
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .unwrap()
-    {
-        let (path, vector) = row.unwrap();
-        hash.update(path);
-        hash.update(vector);
+    if workload != Workload::People {
+        let search = Connection::open(album.join(".photosys/ai.sqlite")).unwrap();
+        let mut statement = search
+            .prepare("SELECT path,vector FROM embeddings ORDER BY path")
+            .unwrap();
+        for row in statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+        {
+            let (path, vector) = row.unwrap();
+            hash.update(path);
+            hash.update(vector);
+        }
+    }
+    if workload == Workload::Search {
+        return (0, format!("{:x}", hash.finalize()));
     }
     let people = Connection::open(album.join(".photosys/people.sqlite")).unwrap();
     let mut statement = people
-        .prepare("SELECT path,person_id,vector FROM faces WHERE active=1 ORDER BY path,id")
+        .prepare("SELECT path,person_id,vector,bbox,confidence,thumbnail FROM faces WHERE active=1 ORDER BY path,id")
         .unwrap();
     let rows = statement
         .query_map([], |row| {
@@ -222,15 +252,21 @@ fn snapshot(album: &Path) -> (usize, String) {
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
             ))
         })
         .unwrap();
     let mut faces = 0;
     for row in rows {
-        let (path, person, vector) = row.unwrap();
+        let (path, person, vector, bbox, confidence, thumbnail) = row.unwrap();
         hash.update(path);
         hash.update(person.unwrap_or_default().to_le_bytes());
         hash.update(vector.unwrap_or_default());
+        hash.update(bbox.as_bytes());
+        hash.update(confidence.to_le_bytes());
+        hash.update(thumbnail);
         faces += 1;
     }
     (faces, format!("{:x}", hash.finalize()))
@@ -254,17 +290,32 @@ fn benchmark_index_pipeline() {
         .ok()
         .map_or(3, |value| value.parse::<usize>().unwrap());
     assert!(trials > 0);
+    let count = std::env::var("PHOTOSYS_AI_BENCHMARK_PHOTOS")
+        .ok()
+        .map_or(40, |value| value.parse::<usize>().unwrap());
+    assert!(count >= 40 && count.is_multiple_of(10));
+    let workload = match std::env::var("PHOTOSYS_AI_BENCHMARK_WORKLOAD").as_deref() {
+        Ok("search") => Workload::Search,
+        Ok("people") => Workload::People,
+        Ok("both") | Err(_) => Workload::Both,
+        _ => panic!("Set PHOTOSYS_AI_BENCHMARK_WORKLOAD to search, people, or both"),
+    };
     println!(
-        "pid={} mode={mode:?} backend={} threads={}",
+        "pid={} mode={mode:?} workload={workload:?} photos={count} backend={} threads={}",
         std::process::id(),
         if gpu { "DirectML" } else { "CPU" },
         thread::available_parallelism().unwrap()
     );
+    let load_started = Instant::now();
     let (search, people) = if gpu {
         gpu_models(&models)
     } else {
         cpu_models(&models)
     };
+    println!(
+        "model_load_and_warmup={:.3}s",
+        load_started.elapsed().as_secs_f64()
+    );
     let search = Arc::new(search);
     let people = Arc::new(people);
     let mut totals = Vec::new();
@@ -273,7 +324,7 @@ fn benchmark_index_pipeline() {
     let mut fingerprint = None;
     for trial in 1..=trials {
         let album = tempfile::tempdir().unwrap();
-        let count = fixture_album(album.path(), &portrait, &people);
+        fixture_album(album.path(), &portrait, &people, count);
         let scan_id = open_directory(album.path().to_str().unwrap(), OpenMode::Select, |_| {})
             .unwrap()
             .scan_id;
@@ -282,22 +333,31 @@ fn benchmark_index_pipeline() {
         let (elapsed, statuses, (preview, queries)) = thread::scope(|scope| {
             let observer = scope.spawn(|| foreground(scan, &search, stop));
             let started = Instant::now();
-            let statuses = index_both(scan_id, mode, false, &search, &people);
+            let statuses = index(scan_id, mode, false, &search, &people, workload);
             let elapsed = started.elapsed();
             signal.send(()).unwrap();
             (elapsed, statuses, observer.join().unwrap())
         });
         let (search_status, people_status, search_stages, people_stages) = statuses;
-        assert_eq!(search_status, [count, 0, 0]);
-        assert_eq!(people_status, [count, 0, 0]);
         let started = Instant::now();
-        let (search_reused, people_reused, _, _) =
-            index_both(scan_id, mode, true, &search, &people);
+        let (search_reused, people_reused, search_rescan, people_rescan) =
+            index(scan_id, mode, true, &search, &people, workload);
         let incremental = started.elapsed();
-        assert_eq!(search_reused, [count, 0, count]);
-        assert_eq!(people_reused, [count, 0, count]);
-        let (faces, digest) = snapshot(album.path());
-        assert!(faces > 12, "multiface fixture yielded only {faces} faces");
+        assert_eq!(search_rescan.decodes, [0, 0]);
+        assert_eq!(people_rescan.decodes, [0, 0]);
+        if workload != Workload::People {
+            assert_eq!(search_status, [count, 0, 0]);
+            assert_eq!(search_reused, [count, 0, count]);
+        }
+        if workload != Workload::Search {
+            assert_eq!(people_status, [count, 0, 0]);
+            assert_eq!(people_reused, [count, 0, count]);
+        }
+        let (faces, digest) = snapshot(album.path(), workload);
+        assert!(
+            workload == Workload::Search || faces > count * 3 / 10,
+            "multiface fixture yielded only {faces} faces"
+        );
         if let Some(expected) = &fingerprint {
             assert_eq!(&digest, expected);
         }
@@ -307,7 +367,11 @@ fn benchmark_index_pipeline() {
             incremental.as_secs_f64() * 1000.
         );
         println!(
-            "stages ms [decode, prepare, inference, write, group]: search {search_stages:.1?}, people {people_stages:.1?}"
+            "stages ms [decode, prepare, inference, write, group, decode wait, GPU wait, model load]: search {:.1?}, people {:.1?}; decode [actual, reused]: search {:?}, people {:?}",
+            search_stages.millis,
+            people_stages.millis,
+            search_stages.decodes,
+            people_stages.decodes
         );
         fingerprint = Some(digest);
         totals.push(elapsed);
