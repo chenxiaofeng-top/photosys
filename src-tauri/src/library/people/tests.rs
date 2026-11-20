@@ -244,7 +244,7 @@ fn photos_timeline_deduplicate_filter_paginate_move_and_reject_stale_results() {
             name: Some("家人".into()),
         })
         .unwrap();
-    let people = query::people(id, "家人", 0).unwrap();
+    let people = query::people(id, "家人", 0, Default::default()).unwrap();
     let p = people.items[0].id;
     assert_eq!(people.items[0].photo_count, 31);
     assert_eq!(people.items[0].face_count, 62);
@@ -340,8 +340,14 @@ fn photos_timeline_deduplicate_filter_paginate_move_and_reject_stale_results() {
     let moved = temp.path().join("moved");
     fs::rename(&root, &moved).unwrap();
     let fresh = open(&moved);
-    assert!(query::people(id, "", 0).is_err());
-    assert_eq!(query::people(fresh, "家人", 0).unwrap().items[0].id, p);
+    assert!(query::people(id, "", 0, Default::default()).is_err());
+    assert_eq!(
+        query::people(fresh, "家人", 0, Default::default())
+            .unwrap()
+            .items[0]
+            .id,
+        p
+    );
     assert_eq!(
         query::photos(fresh, p, &all(), Sort::DateAsc, 0)
             .unwrap()
@@ -697,12 +703,245 @@ fn conservative_grouping_for_both_models_reuses_features_and_keeps_uncertain_fac
         groups
             .assign(&mut store, &grouping::Groups::pending_ids(id).unwrap())
             .unwrap();
-        assert_eq!(query::people(id, "", 0).unwrap().total, 2);
+        assert_eq!(
+            query::people(id, "", 0, Default::default()).unwrap().total,
+            2
+        );
         for (path, record) in before {
             let after = store.records().unwrap();
             assert_eq!(record.stamp, after[&path].stamp);
             assert_eq!(record.version, after[&path].version);
         }
+    }
+}
+
+#[test]
+fn tuned_pending_groups_and_hidden_people_work_for_both_models() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let _restore = RestorePeopleModel(ai::catalog::active(ai::ModelKind::People));
+    let models = ["yunet-sface-fp32-v1", "yunet-auraface-fp32-v1"];
+    let parameters = |threshold, margin| {
+        serde_json::from_value(serde_json::json!({ "threshold": threshold, "margin": margin }))
+            .unwrap()
+    };
+    for (index, model) in models.iter().enumerate() {
+        let spec = ai::catalog::find(ai::ModelKind::People, model).unwrap();
+        ai::catalog::select(spec);
+        let album = tempfile::tempdir().unwrap();
+        for i in 0..=10 {
+            RgbImage::new(2, 2)
+                .save(album.path().join(format!("{i:02}.png")))
+                .unwrap();
+        }
+        let id = open(album.path());
+        let scan = scan(id).unwrap();
+        let mut store = Store::open(&scan, true).unwrap().unwrap();
+        let cache = |store: &mut Store, n: usize, found: Vec<Face>| {
+            let item = scan
+                .items
+                .iter()
+                .find(|item| item.file.path_label() == format!("{n:02}.png"))
+                .unwrap();
+            let ids = store
+                .save_for_model(
+                    &favorites::path_key(&item.file.relative),
+                    &item.file.stamp.portable_key(),
+                    0,
+                    &Ok(found),
+                    spec.feature_version,
+                )
+                .unwrap();
+            (item.file.id, ids)
+        };
+        let vector = |components| model_face(spec, components);
+        let (anchor_photo, roots) = cache(&mut store, 0, vec![vector(&[1.]), vector(&[0., 1.])]);
+        for (face_id, name) in [(roots[0], ""), (roots[1], "已归组的路人")] {
+            store
+                .edit(Edit::Assign {
+                    face_ids: vec![face_id],
+                    person_id: None,
+                    name: Some(name.into()),
+                })
+                .unwrap();
+        }
+        let visible = assigned(&store, roots[0]).unwrap();
+        let hidden = assigned(&store, roots[1]).unwrap();
+        let close = cache(&mut store, 1, vec![vector(&[0.72, 0.68])]).1[0];
+        let hidden_close = cache(&mut store, 2, vec![vector(&[0.68, 0.72])]).1[0];
+        let hidden_low = cache(&mut store, 3, vec![vector(&[0., 0.62, 0.7846])]).1[0];
+        let hidden_match = cache(&mut store, 4, vec![vector(&[0., 1.])]).1[0];
+        let duplicate = cache(&mut store, 5, vec![vector(&[1.]), vector(&[1.])]).1;
+        let mut small = vector(&[1.]);
+        small.vector = None;
+        let small = cache(&mut store, 6, vec![small]).1[0];
+        let ignored_face = cache(&mut store, 7, vec![vector(&[0., 1.])]).1[0];
+        store
+            .edit(Edit::Ignore {
+                face_ids: vec![ignored_face],
+            })
+            .unwrap();
+        let rejected = cache(&mut store, 8, vec![vector(&[1.])]).1[0];
+        store
+            .connection
+            .execute(
+                "INSERT INTO rejections VALUES(?1,?2)",
+                params![rejected, visible],
+            )
+            .unwrap();
+        let unmatched = cache(&mut store, 9, vec![vector(&[0., 0., 0., 1.])]).1[0];
+
+        let single_unnamed = serde_json::from_value(serde_json::json!({
+            "unnamedOnly": true, "singlePhotoOnly": true
+        }))
+        .unwrap();
+        assert_eq!(
+            query::people(id, "", 0, single_unnamed).unwrap().items[0].id,
+            visible
+        );
+        assert!(
+            store
+                .edit(Edit::IgnorePeople {
+                    person_ids: vec![hidden, i64::MAX]
+                })
+                .is_err()
+        );
+        assert_eq!(status(id).unwrap().ignored_people, 0);
+        store
+            .edit(Edit::IgnorePeople {
+                person_ids: vec![hidden, visible],
+            })
+            .unwrap();
+        assert_eq!(status(id).unwrap().ignored_people, 2);
+        store.undo().unwrap();
+        assert_eq!(status(id).unwrap().ignored_people, 0);
+        store
+            .edit(Edit::IgnorePeople {
+                person_ids: vec![hidden],
+            })
+            .unwrap();
+        assert_eq!(
+            query::photo_people(id, anchor_photo).unwrap()[0].id,
+            visible
+        );
+        assert_eq!(query::photo_people(id, anchor_photo).unwrap().len(), 1);
+        assert!(query::photos(id, hidden, &all(), Sort::DateAsc, 0).is_err());
+        assert!(query::months(id, hidden, &all(), Sort::DateAsc).is_err());
+        let suggested =
+            serde_json::to_value(grouping::suggestions(id, &[hidden_match]).unwrap()).unwrap();
+        assert_eq!(suggested["faces"][0]["people"], serde_json::json!([]));
+        assert!(
+            store
+                .edit(Edit::Assign {
+                    face_ids: vec![hidden_match],
+                    person_id: Some(hidden),
+                    name: None
+                })
+                .is_err()
+        );
+
+        let default = serde_json::to_value(regroup_pending(id, None).unwrap()).unwrap();
+        assert_eq!(default["visibleMatches"], 1);
+        assert_eq!(default["ignoredMatches"], 1);
+        save_grouping_parameters(id, spec.feature_version, parameters(0.6, 0.02)).unwrap();
+        let peer = ai::catalog::find(ai::ModelKind::People, models[1 - index]).unwrap();
+        ai::catalog::select(peer);
+        let peer_settings = serde_json::to_value(status(id).unwrap().grouping_settings).unwrap();
+        assert_eq!(peer_settings["parameters"], peer_settings["defaults"]);
+        ai::catalog::select(spec);
+        let preview = regroup_pending(id, None).unwrap();
+        assert!(assigned(&store, close).is_none());
+        save_grouping_parameters(id, spec.feature_version, parameters(0.61, 0.02)).unwrap();
+        assert!(regroup_pending(id, Some(preview.token)).is_err());
+        let preview = regroup_pending(id, None).unwrap();
+        let counts = serde_json::to_value(&preview).unwrap();
+        assert_eq!(counts["visibleMatches"], 2);
+        assert_eq!(counts["ignoredMatches"], 1);
+        assert_eq!(counts["samples"].as_array().unwrap().len(), 3);
+        regroup_pending(id, Some(preview.token.clone())).unwrap();
+        assert!(regroup_pending(id, Some(preview.token)).is_err());
+        assert_eq!(assigned(&store, roots[0]), Some(visible));
+        assert_eq!(assigned(&store, close), Some(visible));
+        assert_eq!(assigned(&store, duplicate[0]), Some(visible));
+        assert_eq!(assigned(&store, hidden_match), Some(hidden));
+        for face_id in [
+            hidden_close,
+            hidden_low,
+            duplicate[1],
+            small,
+            ignored_face,
+            rejected,
+            unmatched,
+        ] {
+            assert_eq!(assigned(&store, face_id), None);
+        }
+
+        drop(store);
+        let reopened = open(album.path());
+        let reopened_scan = super::scan(reopened).unwrap();
+        let mut store = Store::open(&reopened_scan, true).unwrap().unwrap();
+        let current = status(reopened).unwrap();
+        assert_eq!(current.ignored_people, 1);
+        assert_eq!(current.ignored_faces, 1);
+        let saved = serde_json::to_value(current.grouping_settings).unwrap();
+        assert_eq!(
+            saved["parameters"],
+            serde_json::json!({"threshold": 0.61_f32, "margin": 0.02_f32})
+        );
+        assert_eq!(current.undo_description.as_deref(), Some("补分待整理人脸"));
+        store.undo().unwrap();
+        for face_id in [close, duplicate[0], hidden_match] {
+            assert_eq!(assigned(&store, face_id), None);
+        }
+        let fresh = cache(&mut store, 10, vec![vector(&[0., 1.])]).1[0];
+        let policy = grouping::Policy::effective(Some(&store)).unwrap();
+        grouping::Groups::load(reopened, policy)
+            .unwrap()
+            .assign(&mut store, &[fresh, hidden_close, hidden_low])
+            .unwrap();
+        assert_eq!(assigned(&store, fresh), Some(hidden));
+        assert_eq!(assigned(&store, hidden_close), None);
+        assert_eq!(assigned(&store, hidden_low), None);
+        let hidden_filter = serde_json::from_value(serde_json::json!({"ignored": true})).unwrap();
+        assert_eq!(
+            query::people(reopened, "", 0, hidden_filter).unwrap().items[0].photo_count,
+            2
+        );
+        assert_eq!(
+            query::people(reopened, "", 0, Default::default())
+                .unwrap()
+                .total,
+            1
+        );
+        assert!(
+            query::faces(reopened, FaceScope::Person, Some(hidden), None, 0)
+                .unwrap()
+                .items
+                .iter()
+                .all(|face| face.person_ignored)
+        );
+        store
+            .edit(Edit::Assign {
+                face_ids: vec![fresh],
+                person_id: Some(visible),
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(assigned(&store, fresh), Some(visible));
+        store.undo().unwrap();
+        store
+            .edit(Edit::RestorePeople {
+                person_ids: vec![hidden],
+            })
+            .unwrap();
+        assert_eq!(
+            query::photos(reopened, hidden, &all(), Sort::DateAsc, 0)
+                .unwrap()
+                .total,
+            2
+        );
+        store.undo().unwrap();
+        assert_eq!(status(reopened).unwrap().ignored_people, 1);
+        assert!(query::photos(reopened, hidden, &all(), Sort::DateAsc, 0).is_err());
     }
 }
 
@@ -817,7 +1056,13 @@ fn edits_during_grouping_refresh_representatives_and_survive_reopen_for_both_mod
             None,
         ))
         .unwrap();
-        assert_eq!(query::people(id, "家人", 0).unwrap().items[0].id, corrected);
+        assert_eq!(
+            query::people(id, "家人", 0, Default::default())
+                .unwrap()
+                .items[0]
+                .id,
+            corrected
+        );
     }
 }
 
@@ -845,7 +1090,7 @@ fn real_directml_people_reuses_cpu_index_and_manual_identity() {
             .indexed,
         1
     );
-    let person = query::people(id, "", 0).unwrap().items[0].id;
+    let person = query::people(id, "", 0, Default::default()).unwrap().items[0].id;
     let face = query::faces(id, FaceScope::Person, Some(person), None, 0)
         .unwrap()
         .items[0]
@@ -859,7 +1104,10 @@ fn real_directml_people_reuses_cpu_index_and_manual_identity() {
             name: Some("样例人物".into()),
         })
         .unwrap();
-    let named = query::people(id, "样例人物", 0).unwrap().items[0].id;
+    let named = query::people(id, "样例人物", 0, Default::default())
+        .unwrap()
+        .items[0]
+        .id;
 
     let gpu = Arc::new(FaceRuntime::load_with_device(&model, spec, &device).unwrap());
     fs::copy(&portrait, album.path().join("b.jpg")).unwrap();
@@ -869,7 +1117,9 @@ fn real_directml_people_reuses_cpu_index_and_manual_identity() {
     assert!(!added.needs_rebuild);
     let same = update(id, true, &progress, || Ok(cpu.clone())).unwrap();
     assert_eq!(same.reused, 2);
-    let person = &query::people(id, "样例人物", 0).unwrap().items[0];
+    let person = &query::people(id, "样例人物", 0, Default::default())
+        .unwrap()
+        .items[0];
     assert_eq!(person.id, named);
     assert_eq!(person.photo_count, 2);
     assert!(
@@ -927,7 +1177,10 @@ fn real_faces_install_incremental_cancel_and_restore() {
     assert!(!initial.running);
     assert_eq!(initial.pending_faces, 0);
     assert!(initial.auto_grouping);
-    assert_eq!(query::people(id, "", 0).unwrap().total, 1);
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().total,
+        1
+    );
     // Emulate an existing pre-grouping index and exercise the real automatic update path.
     {
         let scan = scan(id).unwrap();
@@ -941,8 +1194,11 @@ fn real_faces_install_incremental_cancel_and_restore() {
     let same = update(id, true, &channel, || Ok(runtime.clone())).unwrap();
     assert_eq!(same.reused, 3);
     assert_eq!(same.pending_faces, 0);
-    assert_eq!(query::people(id, "", 0).unwrap().total, 1);
-    let person = query::people(id, "", 0).unwrap().items[0].id;
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().total,
+        1
+    );
+    let person = query::people(id, "", 0, Default::default()).unwrap().items[0].id;
     let f = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
     let face_id = f.items[0].id;
     let scan = scan(id).unwrap();
@@ -970,7 +1226,10 @@ fn real_faces_install_incremental_cancel_and_restore() {
     .unwrap();
     update(id, true, &channel, || Ok(runtime.clone())).unwrap();
     assert_eq!(
-        query::people(id, "样例人物", 0).unwrap().items[0].photo_count,
+        query::people(id, "样例人物", 0, Default::default())
+            .unwrap()
+            .items[0]
+            .photo_count,
         1
     );
     session()
@@ -1124,7 +1383,7 @@ fn benchmark_people_catalogs() {
         let months_ms = started.elapsed().as_millis();
         assert!(!months.is_empty());
         let started = Instant::now();
-        let persons = query::people(id, "", 0).unwrap();
+        let persons = query::people(id, "", 0, Default::default()).unwrap();
         let people_ms = started.elapsed().as_millis();
         assert_eq!(persons.total, 100);
         let started = Instant::now();
@@ -1545,6 +1804,7 @@ fn legacy_people_schema_reads_without_writes_and_migrates_atomically() {
     .unwrap();
     drop(c);
     let store = Store::at(&path, false).unwrap().unwrap();
+    assert_eq!(store.schema_version().unwrap(), 1);
     assert_eq!(
         store.records().unwrap()[b"a".as_slice()].geometry_version,
         faces::GEOMETRY_VERSION
@@ -1558,9 +1818,70 @@ fn legacy_people_schema_reads_without_writes_and_migrates_atomically() {
     assert_eq!(
         store
             .connection
-            .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn version_two_people_remain_visible_and_old_undo_payloads_survive() {
+    let _session = TEST_SESSION.lock().unwrap();
+    let album = tempfile::tempdir().unwrap();
+    RgbImage::new(2, 2)
+        .save(album.path().join("a.png"))
+        .unwrap();
+    let id = open(album.path());
+    let face = save(id)[0];
+    let scan = scan(id).unwrap();
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store
+        .edit(Edit::Assign {
+            face_ids: vec![face],
+            person_id: None,
+            name: Some("旧名字".into()),
+        })
+        .unwrap();
+    let person = assigned(&store, face).unwrap();
+    store
+        .edit(Edit::Rename {
+            person_id: person,
+            name: "新名字".into(),
+        })
+        .unwrap();
+    store.connection.execute_batch(
+        r#"UPDATE edits SET payload=replace(payload, ',"ignored":false', '') WHERE description='修改人物名称';
+         ALTER TABLE people DROP COLUMN ignored;
+         PRAGMA user_version=2;"#,
+    ).unwrap();
+    drop(store);
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().items[0].name,
+        "新名字"
+    );
+    assert_eq!(query::counts(id).unwrap().2, 0);
+    assert_eq!(
+        Store::open(&scan, false)
+            .unwrap()
+            .unwrap()
+            .schema_version()
             .unwrap(),
         2
+    );
+    let mut store = Store::open(&scan, true).unwrap().unwrap();
+    store.undo().unwrap();
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().items[0].name,
+        "旧名字"
+    );
+    store
+        .edit(Edit::IgnorePeople {
+            person_ids: vec![person],
+        })
+        .unwrap();
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().total,
+        0
     );
 }
 
@@ -1607,7 +1928,7 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
         1
     );
     drop(runtime);
-    let person = query::people(id, "", 0).unwrap().items[0].id;
+    let person = query::people(id, "", 0, Default::default()).unwrap().items[0].id;
     let cards = query::faces(id, FaceScope::Person, Some(person), None, 0).unwrap();
     assert!(!cards.items.is_empty());
     let face_id = cards.items[0].id;
@@ -1621,7 +1942,10 @@ fn real_people_model_selection_keeps_manual_identity_and_requires_manual_start()
         })
         .unwrap();
     drop(store);
-    let person = query::people(id, "家人", 0).unwrap().items[0].id;
+    let person = query::people(id, "家人", 0, Default::default())
+        .unwrap()
+        .items[0]
+        .id;
     let new = ai::catalog::find(ai::ModelKind::People, "yunet-auraface-fp32-v1").unwrap();
     ai::catalog::select(new);
     assert!(status(id).unwrap().needs_rebuild);
@@ -1726,7 +2050,10 @@ fn person_photos_months_and_map_share_geographic_filters() {
         })
         .unwrap();
     drop(store);
-    let person = query::people(scan_id, "家人", 0).unwrap().items[0].id;
+    let person = query::people(scan_id, "家人", 0, Default::default())
+        .unwrap()
+        .items[0]
+        .id;
     let mut filter = all();
     filter.location_mode = library::locations::LocationMode::Known;
     assert_eq!(
@@ -1793,9 +2120,25 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
             face_ids: vec![faces[1]],
         })
         .unwrap();
+    store
+        .edit(Edit::IgnorePeople {
+            person_ids: vec![1],
+        })
+        .unwrap();
+    let model = ai::catalog::active(ai::ModelKind::People);
+    let saved = serde_json::json!({"threshold": 0.62_f32, "margin": 0.04_f32});
+    grouping::Policy::save(
+        &store,
+        model.feature_version,
+        serde_json::from_value(saved.clone()).unwrap(),
+    )
+    .unwrap();
     drop(store);
     // Keep the reusable read connection alive just as the people UI does.
-    assert_eq!(query::people(id, "", 0).unwrap().items[0].name, "妈妈");
+    assert_eq!(
+        query::people(id, "", 0, Default::default()).unwrap().total,
+        0
+    );
     let zip = temp.path().join("backup.zip");
     database_backup::export(&scan.root, &zip, |_| {}).unwrap();
     let checked = tempfile::tempdir().unwrap();
@@ -1822,8 +2165,19 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
     library::invalidate().unwrap();
     let new_id = open(&source);
     assert_ne!(id, new_id);
-    assert!(query::people(id, "", 0).is_err());
-    assert_eq!(query::people(new_id, "", 0).unwrap().items[0].name, "妈妈");
+    assert!(query::people(id, "", 0, Default::default()).is_err());
+    assert_eq!(
+        query::people(new_id, "", 0, Default::default())
+            .unwrap()
+            .total,
+        0
+    );
+    let restored = status(new_id).unwrap();
+    assert_eq!(restored.ignored_people, 1);
+    assert_eq!(
+        serde_json::to_value(restored.grouping_settings).unwrap()["parameters"],
+        saved
+    );
     let scan = super::scan(new_id).unwrap();
     let mut store = Store::open(&scan, true).unwrap().unwrap();
     assert_eq!(
@@ -1844,6 +2198,14 @@ fn database_backup_restores_real_people_corrections_undo_and_closes_old_reader()
             })
             .unwrap(),
         true
+    );
+    store.undo().unwrap();
+    assert_eq!(
+        query::people(new_id, "", 0, Default::default())
+            .unwrap()
+            .items[0]
+            .name,
+        "妈妈"
     );
     store.undo().unwrap();
     assert_eq!(

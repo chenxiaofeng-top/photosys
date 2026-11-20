@@ -10,17 +10,17 @@ use std::{fs, path::Path, time::Duration};
 pub(super) struct Store {
     pub connection: Connection,
 }
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 const SCHEMA:&str="
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL DEFAULT '',archived INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS media(path BLOB PRIMARY KEY,stamp BLOB NOT NULL,rotation INTEGER NOT NULL,version TEXT NOT NULL,error TEXT);
 CREATE TABLE IF NOT EXISTS faces(id INTEGER PRIMARY KEY AUTOINCREMENT,path BLOB NOT NULL,bbox TEXT NOT NULL,confidence REAL NOT NULL,vector BLOB,thumbnail BLOB NOT NULL,person_id INTEGER REFERENCES people(id),manual INTEGER NOT NULL DEFAULT 0,ignored INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,review INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS faces_path ON faces(path,active);
 CREATE INDEX IF NOT EXISTS faces_person ON faces(person_id,active,ignored);
 CREATE INDEX IF NOT EXISTS faces_pending ON faces(active,ignored,person_id,review);
 CREATE TABLE IF NOT EXISTS rejections(face_id INTEGER NOT NULL REFERENCES faces(id),person_id INTEGER NOT NULL REFERENCES people(id),PRIMARY KEY(face_id,person_id));
-CREATE TABLE IF NOT EXISTS edits(id INTEGER PRIMARY KEY AUTOINCREMENT,description TEXT NOT NULL,payload TEXT NOT NULL);
-PRAGMA user_version=2;";
+CREATE TABLE IF NOT EXISTS edits(id INTEGER PRIMARY KEY AUTOINCREMENT,description TEXT NOT NULL,payload TEXT NOT NULL);";
 #[derive(Clone)]
 pub(super) struct Record {
     pub stamp: Vec<u8>,
@@ -34,6 +34,8 @@ struct PersonState {
     id: i64,
     name: String,
     archived: bool,
+    #[serde(default)]
+    ignored: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct FaceState {
@@ -49,6 +51,8 @@ struct Undo {
     people: Vec<PersonState>,
     faces: Vec<FaceState>,
     created: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_assignments: Vec<(i64, i64)>,
 }
 #[derive(Deserialize)]
 #[serde(
@@ -76,6 +80,12 @@ pub(crate) enum Edit {
     Restore {
         face_ids: Vec<i64>,
     },
+    IgnorePeople {
+        person_ids: Vec<i64>,
+    },
+    RestorePeople {
+        person_ids: Vec<i64>,
+    },
 }
 fn name(s: &str) -> Result<String, String> {
     let s = s.trim();
@@ -86,24 +96,31 @@ fn name(s: &str) -> Result<String, String> {
     }
 }
 impl Store {
-    fn has_geometry(c: &Connection) -> Result<bool, String> {
-        let mut q = c.prepare("PRAGMA table_info(media)").map_err(error)?;
-        let names = q
-            .query_map([], |r| r.get::<_, String>(1))
-            .map_err(error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(error)?;
-        Ok(names.iter().any(|n| n == "geometry_version"))
+    fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool, String> {
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            params![table, column],
+            |r| r.get(0),
+        )
+        .map_err(error)
     }
     pub fn geometry_expression(&self) -> Result<String, String> {
-        Ok(if Self::has_geometry(&self.connection)? {
-            "m.geometry_version".into()
-        } else {
-            format!(
-                "CASE WHEN m.version='{VERSION}' THEN '{}' ELSE '' END",
-                crate::ai::faces::GEOMETRY_VERSION
-            )
-        })
+        Ok(
+            if Self::has_column(&self.connection, "media", "geometry_version")? {
+                "m.geometry_version".into()
+            } else {
+                format!(
+                    "CASE WHEN m.version='{VERSION}' THEN '{}' ELSE '' END",
+                    crate::ai::faces::GEOMETRY_VERSION
+                )
+            },
+        )
+    }
+
+    pub fn schema_version(&self) -> Result<u32, String> {
+        self.connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(error)
     }
 
     pub fn open(scan: &Scan, write: bool) -> Result<Option<Self>, String> {
@@ -127,17 +144,17 @@ impl Store {
         let c = Connection::open_with_flags(path, flags).map_err(error)?;
         c.busy_timeout(Duration::from_secs(3)).map_err(error)?;
         c.execute_batch("PRAGMA foreign_keys=ON;").map_err(error)?;
-        let version: i64 = c
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(error)?;
-        if version > 2 {
+        let store = Self { connection: c };
+        let version = store.schema_version()?;
+        if version > SCHEMA_VERSION {
             return Err("人物数据库来自较新版本，请更新 PhotoSys。".into());
         }
-        if write {
+        if write && version < SCHEMA_VERSION {
+            let c = &store.connection;
             c.execute_batch("BEGIN IMMEDIATE").map_err(error)?;
             let migration = (|| -> Result<(), String> {
                 c.execute_batch(SCHEMA).map_err(error)?;
-                if !Self::has_geometry(&c)? {
+                if !Self::has_column(c, "media", "geometry_version")? {
                     c.execute_batch(
                         "ALTER TABLE media ADD COLUMN geometry_version TEXT NOT NULL DEFAULT '';",
                     )
@@ -148,6 +165,14 @@ impl Store {
                     )
                     .map_err(error)?;
                 }
+                if !Self::has_column(c, "people", "ignored")? {
+                    c.execute_batch(
+                        "ALTER TABLE people ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;",
+                    )
+                    .map_err(error)?;
+                }
+                c.pragma_update(None, "user_version", SCHEMA_VERSION)
+                    .map_err(error)?;
                 Ok(())
             })();
             if let Err(e) = migration {
@@ -156,7 +181,7 @@ impl Store {
             }
             c.execute_batch("COMMIT").map_err(error)?;
         }
-        Ok(Some(Self { connection: c }))
+        Ok(Some(store))
     }
     pub fn writable(scan: &Scan) -> bool {
         let Ok(Some(dir)) = favorites::data_directory(&scan.root) else {
@@ -354,13 +379,14 @@ impl Store {
     fn person(&self, id: i64) -> Result<PersonState, String> {
         self.connection
             .query_row(
-                "SELECT id,name,archived FROM people WHERE id=?1 AND archived=0",
+                "SELECT id,name,archived,ignored FROM people WHERE id=?1 AND archived=0",
                 [id],
                 |r| {
                     Ok(PersonState {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         archived: r.get(2)?,
+                        ignored: r.get(3)?,
                     })
                 },
             )
@@ -434,8 +460,12 @@ impl Store {
                 if source_id == target_id {
                     return Err("请选择两个不同人物。".into());
                 }
-                undo.people.push(self.person(source_id)?);
-                undo.people.push(self.person(target_id)?);
+                let source = self.person(source_id)?;
+                let target = self.person(target_id)?;
+                if source.ignored || target.ignored {
+                    return Err("请先恢复已忽略的人物再合并。".into());
+                }
+                undo.people.extend([source, target]);
                 let mut q = self
                     .connection
                     .prepare("SELECT id FROM faces WHERE person_id=?1")
@@ -468,7 +498,9 @@ impl Store {
                     return Err("请选择 1～1000 张人脸。".into());
                 }
                 let target = if let Some(id) = person_id {
-                    self.person(id)?;
+                    if self.person(id)?.ignored {
+                        return Err("归属目标已被忽略，请选择其他人物。".into());
+                    }
                     id
                 } else {
                     let n = name(n.as_deref().unwrap_or(""))?;
@@ -520,8 +552,71 @@ impl Store {
             }
             Edit::Ignore { face_ids } => return self.disposition(face_ids, false),
             Edit::Restore { face_ids } => return self.disposition(face_ids, true),
+            Edit::IgnorePeople { person_ids } => return self.people_disposition(person_ids, true),
+            Edit::RestorePeople { person_ids } => {
+                return self.people_disposition(person_ids, false);
+            }
         }
         self.save_undo(description, undo)
+    }
+    fn people_disposition(&self, ids: Vec<i64>, ignored: bool) -> Result<(), String> {
+        if ids.is_empty() || ids.len() > 1000 {
+            return Err("请选择 1～1000 个人物。".into());
+        }
+        let mut undo = Undo::default();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids.into_iter().filter(|id| seen.insert(*id)) {
+            let previous = self.person(id)?;
+            if previous.ignored != ignored {
+                undo.people.push(previous);
+                self.connection
+                    .execute(
+                        "UPDATE people SET ignored=?2 WHERE id=?1",
+                        params![id, ignored],
+                    )
+                    .map_err(error)?;
+            }
+        }
+        if undo.people.is_empty() {
+            return Ok(());
+        }
+        self.save_undo(
+            if ignored {
+                "忽略人物"
+            } else {
+                "恢复忽略的人物"
+            },
+            undo,
+        )
+    }
+
+    pub fn apply_pending_groups(&mut self, assignments: &[(i64, i64)]) -> Result<(), String> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(error)?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE faces SET person_id=?2 WHERE id=?1 AND active=1 AND ignored=0 AND manual=0 AND review=0 AND person_id IS NULL"
+            ).map_err(error)?;
+            for &(id, person) in assignments {
+                if update.execute(params![id, person]).map_err(error)? != 1 {
+                    return Err(super::grouping::PREVIEW_CHANGED.into());
+                }
+            }
+        }
+        self.save_undo(
+            "补分待整理人脸",
+            Undo {
+                pending_assignments: assignments.to_vec(),
+                ..Undo::default()
+            },
+        )?;
+        tx.commit().map_err(error)
     }
     fn disposition(&self, ids: Vec<i64>, restore: bool) -> Result<(), String> {
         if ids.is_empty() || ids.len() > 1000 {
@@ -571,8 +666,8 @@ impl Store {
         let u: Undo = serde_json::from_str(&json).map_err(error)?;
         for p in u.people {
             tx.execute(
-                "UPDATE people SET name=?2,archived=?3 WHERE id=?1",
-                params![p.id, p.name, p.archived],
+                "UPDATE people SET name=?2,archived=?3,ignored=?4 WHERE id=?1",
+                params![p.id, p.name, p.archived, p.ignored],
             )
             .map_err(error)?;
         }
@@ -583,6 +678,16 @@ impl Store {
             for p in f.rejections {
                 tx.execute("INSERT INTO rejections VALUES(?1,?2)", params![f.id, p])
                     .map_err(error)?;
+            }
+        }
+        if !u.pending_assignments.is_empty() {
+            let mut update = tx
+                .prepare(
+                    "UPDATE faces SET person_id=NULL WHERE id=?1 AND person_id=?2 AND manual=0",
+                )
+                .map_err(error)?;
+            for (face, person) in u.pending_assignments {
+                update.execute(params![face, person]).map_err(error)?;
             }
         }
         for p in u.created {

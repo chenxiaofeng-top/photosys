@@ -108,6 +108,8 @@ pub fn run() {
             library::ai_search::ai_search,
             library::people::people_index_status,
             library::people::people_update_index,
+            library::people::people_save_grouping,
+            library::people::people_regroup_pending,
             library::people::people_cancel_index,
             library::people::people_index_issues,
             library::people::people_list,

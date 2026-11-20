@@ -11,7 +11,7 @@ use crate::ai::{
     faces::{self, FaceRuntime},
     indexing::{Active, Mode, Run, Stage},
 };
-use query::{FaceScope, FaceView, Month, PersonView};
+use query::{FaceScope, FaceView, Month, PeopleFilter, PersonView};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use std::{
@@ -22,6 +22,7 @@ use std::{
     },
     time::Instant,
 };
+pub(crate) use store::SCHEMA_VERSION;
 use store::{Edit, Store};
 use tauri::{AppHandle, ipc::Channel};
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -51,8 +52,10 @@ pub(crate) struct IndexStatus {
     pub message: Option<String>,
     pub pending_faces: usize,
     pub ignored_faces: usize,
+    pub ignored_people: usize,
     pub undo_description: Option<String>,
     pub auto_grouping: bool,
+    pub grouping_settings: Option<grouping::Settings>,
     pub model_id: &'static str,
     pub needs_rebuild: bool,
     pub rebuild_reason: Option<String>,
@@ -81,7 +84,8 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         ..Default::default()
     };
     (state.running, state.queued) = ACTIVE.status(scan_id)?;
-    if let Some(s) = Store::open(&scan, false)? {
+    let store = Store::open(&scan, false)?;
+    if let Some(s) = &store {
         state.enabled = s.enabled()?;
         state.needs_rebuild = ai::index_policy::needs_rebuild(&s.connection, spec, faces::VERSION)?;
         let records = s.records()?;
@@ -108,12 +112,14 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
         state.rebuild_reason = Some("当前模型需要重新计算人脸特征，请手动重建人物索引。".into());
     }
     state.pending = state.total.saturating_sub(state.indexed + state.failed);
-    let (pending, ignored, undo) = query::counts(scan_id)?;
+    let (pending, ignored, ignored_people, undo) = query::counts(scan_id)?;
     state.pending_faces = pending;
     state.ignored_faces = ignored;
+    state.ignored_people = ignored_people;
     state.undo_description = undo;
-    let policy = grouping::Policy::shipped();
+    let policy = grouping::Policy::effective(store.as_ref())?;
     state.auto_grouping = policy.allowed();
+    state.grouping_settings = policy.settings();
     if !policy.accuracy_validated() {
         state.message = Some(policy.reason);
     }
@@ -229,7 +235,7 @@ pub(super) fn update_with_run(
     state.failed = 0;
     let records = store.records()?;
     let rotations = { current(&*session()?, scan_id)?.rotations.clone() };
-    let policy = grouping::Policy::shipped();
+    let policy = grouping::Policy::effective(Some(&store))?;
     let (mut groups, mut edits) = {
         let _edit = MUTATION.lock().map_err(error)?;
         (
@@ -431,10 +437,11 @@ pub(crate) async fn people_list(
     scan_id: u64,
     query: String,
     page: usize,
+    filter: Option<PeopleFilter>,
 ) -> Result<Page<PersonView>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
-        query::people(scan_id, &query, page)
+        query::people(scan_id, &query, page, filter.unwrap_or_default())
     })
     .await
     .map_err(error)?
@@ -450,6 +457,87 @@ pub(crate) async fn people_faces(
     tauri::async_runtime::spawn_blocking(move || {
         let _database = crate::database_access::read()?;
         query::faces(scan_id, scope, person_id, file_id, page)
+    })
+    .await
+    .map_err(error)?
+}
+
+fn save_grouping_parameters(
+    scan_id: u64,
+    feature_version: &str,
+    parameters: grouping::Parameters,
+) -> Result<(), String> {
+    let _serial = SERIAL
+        .try_lock()
+        .map_err(|_| "请等待当前人物分析或补分结束。")?;
+    let _edit = lock_edits()?;
+    let session = session()?;
+    let scan = &current(&session, scan_id)?.scan;
+    let store = Store::open(scan, true)?.ok_or("无法打开人物数据库。")?;
+    grouping::Policy::save(&store, feature_version, parameters)?;
+    EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn people_save_grouping(
+    scan_id: u64,
+    feature_version: String,
+    parameters: grouping::Parameters,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        save_grouping_parameters(scan_id, &feature_version, parameters)
+    })
+    .await
+    .map_err(error)?
+}
+
+fn regroup_pending(
+    scan_id: u64,
+    token: Option<String>,
+) -> Result<grouping::PendingPreview, String> {
+    let _serial = SERIAL
+        .try_lock()
+        .map_err(|_| "请等待当前人物分析或补分结束。")?;
+    let _edit = lock_edits()?;
+    let plan = grouping::pending_plan(
+        scan_id,
+        EDIT_GENERATION.load(Ordering::Relaxed),
+        token.is_none(),
+    )?;
+    if let Some(token) = token {
+        if plan.preview.token != token {
+            return Err(grouping::PREVIEW_CHANGED.into());
+        }
+        if !plan.assignments.is_empty() {
+            let scan = scan(scan_id)?;
+            for file_id in plan.files {
+                let item = scan.item(file_id)?;
+                scan.root
+                    .open_matching(&item.file)
+                    .map_err(|_| grouping::PREVIEW_CHANGED.to_string())?;
+            }
+            let session = session()?;
+            current(&session, scan_id)?;
+            let mut store = Store::open(&scan, true)?.ok_or("无法打开人物数据库。")?;
+            store.apply_pending_groups(&plan.assignments)?;
+            EDIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        scan(scan_id)?;
+    }
+    Ok(plan.preview)
+}
+
+#[tauri::command]
+pub(crate) async fn people_regroup_pending(
+    scan_id: u64,
+    preview_token: Option<String>,
+) -> Result<grouping::PendingPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _database = crate::database_access::read()?;
+        regroup_pending(scan_id, preview_token)
     })
     .await
     .map_err(error)?
@@ -580,7 +668,7 @@ fn apply_suggestion(scan_id: u64, edit: Edit, version: &str) -> Result<(), Strin
             .connection
             .prepare(&format!(
             "SELECT f.path,m.stamp,m.rotation,f.vector FROM faces f JOIN media m ON m.path=f.path
-             WHERE f.id=?1 AND {} AND ({geometry})=?3",
+             WHERE f.id=?1 AND m.version=?2 AND {} AND ({geometry})=?3",
             grouping::PENDING_FACE,
         ))
             .map_err(error)?;

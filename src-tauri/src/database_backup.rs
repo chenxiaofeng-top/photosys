@@ -155,7 +155,13 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
     let version: u32 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(error)?;
-    if version > if name == "people.sqlite" { 2 } else { 0 } {
+    if version
+        > if name == "people.sqlite" {
+            library::people::SCHEMA_VERSION
+        } else {
+            0
+        }
+    {
         return Err(format!("{name} 来自较新版本，请更新 PhotoSys。"));
     }
     let queries: &[&str] = match name {
@@ -176,6 +182,10 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
     };
     for sql in queries {
         c.prepare(sql)
+            .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
+    }
+    if name == "people.sqlite" && version == library::people::SCHEMA_VERSION {
+        c.prepare("SELECT ignored FROM people LIMIT 0")
             .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
     }
     if name == "library.sqlite" {
