@@ -12,9 +12,17 @@ use crate::duplicates::{Root, is_link};
 pub(super) const DATA_DIR: &str = ".photosys";
 const SCHEMA: &str = "CREATE TABLE favorites (path BLOB PRIMARY KEY) WITHOUT ROWID";
 
+fn data_path(root: &Root) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = &root.test_data_directory {
+        return path.clone();
+    }
+    root.path.join(DATA_DIR)
+}
+
 pub(super) fn data_directory(root: &Root) -> Result<Option<PathBuf>, String> {
     root.verify_directory().map_err(|error| error.to_string())?;
-    let directory = root.path.join(DATA_DIR);
+    let directory = data_path(root);
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => Ok(Some(directory)),
         Ok(_) => Err("相册内的 .photosys 必须是普通目录。".into()),
@@ -57,7 +65,7 @@ pub(super) fn initialize(root: &Root) -> Result<HashSet<Vec<u8>>, String> {
     let directory = match data_directory(root)? {
         Some(directory) => directory,
         None => {
-            match fs::create_dir(root.path.join(DATA_DIR)) {
+            match fs::create_dir(data_path(root)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.to_string()),

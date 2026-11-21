@@ -176,7 +176,7 @@ impl FaceRuntime {
         runtime.encode(&RgbImage::from_pixel(112, 112, image::Rgb([127, 127, 127])))?;
         Ok(runtime)
     }
-    pub(super) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
+    pub(crate) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
         Ok(vec![self.detector.status()?, self.recognizer.status()?])
     }
     pub(crate) fn uses_directml_for_index(&self) -> Result<bool, String> {

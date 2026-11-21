@@ -16,6 +16,45 @@ const CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const CANCELLED: &str = "媒体解码已取消。";
 static HEIF_DECODER: Mutex<()> = Mutex::new(());
+#[cfg(all(test, windows))]
+static CODEC_CPU_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, windows))]
+pub(crate) fn benchmark_cpu_micros() -> u64 {
+    CODEC_CPU_MICROS.load(Ordering::Relaxed)
+}
+
+#[cfg(all(test, windows))]
+fn record_codec_cpu(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::{FILETIME, HANDLE},
+        System::Threading::GetProcessTimes,
+    };
+
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    // Child keeps the process handle alive after wait has collected its exit status.
+    if unsafe {
+        GetProcessTimes(
+            HANDLE(child.as_raw_handle()),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    }
+    .is_ok()
+    {
+        let ticks =
+            |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        CODEC_CPU_MICROS.fetch_add((ticks(kernel) + ticks(user)) / 10, Ordering::Relaxed);
+    }
+}
 
 pub(crate) fn is_heif(path: &Path) -> bool {
     path.extension()
@@ -73,6 +112,14 @@ pub(crate) fn convert(
     let limit_arg = CONVERSION_LIMIT.to_string();
     let mut command = media_command("ffmpeg")?;
     command.args(["-nostdin", "-filter_threads", "2"]);
+    let input_threads = if cfg!(test)
+        && matches!(&input, Input::Mov(_))
+        && std::env::var_os("PHOTOSYS_AI_BENCHMARK_HEIC_THREADS").is_some_and(|value| value == "4")
+    {
+        "4"
+    } else {
+        "2"
+    };
     let (source, protocol, demuxer, stdin) = match input {
         Input::Mov(path) => (path, "file", "mov", Stdio::null()),
         // Unlike pipe:, fd: can seek in a regular file, including to a trailing MOV index.
@@ -83,7 +130,7 @@ pub(crate) fn convert(
     }
     let mut child = command
         .args(["-protocol_whitelist", protocol, "-f", demuxer])
-        .args(["-threads", "2", "-max_pixels", "64000000", "-i"])
+        .args(["-threads", input_threads, "-max_pixels", "64000000", "-i"])
         .arg(source)
         .args(output_args)
         .args(["-map_metadata", "-1", "-threads", "2", "-fs", &limit_arg])
@@ -94,7 +141,10 @@ pub(crate) fn convert(
         .spawn()
         .map_err(|error| format!("无法启动随应用安装的媒体解码器。{error}"))?;
 
-    if !wait(&mut child, cancelled, CONVERSION_TIMEOUT)?.success() {
+    let status = wait(&mut child, cancelled, CONVERSION_TIMEOUT);
+    #[cfg(all(test, windows))]
+    record_codec_cpu(&child);
+    if !status?.success() {
         return Err("媒体文件无法解码。".into());
     }
     let file = File::open(output).map_err(|_| "媒体文件无法解码。")?;

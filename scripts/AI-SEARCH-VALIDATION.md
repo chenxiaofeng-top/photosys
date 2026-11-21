@@ -136,6 +136,51 @@ cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib mainten
 
 `PHOTOSYS_AI_BENCHMARK_WORKLOAD` 可设为 `both`、`search` 或 `people`。`PHOTOSYS_AI_BENCHMARK_PHOTOS` 默认为 40，使用 1,000 张时保持单人、多人、图案和 48 MP HEIC 的比例。每轮从空白索引开始，随后复扫并验证所有结果均被复用。输出包括模型加载与预热时间、实际解码次数、共享次数、解码与 GPU 等待时间、向量及人脸结果指纹。更改线程数时使用独立测试进程，可用 `PHOTOSYS_AI_BENCHMARK_CPU_THREADS` 在至少 12 个逻辑线程的 CPU 测试机上试跑 2、4、6 或 8 个推理线程。
 
+### 真实图库前后对照
+
+设置 `PHOTOSYS_AI_BENCHMARK_ALBUM` 为原片目录，设置 `PHOTOSYS_AI_BENCHMARK_OUTPUT` 为图库之外已创建的结果目录。基准直接读取原片，每轮在结果目录下新建 `trial-N`，存放 SQLite 索引和 `photos.json`。每次前后对照使用两个结果目录。基准在结束后复查符合索引条件的照片清单。结果目录中的照片清单包含原片的相对路径。
+
+```powershell
+$env:PHOTOSYS_AI_BENCHMARK_ALBUM = 'E:\path\to\album'
+$env:PHOTOSYS_AI_BENCHMARK_OUTPUT = (New-Item -ItemType Directory src-tauri/target/real-ai-baseline).FullName
+$env:PHOTOSYS_MODEL_OPTIONS_DIR = 'E:\path\to\models'
+$env:PHOTOSYS_AI_BENCHMARK_SEARCH_MODEL = 'chinese-clip-vit-l14-336px-fp32-v1'
+$env:PHOTOSYS_AI_BENCHMARK_PEOPLE_MODEL = 'yunet-auraface-fp32-v1'
+$env:PHOTOSYS_AI_BENCHMARK_BACKEND = 'directml'
+$env:PHOTOSYS_AI_BENCHMARK_MODE = 'pipeline'
+$env:PHOTOSYS_AI_BENCHMARK_WORKLOAD = 'both'
+$env:PHOTOSYS_AI_BENCHMARK_TRIALS = '1'
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib --no-run
+$testExecutable = Get-ChildItem src-tauri/target/release/deps -Filter 'photosys_lib-*.exe' |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+# 保留基线构建时，将测试程序副本放在原来的 release/deps 目录。
+./scripts/measure-ai-index.ps1 -Runner $testExecutable -OutputDirectory $env:PHOTOSYS_AI_BENCHMARK_OUTPUT
+```
+
+真实图库计时覆盖已预热模型对待索引照片的处理和写入，目录扫描、模型加载和无变化复扫分别计时。前台缩略图及查询 P95 使用合成图库测量。日志记录选用的模型、实际推理后端和每项索引的成功数、失败数、复用数。Windows 测量脚本单独记录主进程 CPU 时间、工作集和 NVIDIA GPU 利用率及显存，基准日志另外记录 FFmpeg 子进程的累计 CPU 时间。
+
+对照实验每次只改一个选项。`PHOTOSYS_AI_BENCHMARK_FIXED_CLIP=1` 为合并的 L/14 模型尝试 DirectML 固定形状，日志中的 `fixed_clip_shape` 表示最终是否使用该会话。`PHOTOSYS_AI_BENCHMARK_HEIC_THREADS=4` 将 FFmpeg 的 HEIC 输入解码线程从 2 改为 4。CPU 单任务快速预处理使用 `PHOTOSYS_AI_BENCHMARK_OPTIMIZED_CPU=1` 和 `pipeline` 模式。
+
+2026-11-21 在 i7-9750H / GTX 1650 上使用 Release 构建，150 张混合照片每组运行三轮。固定形状使用 L/14 336px 单项内容索引，其他两组使用 B/16 和 SFace 双项索引。
+
+| 实验 | 建库耗时中位数（秒） | 缩略图 P95（毫秒） | 搜索 P95（毫秒） |
+| --- | ---: | ---: | ---: |
+| L/14 336px DirectML 固定形状 | 84.702 → 83.644 | 14.579 → 14.737 | 525.934 → 516.244 |
+| HEIC 输入解码 2 → 4 线程 | 13.964 → 14.193 | 23.341 → 23.535 | 38.751 → 33.788 |
+| CPU 单任务快速预处理 | 68.958 → 54.622 | 28.962 → 28.288 | 90.709 → 101.551 |
+
+同一对照组前后索引指纹均相同。固定形状节省 1.25%，HEIC 4 线程增加 1.64%，CPU 快速预处理节省 20.79% 且搜索 P95 增加 11.95%。三个方案均未达到建库至少快 10% 且两项前台 P95 增幅均至多 10% 的门槛。
+
+同机对真实图库中的 633 张可索引照片做两次完整建库，使用 L/14 336px 与 YuNet + AuraFace。两轮的模型配置和 DirectML 执行路径相同，差值反映同配置的重复测量波动。
+
+| 任务 | 基线（秒） | 验收复测（秒） | 耗时差（秒） |
+| --- | ---: | ---: | ---: |
+| 媒体库 AI | 239.751 | 230.940 | 8.811 |
+| 人物 AI | 183.782 | 176.326 | 7.456 |
+| 两项总耗时 | 423.533 | 407.267 | 16.266（3.84%） |
+
+两轮的照片清单和索引指纹相同。每项各成功 633 张、失败 0 张，共检出 793 个人脸。目录扫描用时 1.089 秒与 0.927 秒，模型加载和预热用时 8.718 秒与 7.271 秒。建库期间 GPU 平均占用 49.7% 与 47.8%，显存峰值分别为 2,328 MiB 与 2,034 MiB。FFmpeg 子进程分别累计使用 641.094 与 633.812 CPU 秒。
+
 ### 等价缩放、共享解码与推理调度
 
 在同一台 Windows x64 测试机上，使用发布构建、默认模型和同一组 40 张照片各测三轮。CPU 对照在单任务流水线中试验快速预处理，DirectML 允许两项索引同时运行。耗时为三轮中位数，P95 合并三轮采样。可设置 `PHOTOSYS_AI_BENCHMARK_OPTIMIZED_CPU=1` 复现 CPU 试验路径。

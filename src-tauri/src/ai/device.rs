@@ -102,7 +102,7 @@ pub(crate) fn ai_set_inference_preference(
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct SessionStatus {
+pub(crate) struct SessionStatus {
     pub(super) directml: bool,
     pub(super) fallback: Option<String>,
 }
@@ -148,7 +148,7 @@ pub(crate) struct SessionDevice {
 }
 
 impl SessionDevice {
-    pub(super) fn cpu() -> Self {
+    pub(crate) fn cpu() -> Self {
         Self {
             status: SessionStatus {
                 directml: false,

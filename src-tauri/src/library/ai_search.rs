@@ -208,10 +208,10 @@ fn is_writable(scan: &Scan) -> bool {
     let Ok(Some(dir)) = favorites::data_directory(&scan.root) else {
         return false;
     };
-    if tempfile::NamedTempFile::new_in(dir).is_err() {
+    if tempfile::NamedTempFile::new_in(&dir).is_err() {
         return false;
     }
-    let path = scan.root.path.join(".photosys/ai.sqlite");
+    let path = dir.join("ai.sqlite");
     if path.exists() {
         Connection::open_with_flags(
             &path,

@@ -52,6 +52,15 @@ pub(crate) fn tokenizer(vocab: &Path) -> Result<Tokenizer, String> {
 }
 
 fn session(path: &Path, device: &SessionDevice, directml: bool) -> Result<Session, String> {
+    session_with_image_size(path, device, directml, None)
+}
+
+fn session_with_image_size(
+    path: &Path,
+    device: &SessionDevice,
+    directml: bool,
+    fixed_image_size: Option<usize>,
+) -> Result<Session, String> {
     let logical = std::thread::available_parallelism().map_or(1, usize::from);
     let threads = (logical / 2).clamp(1, 4);
     #[cfg(test)]
@@ -106,10 +115,24 @@ fn session(path: &Path, device: &SessionDevice, directml: bool) -> Result<Sessio
     } else {
         builder
     };
-    let _ = (device, directml);
+    let _ = (device, directml, fixed_image_size);
     let mut builder = builder;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     if directml {
+        if let Some(size) = fixed_image_size {
+            for (dimension, value) in [
+                ("image_batch_size", 1),
+                ("text_batch_size", 1),
+                ("sequence_length", 52),
+                ("num_channels", 3),
+                ("height", size as i64),
+                ("width", size as i64),
+            ] {
+                builder = builder
+                    .with_dimension_override(dimension, value)
+                    .map_err(error)?;
+            }
+        }
         let attributes = match path.file_name().and_then(|name| name.to_str()) {
             Some("cn_clip_text.onnx") => 48,
             Some("cn_clip_vision.onnx") => 49,
@@ -149,6 +172,7 @@ fn directml_clip_model(path: &Path, expected_attributes: usize) -> Result<Vec<u8
 struct ActiveSession {
     session: Option<Session>,
     status: SessionStatus,
+    fixed_image_shape: bool,
 }
 
 pub(super) struct InferenceSession {
@@ -167,14 +191,40 @@ pub(super) enum Work<'a> {
 
 impl InferenceSession {
     pub(super) fn open(path: PathBuf, device: &SessionDevice) -> Result<Self, String> {
+        Self::open_with_image_size(path, device, None)
+    }
+
+    fn open_with_image_size(
+        path: PathBuf,
+        device: &SessionDevice,
+        fixed_image_size: Option<usize>,
+    ) -> Result<Self, String> {
         let mut status = device.status.clone();
-        let session = match session(&path, device, status.directml) {
-            Err(e) if status.directml => {
-                status.directml = false;
-                status.fallback = Some(format!("DirectML 会话初始化失败。{e}"));
-                session(&path, device, false)?
+        let fixed = fixed_image_size
+            .filter(|_| status.directml)
+            .and_then(
+                |size| match session_with_image_size(&path, device, true, Some(size)) {
+                    Ok(session) => Some(session),
+                    Err(e) => {
+                        #[cfg(test)]
+                        eprintln!("Fixed-shape DirectML initialization failed: {e}");
+                        let _ = e;
+                        None
+                    }
+                },
+            );
+        let fixed_image_shape = fixed.is_some();
+        let session = if let Some(fixed) = fixed {
+            fixed
+        } else {
+            match session(&path, device, status.directml) {
+                Err(e) if status.directml => {
+                    status.directml = false;
+                    status.fallback = Some(format!("DirectML 会话初始化失败。{e}"));
+                    session(&path, device, false)?
+                }
+                result => result?,
             }
-            result => result?,
         };
         let inputs = session
             .inputs()
@@ -187,6 +237,7 @@ impl InferenceSession {
             active: Mutex::new(ActiveSession {
                 session: Some(session),
                 status,
+                fixed_image_shape,
             }),
             inputs,
         })
@@ -244,7 +295,23 @@ impl InferenceSession {
         let directml = active.status.directml;
         let cancelled = || "AI 分析已停止。".to_string();
         match execute(active.session.as_mut().unwrap(), directml)?.ok_or_else(cancelled)? {
-            Err(e) if directml => {
+            Err(mut e) if directml => {
+                if active.fixed_image_shape {
+                    #[cfg(test)]
+                    eprintln!("Fixed-shape DirectML execution failed: {e}");
+                    active.fixed_image_shape = false;
+                    active.session = None;
+                    match session(&self.path, &self.device, true) {
+                        Ok(dynamic) => {
+                            let session = active.session.insert(dynamic);
+                            match execute(session, true)?.ok_or_else(cancelled)? {
+                                Ok(result) => return Ok(result),
+                                Err(error) => e = error,
+                            }
+                        }
+                        Err(error) => e = error,
+                    }
+                }
                 active.status.directml = false;
                 active.status.fallback = Some(format!("DirectML 推理失败。{e}"));
                 // Drop the GPU session before loading CPU weights.
@@ -334,14 +401,20 @@ impl Runtime {
         device: &SessionDevice,
     ) -> Result<Self, String> {
         let combined = spec.backend == "combined";
+        let fixed_image_size = (combined
+            && cfg!(test)
+            && std::env::var_os("PHOTOSYS_AI_BENCHMARK_FIXED_CLIP")
+                .is_some_and(|value| value == "1"))
+        .then_some(spec.image_size);
         let runtime = Self {
-            vision: InferenceSession::open(
+            vision: InferenceSession::open_with_image_size(
                 directory.join(if combined {
                     "model.onnx"
                 } else {
                     "cn_clip_vision.onnx"
                 }),
                 device,
+                fixed_image_size,
             )?,
             text: if combined {
                 None
@@ -365,7 +438,7 @@ impl Runtime {
         )?;
         Ok(runtime)
     }
-    pub(super) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
+    pub(crate) fn inference_status(&self) -> Result<Vec<SessionStatus>, String> {
         let mut sessions = vec![self.vision.status()?];
         if let Some(text) = &self.text {
             sessions.push(text.status()?);
@@ -374,6 +447,11 @@ impl Runtime {
     }
     pub(crate) fn uses_directml_for_index(&self) -> Result<bool, String> {
         Ok(self.vision.status()?.directml)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_fixed_image_shape(&self) -> bool {
+        self.vision.active.lock().unwrap().fixed_image_shape
     }
     #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
     pub(crate) fn end_profiles(&self) -> Vec<String> {

@@ -64,7 +64,7 @@ fn fixture_album(path: &Path, portrait: &Path, people: &FaceRuntime, count: usiz
     }
 }
 
-fn cpu_models(root: &Path) -> (Runtime, FaceRuntime) {
+fn initialize_cpu() {
     let runtime_file = if cfg!(windows) {
         "onnxruntime.dll"
     } else if cfg!(target_os = "macos") {
@@ -79,28 +79,25 @@ fn cpu_models(root: &Path) -> (Runtime, FaceRuntime) {
             .join(runtime_file),
     )
     .unwrap();
+}
+
+fn cpu_models(root: &Path) -> (Runtime, FaceRuntime) {
+    initialize_cpu();
     (
         Runtime::load(&root.join(crate::ai::MODEL_ID)).unwrap(),
         FaceRuntime::load(&root.join("yunet-sface-fp32-v1")).unwrap(),
     )
 }
 
-fn gpu_models(root: &Path) -> (Runtime, FaceRuntime) {
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    {
-        let device = crate::ai::device_tests::directml_device();
-        let search = catalog::active(ModelKind::Search);
-        let people = catalog::active(ModelKind::People);
-        (
-            Runtime::load_with_device(&root.join(search.id), search, &device).unwrap(),
-            FaceRuntime::load_with_device(&root.join(people.id), people, &device).unwrap(),
-        )
-    }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    {
-        let _ = root;
+fn benchmark_device(gpu: bool) -> crate::ai::device::SessionDevice {
+    if gpu {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        return crate::ai::device_tests::directml_device();
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
         panic!("DirectML benchmark requires Windows x64");
     }
+    initialize_cpu();
+    crate::ai::device::SessionDevice::cpu()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +107,12 @@ enum Workload {
     Both,
 }
 
+struct JobResult {
+    counts: [usize; 3],
+    elapsed: Duration,
+    stages: Measurements,
+}
+
 fn index(
     id: u64,
     mode: Mode,
@@ -117,7 +120,7 @@ fn index(
     search: &Arc<Runtime>,
     people: &Arc<FaceRuntime>,
     workload: Workload,
-) -> ([usize; 3], [usize; 3], Measurements, Measurements) {
+) -> (JobResult, JobResult) {
     let search_run = Run {
         mode,
         timings: Some(Timings::default()),
@@ -127,6 +130,7 @@ fn index(
         timings: Some(Timings::default()),
     };
     let index_search = || {
+        let started = Instant::now();
         let _database = crate::database_access::read().unwrap();
         let status = ai_search::update_with_run(
             id,
@@ -136,9 +140,13 @@ fn index(
             || Ok(search.clone()),
         )
         .unwrap();
-        [status.indexed, status.failed, status.reused]
+        (
+            [status.indexed, status.failed, status.reused],
+            started.elapsed(),
+        )
     };
     let index_people = || {
+        let started = Instant::now();
         let _database = crate::database_access::read().unwrap();
         let status = people::update_with_run(
             id,
@@ -148,11 +156,14 @@ fn index(
             || Ok(people.clone()),
         )
         .unwrap();
-        [status.indexed, status.failed, status.reused]
+        (
+            [status.indexed, status.failed, status.reused],
+            started.elapsed(),
+        )
     };
-    let (search, people) = match workload {
-        Workload::Search => (index_search(), [0; 3]),
-        Workload::People => ([0; 3], index_people()),
+    let ((search, search_elapsed), (people, people_elapsed)) = match workload {
+        Workload::Search => (index_search(), ([0; 3], Duration::ZERO)),
+        Workload::People => (([0; 3], Duration::ZERO), index_people()),
         Workload::Both if matches!(mode, Mode::ConcurrentCpu | Mode::ConcurrentDirectMl) => {
             thread::scope(|scope| {
                 let worker = scope.spawn(index_people);
@@ -162,21 +173,17 @@ fn index(
         Workload::Both => (index_search(), index_people()),
     };
     (
-        search,
-        people,
-        search_run.timings.unwrap().measurements(),
-        people_run.timings.unwrap().measurements(),
+        JobResult {
+            counts: search,
+            elapsed: search_elapsed,
+            stages: search_run.timings.unwrap().measurements(),
+        },
+        JobResult {
+            counts: people,
+            elapsed: people_elapsed,
+            stages: people_run.timings.unwrap().measurements(),
+        },
     )
-}
-
-fn index_both(
-    id: u64,
-    mode: Mode,
-    automatic: bool,
-    search: &Arc<Runtime>,
-    people: &Arc<FaceRuntime>,
-) -> ([usize; 3], [usize; 3], Measurements, Measurements) {
-    index(id, mode, automatic, search, people, Workload::Both)
 }
 
 fn p95(samples: &mut [f64]) -> f64 {
@@ -190,10 +197,11 @@ fn foreground(scan: Arc<Scan>, search: &Runtime, stop: mpsc::Receiver<()>) -> (V
         .items
         .iter()
         .filter(|item| {
-            item.file
-                .relative
-                .extension()
-                .is_some_and(|ext| ext == "jpg")
+            item.preview_available
+                && item.kind == Kind::Photo
+                && item.file.relative.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg")
+                })
         })
         .map(|item| item.file.id)
         .collect();
@@ -206,8 +214,9 @@ fn foreground(scan: Arc<Scan>, search: &Runtime, stop: mpsc::Receiver<()>) -> (V
         .zip(["人像", "红蓝方格", "三个人"].into_iter().cycle())
     {
         let started = Instant::now();
-        scan.preview(preview_id, false).unwrap();
-        preview_times.push(started.elapsed().as_secs_f64() * 1000.);
+        if scan.preview(preview_id, false).is_ok() {
+            preview_times.push(started.elapsed().as_secs_f64() * 1000.);
+        }
         let started = Instant::now();
         query(text).unwrap();
         search_times.push(started.elapsed().as_secs_f64() * 1000.);
@@ -221,10 +230,10 @@ fn foreground(scan: Arc<Scan>, search: &Runtime, stop: mpsc::Receiver<()>) -> (V
     (preview_times, search_times)
 }
 
-fn snapshot(album: &Path, workload: Workload) -> (usize, String) {
+fn snapshot(data: &Path, workload: Workload) -> (usize, String) {
     let mut hash = Sha256::new();
     if workload != Workload::People {
-        let search = Connection::open(album.join(".photosys/ai.sqlite")).unwrap();
+        let search = Connection::open(data.join("ai.sqlite")).unwrap();
         let mut statement = search
             .prepare("SELECT path,vector FROM embeddings ORDER BY path")
             .unwrap();
@@ -242,7 +251,7 @@ fn snapshot(album: &Path, workload: Workload) -> (usize, String) {
     if workload == Workload::Search {
         return (0, format!("{:x}", hash.finalize()));
     }
-    let people = Connection::open(album.join(".photosys/people.sqlite")).unwrap();
+    let people = Connection::open(data.join("people.sqlite")).unwrap();
     let mut statement = people
         .prepare("SELECT path,person_id,vector,bbox,confidence,thumbnail FROM faces WHERE active=1 ORDER BY path,id")
         .unwrap();
@@ -272,12 +281,51 @@ fn snapshot(album: &Path, workload: Workload) -> (usize, String) {
     (faces, format!("{:x}", hash.finalize()))
 }
 
+fn album_manifest(scan: &Scan) -> Vec<(String, String)> {
+    let mut photos: Vec<_> = scan
+        .items
+        .iter()
+        .filter(|item| item.kind == Kind::Photo && item.preview_available)
+        .map(|item| {
+            let stamp = item.file.stamp.cache_key();
+            (
+                item.file.path_label(),
+                format!("{:x}", Sha256::digest(&stamp)),
+            )
+        })
+        .collect();
+    photos.sort_unstable();
+    photos
+}
+
+fn select_benchmark_model(kind: ModelKind, name: &str) -> &'static catalog::ModelSpec {
+    let model = std::env::var(name)
+        .map(|id| catalog::find(kind, &id).unwrap())
+        .unwrap_or_else(|_| catalog::default_model(kind));
+    catalog::select(model);
+    model
+}
+
 #[test]
-#[ignore = "requires existing B/16, SFace and a portrait fixture; run in release mode in a separate process per backend and mode"]
+#[ignore = "requires installed models; run in release mode in a separate process per configuration"]
 fn benchmark_index_pipeline() {
     let _session = TEST_SESSION.lock().unwrap();
     let models = PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_DIR").unwrap());
-    let portrait = PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_PORTRAIT").unwrap());
+    let real_album = std::env::var_os("PHOTOSYS_AI_BENCHMARK_ALBUM").map(PathBuf::from);
+    let data_parent = real_album.as_ref().map(|album| {
+        let parent = PathBuf::from(std::env::var_os("PHOTOSYS_AI_BENCHMARK_OUTPUT").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(!parent.starts_with(album.canonicalize().unwrap()));
+        parent
+    });
+    let portrait = real_album
+        .is_none()
+        .then(|| PathBuf::from(std::env::var_os("PHOTOSYS_MODEL_OPTIONS_PORTRAIT").unwrap()));
+    let search_model =
+        select_benchmark_model(ModelKind::Search, "PHOTOSYS_AI_BENCHMARK_SEARCH_MODEL");
+    let people_model =
+        select_benchmark_model(ModelKind::People, "PHOTOSYS_AI_BENCHMARK_PEOPLE_MODEL");
     let gpu = std::env::var("PHOTOSYS_AI_BENCHMARK_BACKEND").as_deref() == Ok("directml");
     let mode = match std::env::var("PHOTOSYS_AI_BENCHMARK_MODE").as_deref() {
         Ok("serial") => Mode::Serial,
@@ -285,7 +333,8 @@ fn benchmark_index_pipeline() {
         Ok("concurrent") if gpu => Mode::ConcurrentDirectMl,
         Ok("concurrent") => Mode::ConcurrentCpu,
         _ => panic!("Set PHOTOSYS_AI_BENCHMARK_MODE to serial, pipeline, or concurrent"),
-    };
+    }
+    .for_active_models();
     let trials = std::env::var("PHOTOSYS_AI_BENCHMARK_TRIALS")
         .ok()
         .map_or(3, |value| value.parse::<usize>().unwrap());
@@ -301,61 +350,136 @@ fn benchmark_index_pipeline() {
         _ => panic!("Set PHOTOSYS_AI_BENCHMARK_WORKLOAD to search, people, or both"),
     };
     println!(
-        "pid={} mode={mode:?} workload={workload:?} photos={count} backend={} threads={}",
+        "pid={} mode={mode:?} workload={workload:?} synthetic_photos={count} requested_backend={} threads={} search_model={} people_model={}",
         std::process::id(),
         if gpu { "DirectML" } else { "CPU" },
-        thread::available_parallelism().unwrap()
+        thread::available_parallelism().unwrap(),
+        search_model.id,
+        people_model.id,
     );
     let load_started = Instant::now();
-    let (search, people) = if gpu {
-        gpu_models(&models)
-    } else {
-        cpu_models(&models)
-    };
-    println!(
-        "model_load_and_warmup={:.3}s",
-        load_started.elapsed().as_secs_f64()
+    let device = benchmark_device(gpu);
+    let search = Arc::new(
+        Runtime::load_with_device(&models.join(search_model.id), search_model, &device).unwrap(),
     );
-    let search = Arc::new(search);
-    let people = Arc::new(people);
+    let search_load = load_started.elapsed();
+    let started = Instant::now();
+    let people = Arc::new(
+        FaceRuntime::load_with_device(&models.join(people_model.id), people_model, &device)
+            .unwrap(),
+    );
+    let people_load = started.elapsed();
+    println!(
+        "model_load_and_warmup={:.3}s search_load={:.3}s people_load={:.3}s",
+        load_started.elapsed().as_secs_f64(),
+        search_load.as_secs_f64(),
+        people_load.as_secs_f64(),
+    );
     let mut totals = Vec::new();
     let mut preview_samples = Vec::new();
     let mut search_samples = Vec::new();
     let mut fingerprint = None;
     for trial in 1..=trials {
-        let album = tempfile::tempdir().unwrap();
-        fixture_album(album.path(), &portrait, &people, count);
-        let scan_id = open_directory(album.path().to_str().unwrap(), OpenMode::Select, |_| {})
-            .unwrap()
-            .scan_id;
-        let scan = scan(scan_id).unwrap();
-        let (signal, stop) = mpsc::channel();
-        let (elapsed, statuses, (preview, queries)) = thread::scope(|scope| {
-            let observer = scope.spawn(|| foreground(scan, &search, stop));
+        let synthetic_album = portrait.as_ref().map(|portrait| {
+            let album = tempfile::tempdir().unwrap();
+            fixture_album(album.path(), portrait, &people, count);
+            album
+        });
+        let scan_started = Instant::now();
+        let (summary, data) =
+            if let Some((album, parent)) = real_album.as_ref().zip(data_parent.as_ref()) {
+                let data = parent.join(format!("trial-{trial}"));
+                fs::create_dir(&data).expect("The benchmark requires a fresh data directory");
+                let mut root = Root::new(album).unwrap();
+                root.test_data_directory = Some(data.clone());
+                let keys = favorites::initialize(&root).unwrap();
+                (open_library(root, keys, |_| {}).unwrap(), data)
+            } else {
+                let album = synthetic_album.as_ref().unwrap().path();
+                (
+                    open_directory(album.to_str().unwrap(), OpenMode::Select, |_| {}).unwrap(),
+                    album.join(".photosys"),
+                )
+            };
+        let scan_id = summary.scan_id;
+        let scanned = scan(scan_id).unwrap();
+        let manifest = album_manifest(&scanned);
+        let eligible = manifest.len();
+        assert!(eligible > 0);
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_digest = Sha256::digest(&manifest_bytes);
+        if real_album.is_some() {
+            fs::write(data.join("photos.json"), manifest_bytes).unwrap();
+        }
+        println!(
+            "scan={:.3}s media={} issues={} eligible_photos={eligible} manifest={manifest_digest:x}",
+            scan_started.elapsed().as_secs_f64(),
+            summary.total,
+            summary.issues,
+        );
+        println!("index_started trial={trial}");
+        #[cfg(windows)]
+        let codec_cpu_before = crate::media_codec::benchmark_cpu_micros();
+        let (elapsed, (search_job, people_job), foreground_samples) = if real_album.is_some() {
             let started = Instant::now();
             let statuses = index(scan_id, mode, false, &search, &people, workload);
-            let elapsed = started.elapsed();
-            signal.send(()).unwrap();
-            (elapsed, statuses, observer.join().unwrap())
-        });
-        let (search_status, people_status, search_stages, people_stages) = statuses;
+            (started.elapsed(), statuses, None)
+        } else {
+            let (signal, stop) = mpsc::channel();
+            thread::scope(|scope| {
+                let observer = scope.spawn(|| foreground(scanned.clone(), &search, stop));
+                let started = Instant::now();
+                let statuses = index(scan_id, mode, false, &search, &people, workload);
+                let elapsed = started.elapsed();
+                signal.send(()).unwrap();
+                (elapsed, statuses, Some(observer.join().unwrap()))
+            })
+        };
+        println!(
+            "index_finished trial={trial} total={:.3}s search={:.3}s people={:.3}s search_counts={:?} people_counts={:?}",
+            elapsed.as_secs_f64(),
+            search_job.elapsed.as_secs_f64(),
+            people_job.elapsed.as_secs_f64(),
+            search_job.counts,
+            people_job.counts,
+        );
+        #[cfg(windows)]
+        println!(
+            "codec_cpu_seconds={:.3}",
+            (crate::media_codec::benchmark_cpu_micros() - codec_cpu_before) as f64 / 1e6,
+        );
         let started = Instant::now();
-        let (search_reused, people_reused, search_rescan, people_rescan) =
-            index(scan_id, mode, true, &search, &people, workload);
+        let (search_reused, people_reused) = index(scan_id, mode, true, &search, &people, workload);
         let incremental = started.elapsed();
-        assert_eq!(search_rescan.decodes, [0, 0]);
-        assert_eq!(people_rescan.decodes, [0, 0]);
-        if workload != Workload::People {
-            assert_eq!(search_status, [count, 0, 0]);
-            assert_eq!(search_reused, [count, 0, count]);
+        for (run, reused) in [(&search_job, &search_reused), (&people_job, &people_reused)] {
+            assert_eq!(reused.stages.decodes, [0, 0]);
+            let [indexed, failed, reused_before] = run.counts;
+            assert_eq!(reused_before, 0);
+            assert_eq!(reused.counts, [indexed, failed, indexed]);
         }
-        if workload != Workload::Search {
-            assert_eq!(people_status, [count, 0, 0]);
-            assert_eq!(people_reused, [count, 0, count]);
+        for run in [
+            (workload != Workload::People).then_some(&search_job),
+            (workload != Workload::Search).then_some(&people_job),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert_eq!(run.counts[0] + run.counts[1], eligible);
+            if real_album.is_none() {
+                assert_eq!(run.counts, [count, 0, 0]);
+            }
         }
-        let (faces, digest) = snapshot(album.path(), workload);
+        if real_album.is_some() {
+            let current = Scan::read(scan_id, scanned.root.clone(), |_| {});
+            assert_eq!(
+                manifest,
+                album_manifest(&current),
+                "Album changed during indexing"
+            );
+        }
+        let (faces, digest) = snapshot(&data, workload);
         assert!(
-            workload == Workload::Search || faces > count * 3 / 10,
+            real_album.is_some() || workload == Workload::Search || faces > count * 3 / 10,
             "multiface fixture yielded only {faces} faces"
         );
         if let Some(expected) = &fingerprint {
@@ -368,25 +492,43 @@ fn benchmark_index_pipeline() {
         );
         println!(
             "stages ms [decode, prepare, inference, write, group, decode wait, GPU wait, model load]: search {:.1?}, people {:.1?}; decode [actual, reused]: search {:?}, people {:?}",
-            search_stages.millis,
-            people_stages.millis,
-            search_stages.decodes,
-            people_stages.decodes
+            search_job.stages.millis,
+            people_job.stages.millis,
+            search_job.stages.decodes,
+            people_job.stages.decodes
         );
         fingerprint = Some(digest);
         totals.push(elapsed);
-        preview_samples.extend(preview);
-        search_samples.extend(queries);
+        if let Some((preview, queries)) = foreground_samples {
+            preview_samples.extend(preview);
+            search_samples.extend(queries);
+        }
         *session().unwrap() = None;
     }
     totals.sort_unstable();
     println!(
         "median_total={:.3}s preview_p95={:.3}ms search_p95={:.3}ms samples={}",
         totals[totals.len() / 2].as_secs_f64(),
-        p95(&mut preview_samples),
-        p95(&mut search_samples),
+        if preview_samples.is_empty() {
+            f64::NAN
+        } else {
+            p95(&mut preview_samples)
+        },
+        if search_samples.is_empty() {
+            f64::NAN
+        } else {
+            p95(&mut search_samples)
+        },
         search_samples.len()
     );
+    println!(
+        "actual_backends={}",
+        serde_json::json!({
+            "search": search.inference_status().unwrap(),
+            "people": people.inference_status().unwrap(),
+        })
+    );
+    println!("fixed_clip_shape={}", search.uses_fixed_image_shape());
     #[cfg(all(windows, target_arch = "x86_64"))]
     if gpu {
         crate::ai::device_tests::assert_directml_active(&search, &people);
@@ -496,9 +638,15 @@ fn maintenance_stops_both_indexes_and_preserves_completed_work() {
     let id = open_directory(album.path().to_str().unwrap(), OpenMode::Select, |_| {})
         .unwrap()
         .scan_id;
-    let (search_done, people_done, _, _) =
-        index_both(id, Mode::ConcurrentCpu, true, &search, &people);
-    assert_eq!(search_done, [count, 0, search_partial]);
-    assert_eq!(people_done, [count, 0, people_partial]);
+    let (search_done, people_done) = index(
+        id,
+        Mode::ConcurrentCpu,
+        true,
+        &search,
+        &people,
+        Workload::Both,
+    );
+    assert_eq!(search_done.counts, [count, 0, search_partial]);
+    assert_eq!(people_done.counts, [count, 0, people_partial]);
     *session().unwrap() = None;
 }
