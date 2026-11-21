@@ -17,6 +17,17 @@ fn put(directory: &Path, name: &str, contents: &[u8]) {
     fs::write(path, contents).unwrap();
 }
 
+fn reported_date_ranges(report: &str) -> &str {
+    report
+        .split_once("成功复制媒体日期段：\n")
+        .unwrap()
+        .1
+        .split("\n\n")
+        .next()
+        .unwrap()
+        .trim_end()
+}
+
 fn photo_with_date() -> Vec<u8> {
     // TIFF header, IFD0 with an Exif IFD pointer, then one DateTimeOriginal entry.
     let mut tiff = b"II*\0\x08\0\0\0".to_vec();
@@ -106,6 +117,51 @@ fn sorts_using_filename_then_capture_time_and_preserves_live_photos() {
     assert!(report.contains("结束时间："));
     assert!(report.contains("成功复制：9"));
     assert!(report.contains("归入其它：2"));
+    assert_eq!(
+        reported_date_ranges(&report),
+        "2024-2-29-2024-2-29\n2025-5-1-2025-5-1\n2026-1-31-2026-1-31\n2026-6-7-2026-6-7\n2026-7-1-2026-7-1"
+    );
+}
+
+#[test]
+fn reports_sorted_unique_date_ranges_across_media_months_years_and_leap_days() {
+    let (_root, source, destination) = folders();
+    for name in [
+        "a_2026-09-15.jpg",
+        "b_2024-03-01.mov",
+        "c_2026-09-04.livp",
+        "d_2026-01-01.mp4",
+        "e_2024-02-28.jpg",
+        "f_2026-09-14.mp4",
+        "g_2025-12-31.png",
+        "h_2024-02-29.livp",
+        "i_2026-09-04.mov",
+        "j_2026-09-02.jpg",
+        "z_2026-09-01.jpg",
+    ] {
+        put(&source, name, b"media");
+    }
+
+    let summary = run(&source, &destination, |_| {}).unwrap();
+    assert_eq!((summary.copied, summary.failed), (11, 0));
+    let report = fs::read_to_string(summary.report_path.unwrap()).unwrap();
+    assert_eq!(
+        reported_date_ranges(&report),
+        "2024-2-28-2024-3-1\n2025-12-31-2026-1-1\n2026-9-1-2026-9-2\n2026-9-4-2026-9-4\n2026-9-14-2026-9-15"
+    );
+}
+
+#[test]
+fn reports_no_available_dates_when_all_copied_media_have_unknown_dates() {
+    let (_root, source, destination) = folders();
+    put(&source, "photo.jpg", b"no metadata");
+    put(&source, "video.mov", &video_with_date(None));
+
+    let summary = run(&source, &destination, |_| {}).unwrap();
+    assert_eq!((summary.copied, summary.other, summary.failed), (2, 2, 0));
+    let report = fs::read_to_string(summary.report_path.unwrap()).unwrap();
+    assert_eq!(reported_date_ranges(&report), "无可用日期");
+    assert!(report.contains("归入其它：2"));
 }
 
 #[test]
@@ -134,15 +190,16 @@ fn handles_same_size_collisions_and_finds_duplicates_past_gaps() {
     );
     assert!(!month.join("20230607_2.jpg").exists());
     let first_report = first.report_path.unwrap();
-    assert!(
-        fs::read_to_string(&first_report)
-            .unwrap()
-            .contains("重命名明细")
-    );
+    let report = fs::read_to_string(&first_report).unwrap();
+    assert!(report.contains("重命名明细"));
+    assert_eq!(reported_date_ranges(&report), "2023-6-7-2023-6-7");
 
     let second = run(&source, &destination, |_| {}).unwrap();
     assert_eq!((second.copied, second.duplicates, second.failed), (0, 3, 0));
-    assert_ne!(first_report, second.report_path.unwrap());
+    let second_report = second.report_path.unwrap();
+    assert_ne!(first_report, second_report);
+    let report = fs::read_to_string(second_report).unwrap();
+    assert_eq!(reported_date_ranges(&report), "无可用日期");
     assert!(Path::new(&first_report).exists());
 }
 
@@ -171,6 +228,7 @@ fn excludes_nested_destination_and_reports_partial_failures() {
     assert!(report.contains("复制失败：1"));
     assert!(report.contains("失败明细"));
     assert!(report.contains("2024-05-02.png"));
+    assert_eq!(reported_date_ranges(&report), "2026-5-2-2026-5-2");
 }
 
 #[test]
@@ -179,7 +237,8 @@ fn writes_a_report_for_an_empty_source() {
     let mut progress = Vec::new();
     let summary = run(&source, &destination, |update| progress.push(update)).unwrap();
     assert_eq!(summary.found, 0);
-    assert!(Path::new(&summary.report_path.unwrap()).is_file());
+    let report = fs::read_to_string(summary.report_path.unwrap()).unwrap();
+    assert_eq!(reported_date_ranges(&report), "无可用日期");
     assert_eq!(
         progress,
         [
@@ -208,6 +267,8 @@ fn reports_copy_duplicate_and_failure_in_processed_total() {
         (summary.copied, summary.duplicates, summary.failed),
         (1, 1, 1)
     );
+    let report = fs::read_to_string(summary.report_path.unwrap()).unwrap();
+    assert_eq!(reported_date_ranges(&report), "2026-6-1-2026-6-1");
     assert_eq!(
         progress.first(),
         Some(&ArchiveProgress::Scanning { found: 0 })

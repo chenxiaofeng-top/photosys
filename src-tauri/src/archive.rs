@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use nom_exif::MediaParser;
 use serde::Serialize;
 use tempfile::NamedTempFile;
@@ -61,6 +61,7 @@ pub struct ArchiveSummary {
 
 struct ArchiveRun {
     summary: ArchiveSummary,
+    copied_dates: BTreeSet<NaiveDate>,
     renames: Vec<(PathBuf, PathBuf)>,
     errors: Vec<(PathBuf, String)>,
 }
@@ -82,6 +83,7 @@ pub fn run(
     let started = Local::now();
     let mut job = ArchiveRun {
         summary: ArchiveSummary::default(),
+        copied_dates: BTreeSet::new(),
         renames: Vec::new(),
         errors: Vec::new(),
     };
@@ -218,6 +220,9 @@ impl ArchiveRun {
             Ok(Some((path, renamed))) => {
                 self.summary.copied += 1;
                 self.summary.other += u64::from(date.is_none());
+                if let Some(date) = date {
+                    self.copied_dates.insert(date);
+                }
                 if renamed {
                     self.summary.renamed += 1;
                     self.renames.push((source.to_path_buf(), path));
@@ -239,6 +244,28 @@ impl ArchiveRun {
         writeln!(writer, "归入其它：{}", summary.other)?;
         writeln!(writer, "复制失败：{}", summary.failed)?;
         writeln!(writer, "扫描错误：{}", summary.scan_errors)?;
+
+        writeln!(writer, "\n成功复制媒体日期段：")?;
+        if self.copied_dates.is_empty() {
+            writeln!(writer, "无可用日期")?;
+        }
+        let mut dates = self.copied_dates.iter().copied().peekable();
+        while let Some(start) = dates.next() {
+            let mut end = start;
+            while let Some(&next) = dates.peek() {
+                if end.succ_opt() != Some(next) {
+                    break;
+                }
+                end = next;
+                dates.next();
+            }
+            writeln!(
+                writer,
+                "{}-{}",
+                start.format("%Y-%-m-%-d"),
+                end.format("%Y-%-m-%-d")
+            )?;
+        }
 
         if !self.renames.is_empty() {
             writeln!(writer, "\n重命名明细")?;
