@@ -14,6 +14,8 @@ import MediaDetailsInfo from "./MediaDetailsInfo.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import DatabaseBackup from "./DatabaseBackup.vue";
+import DateFilterPicker from "./DateFilterPicker.vue";
+import { ALL_DATES, UNKNOWN_DATES, monthDateRange, sameDateFilter, type DateFilter } from "./dateFilter";
 import type { DatabaseRestoreResult, LibrarySummary } from "./databaseBackup";
 import PeoplePanel from "./PeoplePanel.vue";
 import AlbumsPanel from "./AlbumsPanel.vue";
@@ -61,9 +63,10 @@ const itemsError = ref("");
 const issuesError = ref("");
 
 const kind = ref<Kind | "all">("all");
-const dateMode = ref<"all" | "range" | "unknown">("all");
-const from = ref("");
-const to = ref("");
+const dateFilter = shallowRef<DateFilter>(ALL_DATES);
+function setDateFilter(next: DateFilter) {
+  if (!sameDateFilter(dateFilter.value, next)) dateFilter.value = next;
+}
 const favoritesOnly = ref(false);
 const locationMode = ref<LocationMode>("all");
 const locationSelection = shallowRef<Selection | null>(null);
@@ -121,18 +124,16 @@ function personChanged() { peopleRevision.value++; revision.value++; }
 function selectPerson(person: Person | undefined) {
   selectedPerson.value = person;
   requestedPage.value = 0;
-  if (person) { dateMode.value = "all"; from.value = ""; to.value = ""; favoritesOnly.value = false; sort.value = "dateAsc"; }
+  if (person) { dateFilter.value = ALL_DATES; favoritesOnly.value = false; sort.value = "dateAsc"; }
 }
 function selectMonth(month: string | null) {
-  if (month === null) { dateMode.value = "unknown"; return; }
-  from.value = `${month}-01`;
-  const [year, number] = month.split("-").map(Number);
-  const end = new Date(Date.UTC(year!, number!, 0)).getUTCDate();
-  to.value = `${month}-${String(end).padStart(2, "0")}`;
-  dateMode.value = "range";
+  setDateFilter(month === null ? UNKNOWN_DATES : monthDateRange(month));
+}
+function monthSelected(month: string | null) {
+  return sameDateFilter(dateFilter.value, month === null ? UNKNOWN_DATES : monthDateRange(month));
 }
 function monthTitle(date: string | null) { return date ? `${date.slice(0, 4)} 年 ${Number(date.slice(5, 7))} 月` : "日期未知"; }
-let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateMode: typeof dateMode.value; from: string; to: string; favoritesOnly: boolean; input: string; query: string } | undefined;
+let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateFilter: DateFilter; favoritesOnly: boolean; input: string; query: string } | undefined;
 const composing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 const searchPending = computed(() => searchMode.value === "filename" && (composing.value || searchInput.value.trim() !== query.value));
@@ -172,9 +173,9 @@ watch(searchInput, scheduleSearch);
 const filter = computed(() => ({
   query: query.value,
   kind: kind.value === "all" ? null : kind.value,
-  from: dateMode.value === "range" ? from.value || null : null,
-  to: dateMode.value === "range" ? to.value || null : null,
-  unknownDate: dateMode.value === "unknown",
+  from: dateFilter.value.mode === "range" ? dateFilter.value.from : null,
+  to: dateFilter.value.mode === "range" ? dateFilter.value.to : null,
+  unknownDate: dateFilter.value.mode === "unknown",
   favoritesOnly: favoritesOnly.value,
   locationMode: albumsMode.value ? "all" as const : locationMode.value,
   locationSelection: albumsMode.value ? null : locationSelection.value,
@@ -196,10 +197,10 @@ watch(() => props.mode, (mode, oldMode) => {
   const people = mode === "people";
   if (mode !== "library") {
     if (people) peopleVisited.value = true;
-    if (oldMode === "library" || oldMode === undefined) libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateMode: dateMode.value, from: from.value, to: to.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
-    searchMode.value = "filename"; clearSearch(); kind.value = people ? "photo" : "all"; dateMode.value = "all"; favoritesOnly.value = false; sort.value = people ? "dateAsc" : "dateDesc";
+    if (oldMode === "library" || oldMode === undefined) libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateFilter: dateFilter.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
+    searchMode.value = "filename"; clearSearch(); kind.value = people ? "photo" : "all"; dateFilter.value = ALL_DATES; favoritesOnly.value = false; sort.value = people ? "dateAsc" : "dateDesc";
   } else if (libraryPreferences) {
-    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateMode.value = p.dateMode; from.value = p.from; to.value = p.to; favoritesOnly.value = p.favoritesOnly;
+    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateFilter.value = p.dateFilter; favoritesOnly.value = p.favoritesOnly;
     nextTick(() => { searchInput.value = p.input; query.value = p.query; });
     libraryPreferences = undefined;
   }
@@ -378,7 +379,7 @@ async function rotateDetail(delta: -90 | 90) {
 
 function selectAlbum(album: Album | undefined) {
   selectedAlbum.value = album;
-  requestedPage.value = 0; clearSearch(); kind.value = "all"; dateMode.value = "all";
+  requestedPage.value = 0; clearSearch(); kind.value = "all"; dateFilter.value = ALL_DATES;
   favoritesOnly.value = false; sort.value = "dateDesc"; stopSelection();
 }
 function addToAlbum(album: Album) {
@@ -450,9 +451,7 @@ function showScan(selected: string, scanned: Summary) {
     peopleStatus.value = undefined;
     libraryPreferences = undefined;
     kind.value = "all";
-    dateMode.value = "all";
-    from.value = "";
-    to.value = "";
+    dateFilter.value = ALL_DATES;
     favoritesOnly.value = false;
     locationMode.value = "all"; locationSelection.value = null; mapFocus.value = null;
     clearSearch();
@@ -882,9 +881,9 @@ async function performFileAction(action: FileAction) {
       </div>
       <p v-if="peopleMode" class="timeline-intro">按拍摄日期浏览成长记录，未知日期单独列出。</p>
       <nav v-if="peopleMode && months?.length" class="timeline-months" aria-label="成长时间线年月导航">
-        <button type="button" class="secondary" :aria-pressed="dateMode === 'all'" @click="dateMode = 'all'">全部日期</button>
+        <button type="button" class="secondary" :aria-pressed="dateFilter.mode === 'all'" @click="dateFilter = ALL_DATES">全部日期</button>
         <button v-for="entry in months" :key="entry.month ?? 'unknown'" type="button" class="secondary"
-          :aria-pressed="entry.month ? dateMode === 'range' && from === `${entry.month}-01` : dateMode === 'unknown'" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
+          :aria-pressed="monthSelected(entry.month)" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
       </nav>
       <p v-if="timelineError" class="error" role="alert">{{ timelineError }}</p>
       <div class="library-tools" :class="{ 'people-tools': peopleMode }" role="search" aria-label="媒体搜索与筛选">
@@ -908,16 +907,8 @@ async function performFileAction(action: FileAction) {
               <ElOption label="全部类型" value="all" /><ElOption label="照片" value="photo" /><ElOption label="视频" value="video" />
             </ElSelect>
           </div>
-          <div class="filter-field">
-            <span id="date-label">拍摄日期</span>
-            <ElSelect v-model="dateMode" class="date-select" aria-label="拍摄日期">
-              <ElOption label="全部日期" value="all" /><ElOption label="日期范围" value="range" /><ElOption label="日期未知" value="unknown" />
-            </ElSelect>
-          </div>
-          <div v-if="dateMode === 'range'" class="date-range">
-            <label>起始日期<input v-model="from" type="date" /></label>
-            <label>结束日期<input v-model="to" type="date" /></label>
-          </div>
+          <DateFilterPicker v-if="active" :key="`${mode}:${directory}:${peopleMode ? selectedPerson?.id : selectedAlbum?.id}`"
+            :model-value="dateFilter" @update:model-value="setDateFilter" />
           <div v-if="!albumsMode" class="filter-field">
             <span>拍摄位置</span>
             <ElSelect v-model="locationMode" class="location-select" aria-label="拍摄位置">
@@ -977,17 +968,17 @@ async function performFileAction(action: FileAction) {
         <p>精彩回忆，即将呈现。</p>
       </div>
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0 && albumsMode" class="library-empty" role="status">
-        <h2>{{ query || kind !== 'all' || dateMode !== 'all' || favoritesOnly ? '没有找到匹配的照片或视频' : '这个相册还没有照片或视频' }}</h2>
+        <h2>{{ query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly ? '没有找到匹配的照片或视频' : '这个相册还没有照片或视频' }}</h2>
         <p>到媒体库勾选同一次出游或情景里的照片和视频，加入这个相册。</p>
         <button type="button" :disabled="busy || !albumsWritable" @click="selectedAlbum && addToAlbum(selectedAlbum)">去媒体库添加</button>
-        <button v-if="query || kind !== 'all' || dateMode !== 'all' || favoritesOnly" type="button" class="secondary" @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false">清除搜索与筛选</button>
+        <button v-if="query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly" type="button" class="secondary" @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false">清除搜索与筛选</button>
       </div>
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0" class="library-empty" role="status">
         <ElIcon class="empty-icon" aria-hidden="true"><component :is="searchMode === 'content' && !query ? Search : Picture" /></ElIcon>
         <h2>{{ searchMode === 'content' && !query ? '用一句话，找回那个瞬间' : summary.total ? '没有找到匹配的照片或视频' : '这里还没有照片或视频' }}</h2>
         <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期、位置和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
-        <ElButton v-if="summary.total && (query || kind !== 'all' || dateMode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
-          @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
+        <ElButton v-if="summary.total && (query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
+          @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
         <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
@@ -1149,13 +1140,10 @@ async function performFileAction(action: FileAction) {
 .library-view-options { display: inline-flex; gap: 4px; }
 .library-view-options button { min-height: 32px; padding: 4px 10px; white-space: nowrap; font-size: 13px; }
 .library-view-options button[aria-pressed="true"]:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
-.kind-select, .date-select, .location-select { width: 120px; }
+.kind-select, .location-select { width: 120px; }
 .sort-select { width: 200px; }
 .sort-field { margin-left: auto; }
 .favorite-filter { margin-right: 0; }
-.date-range { display: flex; flex-wrap: wrap; gap: 8px; }
-.date-range label { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; font-weight: 400; color: var(--muted); }
-.date-range input { max-width: 100%; }
 .relevance-note { margin-left: auto; color: var(--muted); font-size: 13px; }
 .location-selection { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--accent); font-size: 13px; }
 .scan-status, .library-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; padding: 12px 16px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
@@ -1250,9 +1238,6 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
   .filter-field { flex: 1 1 150px; justify-content: space-between; }
   .filter-field :deep(.el-select) { flex: 1; min-width: 0; width: auto; }
   .sort-field { flex-basis: 100%; }
-  .date-range { width: 100%; }
-  .date-range label { flex: 1 1 100%; }
-  .date-range input { flex: 1; }
   .relevance-note { margin-left: 0; }
   .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   button.favorite { width: 40px; min-height: 40px; }
