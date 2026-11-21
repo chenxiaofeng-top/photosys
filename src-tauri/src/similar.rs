@@ -19,9 +19,11 @@ use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
 
 use crate::duplicates::{Candidate, FileStamp, Root, display_path, is_link};
+use crate::library::details::{DETAILS_SLOTS, MediaDetails, read_media_details};
 use crate::media_date::Media;
 
 use self::cache::Cache;
+use self::imaging::PreviewSize;
 use self::matching::{Features, Group, MatchKind};
 
 const PAGE_SIZE: usize = 25;
@@ -146,6 +148,17 @@ struct Scan {
 }
 
 impl Scan {
+    fn active_photo(&self, file_id: usize) -> Result<&Photo, String> {
+        self.photos
+            .get(file_id)
+            .filter(|photo| !photo.moved)
+            .ok_or_else(|| "照片记录已失效，请重新扫描。".into())
+    }
+
+    fn media_details(&self, file_id: usize) -> Result<MediaDetails, String> {
+        read_media_details(&self.root, &self.active_photo(file_id)?.file)
+    }
+
     fn groups(&self, kind: Option<MatchKind>, page: usize) -> Page<GroupView> {
         let groups = self
             .groups
@@ -756,19 +769,40 @@ pub(crate) async fn similar_preview(
     scan_id: u64,
     file_id: usize,
     detail: bool,
+    large: Option<bool>,
 ) -> Result<String, String> {
+    let size = match (large.unwrap_or(false), detail) {
+        (true, _) => PreviewSize::Large,
+        (false, true) => PreviewSize::Detail,
+        (false, false) => PreviewSize::Thumbnail,
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let session = result(scan_id)?;
         let scan = session.read().map_err(|_| STATE_ERROR)?;
-        let photo = scan
-            .photos
-            .get(file_id)
-            .filter(|photo| !photo.moved)
-            .ok_or("照片记录已失效，请重新扫描。")?;
-        preview(&scan.root, &photo.file, detail)
+        preview(&scan.root, &scan.active_photo(file_id)?.file, size)
     })
     .await
     .map_err(|error| format!("无法加载照片预览。{error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn similar_media_details(
+    scan_id: u64,
+    file_id: usize,
+) -> Result<MediaDetails, String> {
+    let permit = DETAILS_SLOTS.acquire().await.map_err(|_| STATE_ERROR)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let session = result(scan_id)?;
+        let details = session
+            .read()
+            .map_err(|_| STATE_ERROR)?
+            .media_details(file_id)?;
+        result(scan_id)?;
+        Ok(details)
+    })
+    .await
+    .map_err(|error| format!("无法读取照片详情。{error}"))?
 }
 
 #[tauri::command]
@@ -787,11 +821,11 @@ pub(crate) async fn trash_similar(
     .map_err(|error| format!("清理相似照片异常结束。{error}"))?
 }
 
-pub(crate) fn preview(root: &Root, photo: &Candidate, detail: bool) -> Result<String, String> {
+fn preview(root: &Root, photo: &Candidate, size: PreviewSize) -> Result<String, String> {
     let _preview = PREVIEW.lock().map_err(|_| STATE_ERROR)?;
     let stale = |_| "照片已变化或已移除，请重新扫描。";
     let mut file = root.open_matching(photo).map_err(stale)?;
-    let image = imaging::preview(&mut file, &photo.relative, photo.stamp.size, detail);
+    let image = imaging::render_preview(&mut file, &photo.relative, photo.stamp.size, size);
     root.verify_read(&file, photo).map_err(stale)?;
     image
 }

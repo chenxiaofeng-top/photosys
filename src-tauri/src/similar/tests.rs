@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{FilterType, brighten, resize, rotate270};
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, Rgb, RgbImage};
@@ -127,14 +128,14 @@ fn scans_variants_applies_exif_and_reuses_cache() {
     assert_eq!(photo.kind, Some(MatchKind::Variant));
     let candidate = &scan.photos[photo.photo.id].file;
     assert!(
-        preview(&scan.root, candidate, false)
+        preview(&scan.root, candidate, PreviewSize::Thumbnail)
             .unwrap()
             .starts_with("data:image/jpeg;base64,")
     );
     fs::rename(&rotated, child.join("old.bin")).unwrap();
     fs::copy(child.join("old.bin"), &rotated).unwrap();
     assert_eq!(
-        preview(&scan.root, candidate, true).unwrap_err(),
+        preview(&scan.root, candidate, PreviewSize::Detail).unwrap_err(),
         "照片已变化或已移除，请重新扫描。"
     );
 
@@ -148,6 +149,61 @@ fn scans_variants_applies_exif_and_reuses_cache() {
         .query_row("SELECT COUNT(*) FROM photo_features", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 4);
+}
+
+#[test]
+fn comparison_viewer_renders_a_larger_oriented_preview_and_reads_checked_metadata() {
+    let directory = tempdir().unwrap();
+    let photos = directory.path().join("photos");
+    fs::create_dir(&photos).unwrap();
+    let rotated = photos.join("rotated.jpg");
+    let plain = photos.join("plain.png");
+    jpeg(
+        &rotated,
+        &resize(&scene(), 4000, 256, FilterType::Nearest),
+        88,
+        exif(6, b"2025:06:03 14:30:20\0", b"+08:00\0"),
+    );
+    scene().save(&plain).unwrap();
+    let (scan, _) = scan_directory(&photos, &directory.path().join("index.sqlite3"));
+    let candidate = &scan
+        .photos
+        .iter()
+        .find(|photo| photo.view().name == "rotated.jpg")
+        .unwrap()
+        .file;
+    let plain_candidate = &scan
+        .photos
+        .iter()
+        .find(|photo| photo.view().name == "plain.png")
+        .unwrap()
+        .file;
+
+    for (size, dimensions) in [
+        (PreviewSize::Thumbnail, (15, 240)),
+        (PreviewSize::Detail, (102, 1600)),
+        (PreviewSize::Large, (205, 3200)),
+    ] {
+        let data = preview(&scan.root, candidate, size).unwrap();
+        let bytes = STANDARD.decode(data.split_once(',').unwrap().1).unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), dimensions);
+    }
+
+    let details = serde_json::to_value(scan.media_details(candidate.id).unwrap()).unwrap();
+    assert_eq!(details["photo"]["dimensions"]["width"], 4000);
+    assert_eq!(details["photo"]["capturedAt"], "2025-06-03T14:30:20+08:00");
+    let plain_details =
+        serde_json::to_value(scan.media_details(plain_candidate.id).unwrap()).unwrap();
+    assert_eq!(plain_details["photo"]["dimensions"]["width"], 288);
+    assert!(plain_details["photo"]["capturedAt"].is_null());
+
+    let moved = photos.join("original.bin");
+    fs::rename(&rotated, &moved).unwrap();
+    assert!(scan.media_details(candidate.id).is_err());
+    fs::copy(&moved, &rotated).unwrap();
+    assert!(preview(&scan.root, candidate, PreviewSize::Large).is_err());
+    assert!(scan.media_details(candidate.id).is_err());
 }
 
 #[test]
@@ -195,7 +251,7 @@ fn matches_heic_with_jpeg_and_reuses_features() {
             );
         }
         assert!(
-            preview(&scan.root, &scan.photos[photo.id].file, true)
+            preview(&scan.root, &scan.photos[photo.id].file, PreviewSize::Detail)
                 .unwrap()
                 .starts_with("data:image/jpeg;base64,")
         );
@@ -211,7 +267,7 @@ fn matches_heic_with_jpeg_and_reuses_features() {
         .file;
     fs::write(heic, b"replacement").unwrap();
     assert_eq!(
-        preview(&scan.root, candidate, false).unwrap_err(),
+        preview(&scan.root, candidate, PreviewSize::Thumbnail).unwrap_err(),
         "照片已变化或已移除，请重新扫描。"
     );
     let (_, replaced) = scan_directory(&photos, &database);
@@ -523,7 +579,8 @@ fn trash_members_preserves_photo_ids_and_unrelated_groups() {
         (1, 3, 2)
     );
     assert!(scan.photos[1].moved);
-    assert!(preview(&scan.root, &scan.photos[1].file, false).is_err());
+    assert!(preview(&scan.root, &scan.photos[1].file, PreviewSize::Thumbnail).is_err());
+    assert!(scan.media_details(1).is_err());
     assert!(
         scan.recycle(17, 0, vec![1], |_| panic!("must not trash twice"))
             .is_err()

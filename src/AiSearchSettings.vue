@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onBeforeUnmount, onMounted, ref, watch, computed } from "vue";
 import { ElButton, ElIcon, ElDialog } from "element-plus";
 import { MagicStick, Setting } from "@element-plus/icons-vue";
@@ -43,6 +44,68 @@ const issues = ref<{ page: number; total: number; items: { path: string; reason:
 const issuesOpen = ref(false);
 let mounted = true;
 let indexRequest = 0;
+type DevicePreference = "auto" | "cpu";
+interface InferenceStatus {
+  supportsDirectml: boolean;
+  current: DevicePreference;
+  saved: DevicePreference;
+  sessions: { directml: boolean; fallback: string | null }[];
+}
+const inference = ref<InferenceStatus>();
+const deviceSaving = ref(false);
+const deviceError = ref("");
+let deviceRequest = 0;
+let unlistenDevice: UnlistenFn | undefined;
+const deviceStatus = computed(() => {
+  const sessions = inference.value?.sessions ?? [];
+  if (!sessions.length) return "等待模型就绪";
+  const directml = sessions.filter(session => session.directml).length;
+  if (!directml) return "CPU";
+  return directml === sessions.length ? "DirectML（GPU 优先）" : "DirectML + CPU";
+});
+const fallbackReasons = computed(() =>
+  [...new Set(inference.value?.sessions.flatMap(session => session.fallback ?? []) ?? [])]
+);
+
+async function loadInferenceStatus() {
+  const request = ++deviceRequest;
+  try {
+    const value = await invoke<InferenceStatus>("ai_inference_status", { kind: props.modelKind });
+    if (mounted && request === deviceRequest) inference.value = value;
+  } catch (cause) {
+    if (mounted && request === deviceRequest) deviceError.value = String(cause);
+  }
+}
+
+async function watchInferenceStatus() {
+  try {
+    const unlisten = await listen("ai-inference-changed", () => void loadInferenceStatus());
+    if (!mounted) {
+      unlisten();
+      return;
+    }
+    unlistenDevice = unlisten;
+  } catch (cause) {
+    if (mounted) deviceError.value = String(cause);
+  }
+  if (mounted) await loadInferenceStatus();
+}
+
+async function setInferencePreference(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  const preference = select.value as DevicePreference;
+  select.value = inference.value?.saved ?? "auto";
+  deviceSaving.value = true;
+  deviceError.value = "";
+  try {
+    await invoke("ai_set_inference_preference", { preference });
+    await loadInferenceStatus();
+  } catch (cause) {
+    if (mounted) deviceError.value = String(cause);
+  } finally {
+    deviceSaving.value = false;
+  }
+}
 
 function setModel(value: ModelStatus) { model.value = value; emit("modelReady", value.activeReady); }
 function setIndex(value: IndexStatus) {
@@ -200,11 +263,18 @@ watch([issuesOpen, issuePage, () => index.value?.failed], async () => {
 });
 
 onMounted(async () => {
+  void watchInferenceStatus();
   try { catalog.value = await invoke<ModelOption[]>("ai_model_catalog", { kind: props.modelKind }); }
   catch (cause) { modelError.value = String(cause); }
   await loadModel(); await refreshIndex(true);
 });
-onBeforeUnmount(() => { mounted = false; indexRequest++; modelRequest++; void cancelIndex(); });
+onBeforeUnmount(() => {
+  mounted = false;
+  indexRequest++;
+  modelRequest++;
+  unlistenDevice?.();
+  void cancelIndex();
+});
 defineExpose({ refreshIndex });
 </script>
 
@@ -213,7 +283,7 @@ defineExpose({ refreshIndex });
     <div class="ai-summary">
       <span class="ai-label"><ElIcon aria-hidden="true"><MagicStick /></ElIcon>本地 AI</span>
       <span class="model-status" :class="{ ready: model?.activeReady }" role="status">{{ modelTask ? '正在处理模型…' : model?.activeReady ? '当前模型已就绪' : '尚未安装可用模型' }}</span>
-      <span v-if="index" role="status">{{ indexTask ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
+      <span v-if="index" role="status">{{ index.queued ? '排队中 · ' : indexTask || index.running ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
       <ElButton v-if="indexTask" @click="cancelIndex">停止索引</ElButton>
       <ElButton v-else-if="!peopleModel && scanId !== undefined && model?.activeReady"
         :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.needsRebuild ? '重建内容索引' : index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>
@@ -222,6 +292,18 @@ defineExpose({ refreshIndex });
     <div v-show="open" :id="settingsId" class="ai-settings-body">
       <p>{{ peopleModel ? "在本机检出人脸，自动按人物分组，可命名和修改归属。" : "用中文描述寻找照片。" }}模型安装后可断网使用，照片只在本机处理。</p>
       <p>当前使用：<strong>{{ activeModel?.name ?? '正在读取…' }}</strong></p>
+      <label v-if="inference?.supportsDirectml" class="model-picker">推理设备
+        <select :value="inference.saved" :disabled="deviceSaving" @change="setInferencePreference">
+          <option value="auto">自动（优先 GPU）</option>
+          <option value="cpu">仅 CPU</option>
+        </select>
+      </label>
+      <p v-if="inference" role="status">
+        当前推理后端为 <strong>{{ deviceStatus }}</strong>。
+        <span v-if="inference.saved !== inference.current">设备设置将在重启 PhotoSys 后生效。</span>
+      </p>
+      <p v-for="reason in fallbackReasons" :key="reason" class="description">已回退到 CPU。{{ reason }}</p>
+      <p v-if="deviceError" class="error" role="alert">{{ deviceError }}</p>
       <label class="model-picker">选择模型
         <select v-model="selectedModelId" :disabled="modelTask" @change="selectModel">
           <option v-for="option in catalog" :key="option.id" :value="option.id">{{ option.name }}{{ option.id === model?.activeModelId ? '（当前使用）' : '' }}</option>

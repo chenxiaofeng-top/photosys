@@ -43,7 +43,7 @@ pub(crate) enum LocationMode {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub(crate) enum Selection {
     Point {

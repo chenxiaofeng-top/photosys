@@ -189,13 +189,20 @@ impl Candidate {
 pub(crate) struct Root {
     pub(crate) path: PathBuf,
     identity: FileIdentity,
+    #[cfg(test)]
+    pub(crate) test_data_directory: Option<PathBuf>,
 }
 
 impl Root {
     pub(crate) fn new(path: &Path) -> io::Result<Self> {
         let path = path.canonicalize()?;
         let identity = directory_identity(&path)?;
-        Ok(Self { path, identity })
+        Ok(Self {
+            path,
+            identity,
+            #[cfg(test)]
+            test_data_directory: None,
+        })
     }
 
     pub(crate) fn verify_directory(&self) -> io::Result<()> {

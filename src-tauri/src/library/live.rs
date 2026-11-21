@@ -40,10 +40,16 @@ impl Member {
     }
 }
 
-struct ExtractedMember {
+pub(super) struct ExtractedMember {
     directory: TempDir,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     kind: Member,
+}
+
+impl ExtractedMember {
+    pub(super) fn is_heif(&self) -> bool {
+        self.kind == Member::Heif
+    }
 }
 
 fn extract(
@@ -87,13 +93,25 @@ fn extract(
     })
 }
 
-pub(super) fn cover(file: &mut File, detail: bool) -> Result<String, String> {
-    let member = extract(
+pub(super) fn cover_member(file: &mut File) -> Result<ExtractedMember, String> {
+    extract(
         file,
         |kind| kind != Member::Video,
         "实况照片包内没有可预览的封面。",
-    )?;
-    let (mut image, size) = if member.kind == Member::Heif {
+    )
+}
+
+pub(super) fn video_member(file: &mut File) -> Result<ExtractedMember, String> {
+    extract(
+        file,
+        |kind| kind == Member::Video,
+        "实况照片包内没有 MOV 或 MP4 视频。",
+    )
+}
+
+pub(super) fn cover(file: &mut File, detail: bool) -> Result<String, String> {
+    let member = cover_member(file)?;
+    let (mut image, size) = if member.is_heif() {
         media_codec::heif_jpeg(
             &member.path,
             &member.directory.path().join("cover.jpg"),
@@ -153,12 +171,7 @@ impl Scan {
             return Err("此文件没有实况视频。".into());
         }
         let mut file = self.root.open_matching(&item.file).map_err(|_| CHANGED)?;
-        let video = extract(
-            &mut file,
-            |kind| kind == Member::Video,
-            "实况照片包内没有 MOV 或 MP4 视频。",
-        )
-        .and_then(|member| webm(&member));
+        let video = video_member(&mut file).and_then(|member| webm(&member));
         self.root
             .verify_read(&file, &item.file)
             .map_err(|_| CHANGED)?;

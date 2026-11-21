@@ -70,6 +70,11 @@ pub(crate) fn maintenance() -> Result<Maintenance<'static>, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn maintenance_pending() -> bool {
+    ACCESS.pending.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, mpsc};

@@ -1,11 +1,12 @@
 //! Reusable read connection with an indexed, per-scan in-memory media catalog.
 use super::{
     super::{self as library, Filter, ItemView, Kind, Page, Sort, favorites},
-    store::Store,
+    pending,
+    store::{SCHEMA_VERSION, Store},
 };
 use crate::ai::{error, faces::GEOMETRY_VERSION};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -28,6 +29,8 @@ struct Reader {
     favorites: HashSet<usize>,
     rotations: HashMap<usize, u16>,
     geometry_expression: String,
+    schema_version: u32,
+    legacy_data_version: Option<i64>,
 }
 pub(super) fn with<T>(
     scan_id: u64,
@@ -42,11 +45,16 @@ pub(super) fn with<T>(
     let mut reader = READER.lock().map_err(error)?;
     let reset = match reader.as_ref() {
         Some(r) => {
-            r.scan_id != scan_id || r.geometry_expression != r.store.geometry_expression()?
+            r.scan_id != scan_id
+                || r.geometry_expression != r.store.geometry_expression()?
+                || r.schema_version != r.store.schema_version()?
+                || (r.legacy_data_version.is_some()
+                    && r.legacy_data_version != Some(data_version(&r.store)?))
         }
         None => true,
     };
     if reset {
+        pending::invalidate()?;
         *reader = None;
         if let Some(store) = Store::open(&scan, false)? {
             store.connection.execute_batch("CREATE TEMP TABLE current_media(path BLOB PRIMARY KEY,file_id INTEGER NOT NULL,captured TEXT,favorite INTEGER NOT NULL,rotation INTEGER NOT NULL,stamp BLOB NOT NULL) WITHOUT ROWID; BEGIN;").map_err(error)?;
@@ -77,6 +85,65 @@ pub(super) fn with<T>(
                 .execute_batch("COMMIT; CREATE INDEX current_file_id ON current_media(file_id);")
                 .map_err(error)?;
             let geometry = store.geometry_expression()?;
+            let schema_version = store.schema_version()?;
+            let legacy_groups = (3..SCHEMA_VERSION).contains(&schema_version);
+            let important = if schema_version >= 4 {
+                "important"
+            } else {
+                "0"
+            };
+            let legacy_data_version = (schema_version < 5)
+                .then(|| data_version(&store))
+                .transpose()?;
+            let source_faces = if legacy_data_version.is_some() {
+                store.classify_legacy(if legacy_groups { "ignored" } else { "0" }, important)?;
+                store
+                    .connection
+                    .execute_batch(
+                        "CREATE TEMP VIEW legacy_assigned_faces AS
+                    SELECT f.id,f.path,f.bbox,f.confidence,f.vector,f.thumbnail,
+                      CASE WHEN c.id IS NOT NULL OR (f.manual=1 AND d.id IS NULL)
+                        THEN f.person_id END AS person_id,
+                      (f.manual=1 OR c.id IS NOT NULL) AS manual,f.ignored,f.active,f.review
+                    FROM main.faces f LEFT JOIN temp.legacy_confirmations c
+                      ON c.id=f.id AND c.person_id=f.person_id
+                    LEFT JOIN temp.legacy_dispositions d ON d.id=f.id AND d.person_id=f.person_id;",
+                    )
+                    .map_err(error)?;
+                "temp.legacy_assigned_faces"
+            } else {
+                "main.faces"
+            };
+            if legacy_groups {
+                store
+                    .connection
+                    .execute_batch(&format!(
+                        "CREATE TEMP VIEW faces AS
+                    SELECT f.id,f.path,f.bbox,f.confidence,f.vector,f.thumbnail,
+                      CASE WHEN retired.id IS NULL THEN f.person_id END AS person_id,
+                      CASE WHEN retired.id IS NOT NULL AND f.active=1 AND f.ignored=0
+                        THEN 1 ELSE f.manual END AS manual,f.ignored,f.active,f.review
+                    FROM {source_faces} f LEFT JOIN main.people retired
+                      ON retired.id=f.person_id AND retired.ignored=1;"
+                    ))
+                    .map_err(error)?;
+            } else if legacy_data_version.is_some() {
+                store
+                    .connection
+                    .execute_batch(
+                        "CREATE TEMP VIEW faces AS SELECT * FROM temp.legacy_assigned_faces;",
+                    )
+                    .map_err(error)?;
+            }
+            let archived = if legacy_data_version.is_some() {
+                "(archived OR id NOT IN(SELECT id FROM temp.legacy_people))"
+            } else {
+                "archived"
+            };
+            let retired = if legacy_groups { " OR ignored=1" } else { "" };
+            store.connection.execute_batch(&format!(
+                "CREATE TEMP VIEW person_groups AS SELECT id,name,({archived}{retired}) AS archived,{important} AS important FROM main.people;"
+            )).map_err(error)?;
             store.connection.execute_batch(&format!("CREATE TEMP VIEW visible_faces AS SELECT f.*,c.file_id,c.captured,c.favorite FROM faces f JOIN media m ON m.path=f.path JOIN current_media c ON c.path=m.path AND c.stamp=m.stamp AND c.rotation=m.rotation WHERE f.active=1 AND ({geometry})='{GEOMETRY_VERSION}';")).map_err(error)?;
             store.connection.execute_batch(&format!("
                 CREATE TEMP VIEW face_cards AS SELECT f.*,c.file_id,c.captured,c.favorite,
@@ -86,8 +153,10 @@ pub(super) fn with<T>(
                   WITH stale AS MATERIALIZED (SELECT c.path FROM current_media c LEFT JOIN media m ON m.path=c.path
                     WHERE m.path IS NULL OR ({geometry})!='{GEOMETRY_VERSION}' OR m.stamp!=c.stamp OR m.rotation!=c.rotation)
                   SELECT id FROM visible_faces WHERE ignored=0 AND person_id IS NULL
-                  UNION ALL SELECT f.id FROM faces f JOIN current_media c ON c.path=f.path WHERE f.active=0 AND f.review=1 AND f.manual=1 AND f.ignored=0
-                  UNION ALL SELECT f.id FROM stale s CROSS JOIN faces f WHERE f.path=s.path AND f.active=1 AND f.manual=1 AND f.ignored=0;
+                  UNION ALL SELECT f.id FROM faces f JOIN current_media c ON c.path=f.path
+                    WHERE f.active=0 AND f.review=1 AND f.manual=1 AND f.ignored=0
+                  UNION ALL SELECT f.id FROM stale s CROSS JOIN faces f
+                    WHERE f.path=s.path AND f.active=1 AND f.manual=1 AND f.ignored=0;
             ")).map_err(error)?;
             *reader = Some(Reader {
                 scan_id,
@@ -95,10 +164,15 @@ pub(super) fn with<T>(
                 favorites: saved_favorites.clone(),
                 rotations: saved_rotations.clone(),
                 geometry_expression: geometry,
+                schema_version,
+                legacy_data_version,
             });
         }
     }
     if let Some(r) = reader.as_mut() {
+        if r.rotations != saved_rotations {
+            pending::invalidate()?;
+        }
         for &id in r.favorites.symmetric_difference(&saved_favorites) {
             r.store
                 .connection
@@ -134,6 +208,13 @@ pub(super) fn with<T>(
     library::scan(scan_id)?;
     Ok(result)
 }
+fn data_version(store: &Store) -> Result<i64, String> {
+    store
+        .connection
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .map_err(error)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersonView {
@@ -142,6 +223,8 @@ pub(crate) struct PersonView {
     pub photo_count: usize,
     pub face_count: usize,
     pub thumbnail: Option<String>,
+    pub avatar_face_id: Option<i64>,
+    pub important: bool,
 }
 #[derive(Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -172,10 +255,24 @@ pub(crate) struct Month {
     pub month: Option<String>,
     pub count: usize,
 }
-fn image(bytes: Vec<u8>) -> String {
+pub(super) fn image(bytes: Vec<u8>) -> String {
     format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
 }
-pub(super) fn people(scan_id: u64, query: &str, page: usize) -> Result<Page<PersonView>, String> {
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct PeopleFilter {
+    unnamed_only: bool,
+    single_photo_only: bool,
+    important_first: bool,
+    person_id: Option<i64>,
+}
+
+pub(super) fn people(
+    scan_id: u64,
+    query: &str,
+    page: usize,
+    filter: PeopleFilter,
+) -> Result<Page<PersonView>, String> {
     if query.len() > 1024 {
         return Err("搜索词过长。".into());
     }
@@ -187,19 +284,63 @@ pub(super) fn people(scan_id: u64, query: &str, page: usize) -> Result<Page<Pers
                 items: Vec::new(),
             });
         };
-        let total=s.connection.query_row("SELECT COUNT(*) FROM people WHERE archived=0 AND (?1='' OR instr(lower(name),lower(?1))>0)",[query.trim()],|r|r.get::<_,i64>(0).map(|v|v as usize)).map_err(error)?;
-        let (page, offset) = Page::<PersonView>::bounds(page, total);
-        let mut q=s.connection.prepare("WITH selected AS (SELECT id,name FROM people WHERE archived=0 AND (?1='' OR instr(lower(name),lower(?1))>0) ORDER BY CASE WHEN name='' THEN 1 ELSE 0 END,name,id LIMIT 24 OFFSET ?2) SELECT p.id,p.name,(SELECT COUNT(DISTINCT path) FROM visible_faces WHERE person_id=p.id AND ignored=0),(SELECT COUNT(*) FROM visible_faces WHERE person_id=p.id AND ignored=0),(SELECT thumbnail FROM visible_faces WHERE person_id=p.id AND ignored=0 ORDER BY id LIMIT 1) FROM selected p ORDER BY CASE WHEN p.name='' THEN 1 ELSE 0 END,p.name,p.id").map_err(error)?;
-        let rows = q
-            .query_map(params![query.trim(), offset as i64], |r| {
-                Ok(PersonView {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    photo_count: r.get::<_, i64>(2)? as usize,
-                    face_count: r.get::<_, i64>(3)? as usize,
-                    thumbnail: r.get::<_, Option<Vec<u8>>>(4)?.map(image),
-                })
+        const MATCH: &str = "FROM person_groups g WHERE g.archived=0
+            AND (?1='' OR instr(lower(g.name),lower(?1))>0) AND (?2=0 OR g.name='')
+            AND (?3=0 OR (SELECT COUNT(*) FROM (SELECT DISTINCT path FROM visible_faces
+                WHERE person_id=g.id AND ignored=0 LIMIT 2))=1)
+            AND (?4 IS NULL OR g.id=?4)";
+        let args = params![
+            query.trim(),
+            filter.unnamed_only,
+            filter.single_photo_only,
+            filter.person_id
+        ];
+        let total = s
+            .connection
+            .query_row(&format!("SELECT COUNT(*) {MATCH}"), args, |r| {
+                r.get::<_, i64>(0).map(|v| v as usize)
             })
+            .map_err(error)?;
+        let (page, offset) = Page::<PersonView>::bounds(page, total);
+        let mut q = s
+            .connection
+            .prepare(&format!(
+                "WITH selected AS (
+                SELECT g.id,g.name,g.important {MATCH}
+                ORDER BY (?6 AND g.important) DESC,g.name='',g.name,g.id LIMIT 24 OFFSET ?5
+             )
+             SELECT p.id,p.name,
+               (SELECT COUNT(DISTINCT path) FROM visible_faces WHERE person_id=p.id AND ignored=0),
+               (SELECT COUNT(*) FROM visible_faces WHERE person_id=p.id AND ignored=0),
+               avatar.thumbnail,avatar.id,p.important
+             FROM selected p LEFT JOIN faces avatar ON avatar.id=(
+                SELECT id FROM visible_faces WHERE person_id=p.id AND ignored=0 ORDER BY id LIMIT 1
+             )
+             ORDER BY (?6 AND p.important) DESC,p.name='',p.name,p.id"
+            ))
+            .map_err(error)?;
+        let rows = q
+            .query_map(
+                params![
+                    query.trim(),
+                    filter.unnamed_only,
+                    filter.single_photo_only,
+                    filter.person_id,
+                    offset as i64,
+                    filter.important_first
+                ],
+                |r| {
+                    Ok(PersonView {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        photo_count: r.get::<_, i64>(2)? as usize,
+                        face_count: r.get::<_, i64>(3)? as usize,
+                        thumbnail: r.get::<_, Option<Vec<u8>>>(4)?.map(image),
+                        avatar_face_id: r.get(5)?,
+                        important: r.get(6)?,
+                    })
+                },
+            )
             .map_err(error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(error)?;
@@ -229,6 +370,25 @@ pub(super) fn faces(
     file_id: Option<usize>,
     page: usize,
 ) -> Result<Page<FaceView>, String> {
+    faces_filtered(scan_id, scope, person_id, file_id, page, None)
+}
+
+pub(super) fn pending_faces(
+    scan_id: u64,
+    page: usize,
+    view: &pending::View,
+) -> Result<Page<FaceView>, String> {
+    faces_filtered(scan_id, FaceScope::Pending, None, None, page, Some(view))
+}
+
+fn faces_filtered(
+    scan_id: u64,
+    scope: FaceScope,
+    person_id: Option<i64>,
+    file_id: Option<usize>,
+    page: usize,
+    view: Option<&pending::View>,
+) -> Result<Page<FaceView>, String> {
     let scan = library::scan(scan_id)?;
     with(scan_id, |store| {
         let Some(s) = store else {
@@ -239,20 +399,36 @@ pub(super) fn faces(
             });
         };
         let join = if matches!(scope, FaceScope::Pending) {
-            "FROM pending_faces pending JOIN face_cards f ON f.id=pending.id LEFT JOIN people p ON p.id=f.person_id"
+            "FROM pending_faces pending JOIN face_cards f ON f.id=pending.id LEFT JOIN person_groups p ON p.id=f.person_id"
         } else {
-            "FROM face_cards f LEFT JOIN people p ON p.id=f.person_id"
+            "FROM face_cards f LEFT JOIN person_groups p ON p.id=f.person_id"
         };
-        // All statements bind both placeholders, even scopes which do not use them.
+        let (group_condition, group_id) = if let Some(view) = view {
+            pending::check_view(s, scan_id, view)?;
+            (
+                match view.group_id {
+                    Some(_) => {
+                        "EXISTS(SELECT 1 FROM temp.pending_group_members g WHERE g.face_id=f.id AND g.group_id=?4)"
+                    }
+                    None => {
+                        "NOT EXISTS(SELECT 1 FROM temp.pending_group_members g WHERE g.face_id=f.id) AND ?4 IS NULL"
+                    }
+                },
+                view.group_id,
+            )
+        } else {
+            ("?4 IS NULL", None)
+        };
+        // Bind all placeholders for every scope.
         let condition = format!(
-            "({}) AND (?1 IS NULL OR ?1 IS NOT NULL) AND (?2 IS NULL OR ?2 IS NOT NULL)",
+            "({}) AND (?1 IS NULL OR ?1 IS NOT NULL) AND (?2 IS NULL OR ?2 IS NOT NULL) AND ({group_condition})",
             face_where(scope)
         );
         let total = s
             .connection
             .query_row(
                 &format!("SELECT COUNT(*) {join} WHERE {condition}"),
-                params![person_id, file_id.map(|id| id as i64)],
+                params![person_id, file_id.map(|id| id as i64), 0, group_id],
                 |r| r.get::<_, i64>(0).map(|v| v as usize),
             )
             .map_err(error)?;
@@ -260,7 +436,12 @@ pub(super) fn faces(
         let mut q=s.connection.prepare(&format!("SELECT f.id,f.file_id,f.person_id,p.name,f.thumbnail,f.bbox,f.manual,f.ignored,f.valid=0 {join} WHERE {condition} ORDER BY f.review DESC,f.id LIMIT 24 OFFSET ?3")).map_err(error)?;
         let rows = q
             .query_map(
-                params![person_id, file_id.map(|id| id as i64), offset as i64],
+                params![
+                    person_id,
+                    file_id.map(|id| id as i64),
+                    offset as i64,
+                    group_id
+                ],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -325,7 +506,7 @@ fn conditions(
     let exists: bool = s
         .connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM people WHERE id=?1 AND archived=0)",
+            "SELECT EXISTS(SELECT 1 FROM person_groups WHERE id=?1 AND archived=0)",
             [person_id],
             |r| r.get(0),
         )
@@ -465,16 +646,7 @@ pub(super) fn counts(scan_id: u64) -> Result<(usize, usize, Option<String>), Str
             })
             .map_err(error)?;
         let ignored=s.connection.query_row("SELECT COUNT(*) FROM faces f JOIN current_media c ON c.path=f.path WHERE f.ignored=1",[],|r|r.get::<_,i64>(0).map(|v|v as usize)).map_err(error)?;
-        let undo = s
-            .connection
-            .query_row(
-                "SELECT description FROM edits ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(error)?;
-        Ok((pending, ignored, undo))
+        Ok((pending, ignored, s.undo_description()?))
     })
 }
 pub(super) fn validate_faces(
@@ -504,7 +676,7 @@ pub(super) fn photo_people(scan_id: u64, file_id: usize) -> Result<Vec<Identity>
         let Some(s) = store else {
             return Ok(Vec::new());
         };
-        let mut q=s.connection.prepare("SELECT DISTINCT p.id,p.name FROM visible_faces v JOIN people p ON p.id=v.person_id WHERE v.file_id=?1 AND v.ignored=0 AND p.archived=0 ORDER BY p.name,p.id").map_err(error)?;
+        let mut q=s.connection.prepare("SELECT DISTINCT p.id,p.name FROM visible_faces v JOIN person_groups p ON p.id=v.person_id WHERE v.file_id=?1 AND v.ignored=0 AND p.archived=0 ORDER BY p.name,p.id").map_err(error)?;
         q.query_map([file_id as i64], |r| {
             Ok(Identity {
                 id: r.get(0)?,

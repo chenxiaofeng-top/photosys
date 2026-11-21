@@ -7,7 +7,7 @@ import zipfile
 
 import json
 
-CATALOG = json.loads((Path(__file__).parent / "ai-model-catalog.json").read_text())
+CATALOG = json.loads((Path(__file__).parent / "ai-model-catalog.json").read_text(encoding="utf-8"))
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("directory", type=Path, help="directory containing the selected model files")
 parser.add_argument("output", type=Path, help="output ZIP path")

@@ -29,13 +29,13 @@ fn id(s: &Session, path: &str) -> usize {
         .unwrap()
         .id
 }
-fn keep_paths(s: &Session) -> Vec<String> {
+fn keep_paths(s: &Session) -> Vec<&Path> {
     s.scan
         .groups
         .iter()
         .flat_map(|g| &g.files)
         .filter(|f| !s.selected.contains(&f.id))
-        .map(Candidate::path_label)
+        .map(|f| f.relative.as_path())
         .collect()
 }
 
@@ -92,13 +92,13 @@ fn retention_prefers_subdirectory_then_timestamp_and_lexical_tie() {
             });
     }
     apply(&mut s, KeepRule::Shallow, "", "");
-    assert_eq!(keep_paths(&s), ["a.jpg"]);
+    assert_eq!(keep_paths(&s), [Path::new("a.jpg")]);
     apply(&mut s, KeepRule::Newest, "", "");
-    assert_eq!(keep_paths(&s), ["b.jpg"]);
+    assert_eq!(keep_paths(&s), [Path::new("b.jpg")]);
     apply(&mut s, KeepRule::Oldest, "", "");
-    assert_eq!(keep_paths(&s), ["a.jpg"]);
+    assert_eq!(keep_paths(&s), [Path::new("a.jpg")]);
     apply(&mut s, KeepRule::Newest, "chosen", "");
-    assert_eq!(keep_paths(&s), ["chosen/deep/a.jpg"]);
+    assert_eq!(keep_paths(&s), [Path::new("chosen/deep/a.jpg")]);
     let before = s.selected.clone();
     let revision = s.revision;
     assert!(
@@ -213,7 +213,7 @@ fn hardlinks_are_all_retained_but_regular_copies_can_be_selected() {
     let mut s = fixture(root.path());
     apply(&mut s, KeepRule::Shallow, "", "");
     assert_eq!(s.selected.len(), 2);
-    assert_eq!(keep_paths(&s), ["a", "b"]);
+    assert_eq!(keep_paths(&s), [Path::new("a"), Path::new("b")]);
     assert_eq!(s.summary(&Filter::default()).extras, 2);
     assert!(
         s.selection(SelectionAction::Toggle {
@@ -306,7 +306,10 @@ fn validated_file_paths_do_not_use_library_ids_and_reject_replacements() {
     write(root.path(), "b.jpg", b"same");
     let s = fixture(root.path());
     let b = id(&s, "b.jpg");
-    assert_eq!(s.path(b).unwrap(), root.path().join("b.jpg"));
+    assert_eq!(
+        s.path(b).unwrap(),
+        root.path().join("b.jpg").canonicalize().unwrap()
+    );
     assert!(s.path(usize::MAX).is_err());
     fs::remove_file(root.path().join("b.jpg")).unwrap();
     write(root.path(), "b.jpg", b"same");

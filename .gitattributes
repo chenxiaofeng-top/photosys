@@ -1,0 +1,6 @@
+*.sh text eol=lf
+
+# The offline map manifest records SHA-256 hashes of these text assets.
+public/maps/**/*.txt text eol=lf
+public/maps/**/*.geojson text eol=lf
+public/maps/**/*.json text eol=lf

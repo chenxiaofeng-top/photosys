@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch pinned official CPU runtimes; no Python is needed by the shipped app."""
+"""Fetch pinned official ONNX runtimes for the desktop installer."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -23,6 +23,10 @@ DIGESTS = {
     "1.24.2": "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3",
     "1.22.0": "d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
 }
+DIRECTML_ORT = ("microsoft.ml.onnxruntime.directml", "1.24.2",
+                "c9b8adb96dfb5578097bea42a7d9b7ff8f300fb3c3a6f3052fe5b702628ab681")
+DIRECTML_REDIST = ("microsoft.ai.directml", "1.15.4",
+                   "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9")
 
 
 def digest(path):
@@ -43,15 +47,13 @@ def extract_runtime(archive, target):
     return files
 
 
-def prepare(system, arch):
-    version, target = PACKAGES[(system, arch)]
-    expected = DIGESTS[version]
-    filename = f"microsoft.ml.onnxruntime.{version}.nupkg"
+def verified_package(package, version, expected):
+    filename = f"{package}.{version}.nupkg"
     cache = ROOT / "src-tauri/target/ai-runtime"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / filename
     if not archive.exists() or digest(archive) != expected:
-        url = f"https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/{version}/{filename}"
+        url = f"https://api.nuget.org/v3-flatcontainer/{package}/{version}/{filename}"
         print(f"Downloading {filename}", flush=True)
         partial = archive.with_suffix(".partial")
         with urllib.request.urlopen(url, timeout=120) as response, partial.open("wb") as output:
@@ -59,8 +61,10 @@ def prepare(system, arch):
         if digest(partial) != expected:
             raise RuntimeError(f"SHA-256 mismatch: {filename}")
         partial.replace(archive)
-    files = extract_runtime(archive, target)
-    output = ROOT / "src-tauri/binaries/onnxruntime" / arch
+    return archive
+
+
+def install_files(output, files):
     output.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():
         with tempfile.NamedTemporaryFile(dir=output, delete=False) as temporary:
@@ -69,7 +73,35 @@ def prepare(system, arch):
         staging.replace(output / name)
         if name.endswith(".dylib"):
             subprocess.run(["codesign", "--force", "--sign", "-", str(output / name)], check=True)
+
+
+def extract_directml(redist):
+    entries = {
+        "DirectML.dll": "bin/x64-win/DirectML.dll",
+        "DirectML-LICENSE.txt": "LICENSE.txt",
+        "DirectML-LICENSE-CODE.txt": "LICENSE-CODE.txt",
+        "DirectML-ThirdPartyNotices.txt": "ThirdPartyNotices.txt",
+    }
+    with zipfile.ZipFile(redist) as source:
+        try:
+            return {name: source.read(entry) for name, entry in entries.items()}
+        except KeyError as error:
+            raise RuntimeError(f"Incomplete DirectML redistributable: {redist}") from error
+
+
+def prepare(system, arch):
+    version, target = PACKAGES[(system, arch)]
+    archive = verified_package("microsoft.ml.onnxruntime", version, DIGESTS[version])
+    output = ROOT / "src-tauri/binaries/onnxruntime"
+    install_files(output / arch, extract_runtime(archive, target))
     print(f"Prepared CPU runtime {version}: {system} {arch}", flush=True)
+
+    if (system, arch) == ("Windows", "x86_64"):
+        ort = verified_package(*DIRECTML_ORT)
+        redist = verified_package(*DIRECTML_REDIST)
+        files = extract_runtime(ort, target) | extract_directml(redist)
+        install_files(output / "directml" / arch, files)
+        print(f"Prepared ONNX Runtime DirectML {DIRECTML_ORT[1]} and DirectML {DIRECTML_REDIST[1]}", flush=True)
 
 
 if __name__ == "__main__":

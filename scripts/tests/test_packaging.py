@@ -22,6 +22,7 @@ def load_script(name):
 versions = load_script("check-release-version")
 publisher = load_script("publish-desktop-release")
 runtime = load_script("prepare-ai-runtime")
+windows_runtime = load_script("prepare-windows-runtime")
 
 
 class RuntimeTests(unittest.TestCase):
@@ -69,6 +70,46 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
                 runtime.prepare("Linux", "x86_64")
         self.assertFalse((self.archive.parent / "src-tauri/binaries/onnxruntime").exists())
+
+    def test_directml_installs_only_the_x64_windows_redistributable_and_licenses(self):
+        with zipfile.ZipFile(self.archive, "w") as source:
+            for name in ("bin/x64-win/DirectML.dll", "bin/arm64-win/DirectML.dll",
+                         "bin/x64-win/DirectML.Debug.dll", "LICENSE.txt", "LICENSE-CODE.txt",
+                         "ThirdPartyNotices.txt"):
+                source.writestr(name, name)
+        self.assertEqual(runtime.extract_directml(self.archive), {
+            "DirectML.dll": b"bin/x64-win/DirectML.dll",
+            "DirectML-LICENSE.txt": b"LICENSE.txt",
+            "DirectML-LICENSE-CODE.txt": b"LICENSE-CODE.txt",
+            "DirectML-ThirdPartyNotices.txt": b"ThirdPartyNotices.txt",
+        })
+        with zipfile.ZipFile(self.archive, "w") as source:
+            source.writestr("bin/x64-win/DirectML.dll", b"native")
+        with self.assertRaisesRegex(RuntimeError, "Incomplete DirectML"):
+            runtime.extract_directml(self.archive)
+
+
+class WindowsRuntimeTests(unittest.TestCase):
+    def test_staging_rejects_missing_dll_and_copies_only_installer_resources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "redist"
+            source.mkdir()
+            output = root / "staged"
+            files = list(windows_runtime.DLLS)
+            for name in files[:-1] + ["concrt140.dll"]:
+                (source / name).write_bytes(name.encode())
+            with self.assertRaisesRegex(RuntimeError, files[-1]):
+                windows_runtime.stage_crt(source, output)
+            self.assertFalse(output.exists())
+
+            (source / files[-1]).write_bytes(files[-1].encode())
+            windows_runtime.stage_crt(source, output)
+            self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()},
+                             {name: name.encode() for name in files})
+            config = json.loads((SCRIPTS.parent / "src-tauri/tauri.windows.conf.json").read_text())
+            self.assertEqual(config["bundle"]["resources"],
+                             {f"target/windows-runtime/x64/{name}": name for name in files})
 
 
 class VersionTests(unittest.TestCase):

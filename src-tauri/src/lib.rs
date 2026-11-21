@@ -72,6 +72,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             ai::initialize_choices(app.handle()).map_err(std::io::Error::other)?;
+            ai::device::initialize_settings(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -90,6 +91,8 @@ pub fn run() {
             maps::offline_map_delete,
             maps::offline_map_read,
             ai::catalog::ai_model_catalog,
+            ai::device::ai_inference_status,
+            ai::device::ai_set_inference_preference,
             ai::ai_activate_model,
             ai::ai_model_change_impact,
             ai::ai_open_model_source,
@@ -105,10 +108,17 @@ pub fn run() {
             library::ai_search::ai_search,
             library::people::people_index_status,
             library::people::people_update_index,
+            library::people::people_save_grouping,
+            library::people::people_pending_groups,
+            library::people::people_pending_faces,
+            library::people::people_edit_pending_group,
             library::people::people_cancel_index,
             library::people::people_index_issues,
             library::people::people_list,
             library::people::people_faces,
+            library::people::people_face_suggestions,
+            library::people::people_similar_faces,
+            library::people::people_confirm_similar_faces,
             library::people::people_photos,
             library::people::people_photo_people,
             library::people::people_months,
@@ -122,6 +132,7 @@ pub fn run() {
             library::albums::album_items,
             library::albums::albums_edit,
             library::library_issues,
+            library::details::library_media_details,
             library::library_preview,
             library::library_live_video,
             library::set_library_favorite,
@@ -148,6 +159,7 @@ pub fn run() {
             similar::similar_groups,
             similar::similar_members,
             similar::similar_issues,
+            similar::similar_media_details,
             similar::similar_preview
         ])
         .run(tauri::generate_context!())

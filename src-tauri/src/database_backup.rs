@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -155,7 +155,13 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
     let version: u32 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(error)?;
-    if version > if name == "people.sqlite" { 2 } else { 0 } {
+    if version
+        > if name == "people.sqlite" {
+            library::people::SCHEMA_VERSION
+        } else {
+            0
+        }
+    {
         return Err(format!("{name} 来自较新版本，请更新 PhotoSys。"));
     }
     let queries: &[&str] = match name {
@@ -175,6 +181,15 @@ fn validate_database(path: &Path, name: &str) -> Result<(), String> {
         _ => return Err("未知数据库。".into()),
     };
     for sql in queries {
+        c.prepare(sql)
+            .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
+    }
+    if name == "people.sqlite" && version >= 3 {
+        let sql = if version >= 4 {
+            "SELECT ignored,important FROM people LIMIT 0"
+        } else {
+            "SELECT ignored FROM people LIMIT 0"
+        };
         c.prepare(sql)
             .map_err(|e| format!("{name} 表结构不兼容。{e}"))?;
     }
@@ -222,7 +237,9 @@ fn snapshot(source: &Path, destination: &Path, mut tick: impl FnMut()) -> Result
     }
     drop(backup);
     target.close().map_err(|(_, e)| error(e))?;
-    File::open(destination)
+    OpenOptions::new()
+        .write(true)
+        .open(destination)
         .and_then(|f| f.sync_all())
         .map_err(error)
 }
@@ -788,6 +805,7 @@ pub(crate) async fn database_restore(
         let _task = crate::file_task()?;
         let _database = crate::database_access::maintenance()?;
         library::people::close_reader()?;
+        library::ai_search::close_reader()?;
         let root = Root::new(Path::new(&directory)).map_err(error)?;
         let directory = root.path.to_str().ok_or("相册路径无法显示。")?.to_owned();
         let (rollback, mut warning) = restore(

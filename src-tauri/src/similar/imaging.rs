@@ -216,9 +216,38 @@ pub(crate) fn preview(
     size: u64,
     detail: bool,
 ) -> Result<String, String> {
-    let (image, _, _) = scaled(file, path, size, if detail { 1600 } else { 240 }, None)?;
+    render_preview(
+        file,
+        path,
+        size,
+        if detail {
+            PreviewSize::Detail
+        } else {
+            PreviewSize::Thumbnail
+        },
+    )
+}
+
+pub(super) enum PreviewSize {
+    Thumbnail,
+    Detail,
+    Large,
+}
+
+pub(super) fn render_preview(
+    file: &mut File,
+    path: &Path,
+    size: u64,
+    preview_size: PreviewSize,
+) -> Result<String, String> {
+    let (edge, quality) = match preview_size {
+        PreviewSize::Thumbnail => (240, 80),
+        PreviewSize::Detail => (1600, 90),
+        PreviewSize::Large => (3200, 90),
+    };
+    let (image, _, _) = scaled(file, path, size, edge, None)?;
     let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, if detail { 90 } else { 80 })
+    JpegEncoder::new_with_quality(&mut jpeg, quality)
         .encode_image(&image)
         .map_err(|error| error.to_string())?;
     Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg)))

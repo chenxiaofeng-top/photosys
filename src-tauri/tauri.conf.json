@@ -27,6 +27,7 @@
     "active": true,
     "externalBin": [
       "binaries/photosys-ffmpeg",
+      "binaries/photosys-ffprobe",
       "binaries/photosys-pmtiles"
     ],
     "resources": {

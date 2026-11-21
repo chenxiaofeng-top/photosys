@@ -10,25 +10,28 @@ import "element-plus/es/components/input/style/css";
 import "element-plus/es/components/option/style/css";
 import "element-plus/es/components/select/style/css";
 import LibraryThumbnail from "./LibraryThumbnail.vue";
+import MediaDetailsInfo from "./MediaDetailsInfo.vue";
 import RotatableImage, { type Rotation } from "./RotatableImage.vue";
 import AiSearchSettings from "./AiSearchSettings.vue";
 import DatabaseBackup from "./DatabaseBackup.vue";
+import DateFilterPicker from "./DateFilterPicker.vue";
+import { ALL_DATES, UNKNOWN_DATES, monthDateRange, sameDateFilter, type DateFilter } from "./dateFilter";
 import type { DatabaseRestoreResult, LibrarySummary } from "./databaseBackup";
 import PeoplePanel from "./PeoplePanel.vue";
 import AlbumsPanel from "./AlbumsPanel.vue";
 import AlbumPicker from "./AlbumPicker.vue";
 import type { Album, AlbumEditResult } from "./albums";
-import type { Item, Page, Kind, Sort, LibraryMode } from "./libraryTypes";
+import type { Item, Page, Kind, Sort, LibraryMode, MediaDetails } from "./libraryTypes";
 import { useAlbumSelection } from "./albumSelection";
 import PeopleFaceEditor from "./PeopleFaceEditor.vue";
 const LocationMap = defineAsyncComponent(() => import("./LocationMap.vue"));
 import { shortLocation, type Coordinates, type LocationMode, type Selection } from "./locations";
 import type { Person, PeopleStatus, Month } from "./people";
 import type { IndexStatus } from "./aiSearch";
-import { formatBytes } from "./formatBytes";
 import { setLibraryThumbnailConcurrency } from "./libraryThumbnailQueue";
 
 type FileAction = "open" | "reveal" | "copy";
+type LibraryView = "grid" | "timeline";
 
 interface Issue {
   path: string;
@@ -60,9 +63,10 @@ const itemsError = ref("");
 const issuesError = ref("");
 
 const kind = ref<Kind | "all">("all");
-const dateMode = ref<"all" | "range" | "unknown">("all");
-const from = ref("");
-const to = ref("");
+const dateFilter = shallowRef<DateFilter>(ALL_DATES);
+function setDateFilter(next: DateFilter) {
+  if (!sameDateFilter(dateFilter.value, next)) dateFilter.value = next;
+}
 const favoritesOnly = ref(false);
 const locationMode = ref<LocationMode>("all");
 const locationSelection = shallowRef<Selection | null>(null);
@@ -87,6 +91,29 @@ const aiIndex = ref<IndexStatus>();
 const aiPanel = ref<InstanceType<typeof AiSearchSettings>>();
 const aiRevision = ref(0);
 const sort = ref<Sort>("dateDesc");
+const timelineSort = ref<"dateDesc" | "dateAsc">("dateDesc");
+const libraryViewKey = "photosys.libraryView";
+const libraryView = ref<LibraryView>("grid");
+try {
+  if (window.localStorage.getItem(libraryViewKey) === "timeline") libraryView.value = "timeline";
+} catch { /* The current session can still change views. */ }
+
+const canChooseLibraryView = computed(() => props.mode === "library" && searchMode.value === "filename");
+const libraryTimeline = computed(() => canChooseLibraryView.value && libraryView.value === "timeline");
+const activeSort = computed<Sort>({
+  get: () => libraryTimeline.value ? timelineSort.value : sort.value,
+  set: (value) => {
+    if (!libraryTimeline.value) sort.value = value;
+    else if (value === "dateDesc" || value === "dateAsc") timelineSort.value = value;
+  },
+});
+
+function setLibraryView(value: LibraryView) {
+  libraryView.value = value;
+  try { window.localStorage.setItem(libraryViewKey, value); }
+  catch { /* The current session can still change views. */ }
+}
+
 const selectedPerson = shallowRef<Person>();
 const peopleVisited = ref(false);
 const peopleRevision = ref(0);
@@ -97,18 +124,16 @@ function personChanged() { peopleRevision.value++; revision.value++; }
 function selectPerson(person: Person | undefined) {
   selectedPerson.value = person;
   requestedPage.value = 0;
-  if (person) { dateMode.value = "all"; from.value = ""; to.value = ""; favoritesOnly.value = false; sort.value = "dateAsc"; }
+  if (person) { dateFilter.value = ALL_DATES; favoritesOnly.value = false; sort.value = "dateAsc"; }
 }
 function selectMonth(month: string | null) {
-  if (month === null) { dateMode.value = "unknown"; return; }
-  from.value = `${month}-01`;
-  const [year, number] = month.split("-").map(Number);
-  const end = new Date(Date.UTC(year!, number!, 0)).getUTCDate();
-  to.value = `${month}-${String(end).padStart(2, "0")}`;
-  dateMode.value = "range";
+  setDateFilter(month === null ? UNKNOWN_DATES : monthDateRange(month));
+}
+function monthSelected(month: string | null) {
+  return sameDateFilter(dateFilter.value, month === null ? UNKNOWN_DATES : monthDateRange(month));
 }
 function monthTitle(date: string | null) { return date ? `${date.slice(0, 4)} 年 ${Number(date.slice(5, 7))} 月` : "日期未知"; }
-let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateMode: typeof dateMode.value; from: string; to: string; favoritesOnly: boolean; input: string; query: string } | undefined;
+let libraryPreferences: { searchMode: typeof searchMode.value; sort: Sort; kind: typeof kind.value; dateFilter: DateFilter; favoritesOnly: boolean; input: string; query: string } | undefined;
 const composing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 const searchPending = computed(() => searchMode.value === "filename" && (composing.value || searchInput.value.trim() !== query.value));
@@ -148,9 +173,9 @@ watch(searchInput, scheduleSearch);
 const filter = computed(() => ({
   query: query.value,
   kind: kind.value === "all" ? null : kind.value,
-  from: dateMode.value === "range" ? from.value || null : null,
-  to: dateMode.value === "range" ? to.value || null : null,
-  unknownDate: dateMode.value === "unknown",
+  from: dateFilter.value.mode === "range" ? dateFilter.value.from : null,
+  to: dateFilter.value.mode === "range" ? dateFilter.value.to : null,
+  unknownDate: dateFilter.value.mode === "unknown",
   favoritesOnly: favoritesOnly.value,
   locationMode: albumsMode.value ? "all" as const : locationMode.value,
   locationSelection: albumsMode.value ? null : locationSelection.value,
@@ -164,7 +189,7 @@ const addedAlbum = shallowRef<Album>();
 const albumError = ref("");
 const albumPicker = ref<InstanceType<typeof AlbumPicker>>();
 const { selected: selectedFiles, selecting, clear: clearSelection, toggle: toggleSelection, selectPage, stop: stopSelection } = useAlbumSelection([
-  summary, filter, sort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
+  summary, filter, activeSort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
 ]);
 const requestedPage = ref(0);
 const revision = ref(0);
@@ -172,16 +197,19 @@ watch(() => props.mode, (mode, oldMode) => {
   const people = mode === "people";
   if (mode !== "library") {
     if (people) peopleVisited.value = true;
-    if (oldMode === "library" || oldMode === undefined) libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateMode: dateMode.value, from: from.value, to: to.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
-    searchMode.value = "filename"; clearSearch(); kind.value = people ? "photo" : "all"; dateMode.value = "all"; favoritesOnly.value = false; sort.value = people ? "dateAsc" : "dateDesc";
+    if (oldMode === "library" || oldMode === undefined) libraryPreferences = { searchMode: searchMode.value, sort: sort.value, kind: kind.value, dateFilter: dateFilter.value, favoritesOnly: favoritesOnly.value, input: searchInput.value, query: query.value };
+    searchMode.value = "filename"; clearSearch(); kind.value = people ? "photo" : "all"; dateFilter.value = ALL_DATES; favoritesOnly.value = false; sort.value = people ? "dateAsc" : "dateDesc";
   } else if (libraryPreferences) {
-    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateMode.value = p.dateMode; from.value = p.from; to.value = p.to; favoritesOnly.value = p.favoritesOnly;
+    const p = libraryPreferences; searchMode.value = p.searchMode; sort.value = p.sort; kind.value = p.kind; dateFilter.value = p.dateFilter; favoritesOnly.value = p.favoritesOnly;
     nextTick(() => { searchInput.value = p.input; query.value = p.query; });
     libraryPreferences = undefined;
   }
 }, { immediate: true });
 
 const results = shallowRef<Page<Item>>();
+// Only group results from a library request that used the current timeline order.
+const loadedLibrarySort = ref<Sort>();
+const timelineResultsReady = computed(() => !libraryTimeline.value || loadedLibrarySort.value === activeSort.value);
 // A page request may have started before a rotation was saved (for example when
 // closing a detail on another page). Keep its eventual response up to date.
 const savedRotations = new Map<number, Rotation>();
@@ -231,16 +259,20 @@ async function fetchPage(scanId: number, currentFilter: typeof filter.value, cur
   }
   return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
 }
-watch([filter, sort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, sort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([filter, activeSort], () => { requestedPage.value = 0; }, { flush: "sync" });
+watch([summary, filter, activeSort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
+  const requestedLibrarySort = canChooseLibraryView.value ? currentSort : undefined;
   let receiving = true;
   onCleanup(() => { receiving = false; });
   itemsLoading.value = true;
   itemsError.value = "";
   try {
     const result = await fetchPage(scan.scanId, currentFilter, currentSort, page);
-    if (receiving) results.value = withSavedRotations(result);
+    if (receiving) {
+      loadedLibrarySort.value = requestedLibrarySort;
+      results.value = withSavedRotations(result);
+    }
   } catch (cause) {
     if (receiving) {
       results.value = undefined;
@@ -282,6 +314,11 @@ watch([summary, issuesOpen, issuePage], async ([scan, open, page], _, onCleanup)
 });
 
 const detail = shallowRef<Item>();
+const detailBody = ref<HTMLElement>();
+const detailInformation = ref<HTMLElement>();
+const mediaDetails = shallowRef<MediaDetails>();
+const mediaDetailsLoading = ref(false);
+const mediaDetailsError = ref("");
 const dialog = ref<HTMLDialogElement>();
 const detailImage = ref("");
 const detailPeople = ref<string[]>([]);
@@ -303,6 +340,10 @@ const liveVideoUrl = ref("");
 const liveVideoLoading = ref(false);
 const liveVideoError = ref("");
 let detailRequest = 0;
+type MetadataRequest = { scanId: number; fileId: number };
+let activeMetadata: MetadataRequest | undefined;
+let pendingMetadata: MetadataRequest | undefined;
+let readingMetadata = false;
 const canRotate = computed(() => detail.value?.kind === "photo" && detail.value.previewAvailable &&
   previewReady.value && !previewError.value && !detailNavigating.value && !rotationSaving.value &&
   !liveVideoLoading.value && !liveVideoUrl.value);
@@ -338,7 +379,7 @@ async function rotateDetail(delta: -90 | 90) {
 
 function selectAlbum(album: Album | undefined) {
   selectedAlbum.value = album;
-  requestedPage.value = 0; clearSearch(); kind.value = "all"; dateMode.value = "all";
+  requestedPage.value = 0; clearSearch(); kind.value = "all"; dateFilter.value = ALL_DATES;
   favoritesOnly.value = false; sort.value = "dateDesc"; stopSelection();
 }
 function addToAlbum(album: Album) {
@@ -410,9 +451,7 @@ function showScan(selected: string, scanned: Summary) {
     peopleStatus.value = undefined;
     libraryPreferences = undefined;
     kind.value = "all";
-    dateMode.value = "all";
-    from.value = "";
-    to.value = "";
+    dateFilter.value = ALL_DATES;
     favoritesOnly.value = false;
     locationMode.value = "all"; locationSelection.value = null; mapFocus.value = null;
     clearSearch();
@@ -504,7 +543,7 @@ async function toggleFavorite(item: Item) {
   }
 }
 
-watch([summary, filter, sort, revision, searchMode, selectedPerson, () => props.mode, selectedAlbum], () => {
+watch([summary, filter, activeSort, revision, searchMode, selectedPerson, () => props.mode, selectedAlbum], () => {
   pendingFocus = undefined;
   dialog.value?.close();
   resetDetail();
@@ -539,6 +578,39 @@ watch([detail, peopleRevision], async (_, __, cleanup) => {
     if (current) detailPeople.value = value.map(p => p.name || `未命名人物 ${p.id}`);
   } catch (cause) { if (current) detailError.value = `无法读取人物标注。${String(cause)}`; }
 });
+
+watch([() => summary.value?.scanId, () => detail.value?.id], ([scanId, fileId]) => {
+  activeMetadata = scanId !== undefined && fileId !== undefined ? { scanId, fileId } : undefined;
+  pendingMetadata = activeMetadata;
+  mediaDetails.value = undefined;
+  mediaDetailsError.value = "";
+  mediaDetailsLoading.value = !!activeMetadata;
+  if (detailBody.value) detailBody.value.scrollTop = 0;
+  if (detailInformation.value) detailInformation.value.scrollTop = 0;
+  void readLatestMetadata();
+});
+
+async function readLatestMetadata() {
+  if (readingMetadata) return;
+  readingMetadata = true;
+  try {
+    // Keep at most one request running and skip items already passed during navigation.
+    while (pendingMetadata) {
+      const request = pendingMetadata;
+      pendingMetadata = undefined;
+      try {
+        const result = await invoke<MediaDetails>("library_media_details", request);
+        if (activeMetadata === request) mediaDetails.value = result;
+      } catch (cause) {
+        if (activeMetadata === request) mediaDetailsError.value = String(cause);
+      } finally {
+        if (activeMetadata === request) mediaDetailsLoading.value = false;
+      }
+    }
+  } finally {
+    readingMetadata = false;
+  }
+}
 
 async function loadDetail(item: Item, thumbnail = "") {
   const scanId = summary.value?.scanId;
@@ -591,7 +663,7 @@ async function moveDetail(delta: -1 | 1) {
     detailError.value = "";
     detailStatus.value = "";
     try {
-      nextPage = await fetchPage(scanId, filter.value, sort.value, targetPage);
+      nextPage = await fetchPage(scanId, filter.value, activeSort.value, targetPage);
       if (request !== detailRequest || !dialog.value?.open) return;
       nextPage = withSavedRotations(nextPage);
     } catch (cause) {
@@ -678,6 +750,8 @@ function clearLiveVideo() {
 onBeforeUnmount(() => {
   clearTimeout(searchTimer);
   detailRequest++;
+  activeMetadata = undefined;
+  pendingMetadata = undefined;
   clearLiveVideo();
 });
 
@@ -807,9 +881,9 @@ async function performFileAction(action: FileAction) {
       </div>
       <p v-if="peopleMode" class="timeline-intro">按拍摄日期浏览成长记录，未知日期单独列出。</p>
       <nav v-if="peopleMode && months?.length" class="timeline-months" aria-label="成长时间线年月导航">
-        <button type="button" class="secondary" :aria-pressed="dateMode === 'all'" @click="dateMode = 'all'">全部日期</button>
+        <button type="button" class="secondary" :aria-pressed="dateFilter.mode === 'all'" @click="dateFilter = ALL_DATES">全部日期</button>
         <button v-for="entry in months" :key="entry.month ?? 'unknown'" type="button" class="secondary"
-          :aria-pressed="entry.month ? dateMode === 'range' && from === `${entry.month}-01` : dateMode === 'unknown'" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
+          :aria-pressed="monthSelected(entry.month)" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
       </nav>
       <p v-if="timelineError" class="error" role="alert">{{ timelineError }}</p>
       <div class="library-tools" :class="{ 'people-tools': peopleMode }" role="search" aria-label="媒体搜索与筛选">
@@ -833,16 +907,8 @@ async function performFileAction(action: FileAction) {
               <ElOption label="全部类型" value="all" /><ElOption label="照片" value="photo" /><ElOption label="视频" value="video" />
             </ElSelect>
           </div>
-          <div class="filter-field">
-            <span id="date-label">拍摄日期</span>
-            <ElSelect v-model="dateMode" class="date-select" aria-label="拍摄日期">
-              <ElOption label="全部日期" value="all" /><ElOption label="日期范围" value="range" /><ElOption label="日期未知" value="unknown" />
-            </ElSelect>
-          </div>
-          <div v-if="dateMode === 'range'" class="date-range">
-            <label>起始日期<input v-model="from" type="date" /></label>
-            <label>结束日期<input v-model="to" type="date" /></label>
-          </div>
+          <DateFilterPicker v-if="active" :key="`${mode}:${directory}:${peopleMode ? selectedPerson?.id : selectedAlbum?.id}`"
+            :model-value="dateFilter" @update:model-value="setDateFilter" />
           <div v-if="!albumsMode" class="filter-field">
             <span>拍摄位置</span>
             <ElSelect v-model="locationMode" class="location-select" aria-label="拍摄位置">
@@ -851,12 +917,21 @@ async function performFileAction(action: FileAction) {
           </div>
           <span v-if="!albumsMode && locationLabel" class="location-selection">{{ locationLabel }} <button type="button" class="secondary" @click="locationSelection = null">清除</button></span>
           <ElCheckbox v-model="favoritesOnly" class="favorite-filter">仅收藏</ElCheckbox>
+          <div v-if="canChooseLibraryView" class="filter-field">
+            <span id="library-view-label">显示方式</span>
+            <div class="library-view-options" role="group" aria-labelledby="library-view-label">
+              <button type="button" class="secondary" :aria-pressed="libraryView === 'grid'" :disabled="busy" @click="setLibraryView('grid')">网格</button>
+              <button type="button" class="secondary" :aria-pressed="libraryTimeline" :disabled="busy" @click="setLibraryView('timeline')">时间轴</button>
+            </div>
+          </div>
           <div v-if="searchMode === 'filename'" class="filter-field sort-field">
             <span id="sort-label">排序</span>
-            <ElSelect v-model="sort" class="sort-select" aria-label="排序">
+            <ElSelect v-model="activeSort" class="sort-select" aria-label="排序">
               <ElOption label="拍摄日期：从新到旧" value="dateDesc" /><ElOption label="拍摄日期：从旧到新" value="dateAsc" />
-              <ElOption v-if="!peopleMode" label="名称：升序" value="nameAsc" /><ElOption v-if="!peopleMode" label="名称：降序" value="nameDesc" />
-              <ElOption v-if="!peopleMode" label="文件大小：从大到小" value="sizeDesc" /><ElOption v-if="!peopleMode" label="文件大小：从小到大" value="sizeAsc" />
+              <template v-if="!peopleMode && !libraryTimeline">
+                <ElOption label="名称：升序" value="nameAsc" /><ElOption label="名称：降序" value="nameDesc" />
+                <ElOption label="文件大小：从大到小" value="sizeDesc" /><ElOption label="文件大小：从小到大" value="sizeAsc" />
+              </template>
             </ElSelect>
           </div>
           <span v-else class="relevance-note">按内容相关度排序 · 最多 200 张</span>
@@ -887,29 +962,31 @@ async function performFileAction(action: FileAction) {
           <template v-else>{{ results.total === summary.total ? `共 ${summary.total} 个媒体文件` : `${results.total} / ${summary.total} 个媒体文件` }}</template>
         </template>
       </p>
-      <div v-if="itemsLoading && !results?.items.length" class="library-empty" role="status">
+      <div v-if="itemsLoading && (!timelineResultsReady || !results?.items.length)" class="library-empty" role="status">
         <ElIcon class="empty-icon is-loading" aria-hidden="true"><Loading /></ElIcon>
         <h2>正在加载媒体…</h2>
         <p>精彩回忆，即将呈现。</p>
       </div>
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0 && albumsMode" class="library-empty" role="status">
-        <h2>{{ query || kind !== 'all' || dateMode !== 'all' || favoritesOnly ? '没有找到匹配的照片或视频' : '这个相册还没有照片或视频' }}</h2>
+        <h2>{{ query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly ? '没有找到匹配的照片或视频' : '这个相册还没有照片或视频' }}</h2>
         <p>到媒体库勾选同一次出游或情景里的照片和视频，加入这个相册。</p>
         <button type="button" :disabled="busy || !albumsWritable" @click="selectedAlbum && addToAlbum(selectedAlbum)">去媒体库添加</button>
-        <button v-if="query || kind !== 'all' || dateMode !== 'all' || favoritesOnly" type="button" class="secondary" @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false">清除搜索与筛选</button>
+        <button v-if="query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly" type="button" class="secondary" @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false">清除搜索与筛选</button>
       </div>
       <div v-else-if="!itemsLoading && !itemsError && results?.total === 0" class="library-empty" role="status">
         <ElIcon class="empty-icon" aria-hidden="true"><component :is="searchMode === 'content' && !query ? Search : Picture" /></ElIcon>
         <h2>{{ searchMode === 'content' && !query ? '用一句话，找回那个瞬间' : summary.total ? '没有找到匹配的照片或视频' : '这里还没有照片或视频' }}</h2>
         <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期、位置和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
-        <ElButton v-if="summary.total && (query || kind !== 'all' || dateMode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
-          @click="clearSearch(); kind = 'all'; dateMode = 'all'; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
+        <ElButton v-if="summary.total && (query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
+          @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
         <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
-      <ul v-if="results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
+      <ul v-if="timelineResultsReady && results?.items.length" ref="grid" class="media-grid" :aria-busy="itemsLoading">
         <template v-for="(item, index) in results.items" :key="`${summary.scanId}:${item.id}`">
-        <li v-if="peopleMode && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">{{ monthTitle(item.capturedOn) }}</li>
+        <li v-if="(peopleMode || libraryTimeline) && (index === 0 || item.capturedOn?.slice(0, 7) !== results.items[index - 1]?.capturedOn?.slice(0, 7))" class="timeline-heading">
+          <h2>{{ monthTitle(item.capturedOn) }}</h2>
+        </li>
         <li class="card" :class="{ 'card-selected': selecting && selectedFiles.has(item.id) }">
           <label v-if="selecting && !peopleMode" class="media-select"><input type="checkbox" :checked="selectedFiles.has(item.id)" :disabled="busy || itemsLoading || searchPending" :aria-label="`选择 ${item.name}`" @change="toggleSelection(item.id)" />选择</label>
           <button type="button" class="media-preview secondary" :data-file-id="item.id" :disabled="busy || itemsLoading || searchPending"
@@ -977,7 +1054,7 @@ async function performFileAction(action: FileAction) {
         <span role="status">第 {{ detailPosition + 1 }} / {{ detailPage?.total ?? 0 }} 项</span>
         <button type="button" class="secondary" :disabled="detailNavigating || rotationSaving || detailPosition + 1 >= (detailPage?.total ?? 0)" @click="moveDetail(1)">下一项</button>
       </nav>
-      <div class="detail-body">
+      <div ref="detailBody" class="detail-body">
         <div class="detail-viewer">
           <p v-if="detailNavigating" class="status" role="status">正在切换媒体…</p>
           <video v-else-if="liveVideoUrl" ref="liveVideo" class="detail-image" :src="liveVideoUrl"
@@ -989,34 +1066,40 @@ async function performFileAction(action: FileAction) {
           <p v-if="previewError" class="error" role="alert">{{ previewError }}</p>
           <p v-else-if="!detail.previewAvailable && !detailNavigating" class="viewer-placeholder">此媒体暂不支持预览，可用系统默认应用打开。</p>
         </div>
-        <aside class="detail-information" aria-label="媒体信息与操作">
-          <h3 class="information-heading">{{ detail.kind === 'video' ? '视频信息' : '照片信息' }}</h3>
+        <aside ref="detailInformation" class="detail-information" aria-label="媒体信息与操作">
+          <div class="information-header">
+            <h3>{{ detail.isLivePhoto ? '实况照片信息' : detail.kind === 'video' ? '视频信息' : '照片信息' }}</h3>
+            <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
+              @click="playLivePhoto">
+              {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
+            </button>
+          </div>
+          <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
           <div v-if="detail.kind === 'photo' && detail.previewAvailable && !liveVideoUrl" class="rotation-actions">
             <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(-90)">向左旋转 90°</button>
             <button type="button" class="secondary" :disabled="!canRotate" @click="rotateDetail(90)">向右旋转 90°</button>
             <span class="status" role="status">{{ rotationSaving ? "正在保存方向…" : `已保存方向：${detail.rotation}°` }}</span>
           </div>
           <p v-if="rotationError" class="error" role="alert">{{ rotationError }}</p>
+          <MediaDetailsInfo :item="detail" :details="mediaDetails" :loading="mediaDetailsLoading" :error="mediaDetailsError" />
+          <section class="detail-location">
+            <h4>位置</h4>
+            <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
+            <template v-if="detail.location">
+              <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
+              <button v-if="!albumsMode" type="button" class="secondary" @click="locateDetail">在地图中查看</button>
+            </template>
+          </section>
           <p v-if="detailPeople.length" class="status">照片中的人物：{{ detailPeople.join("、") }}</p>
           <details v-if="summary && detail.kind === 'photo'" class="detail-people">
             <summary>照片中的人物 / 修改分组</summary>
             <PeopleFaceEditor :scan-id="summary.scanId" :file-id="detail.id" :revision="peopleRevision" :writable="peopleStatus?.writable" :busy="busy || rotationSaving"
               @changed="detailPeopleChanged" />
           </details>
-          <div class="detail-location">
-            <p>{{ detail.location?.address || (detail.location ? '地址暂不可用' : '位置未知') }}</p>
-            <template v-if="detail.location">
-              <p>纬度 {{ detail.location.latitude.toFixed(6) }} · 经度 {{ detail.location.longitude.toFixed(6) }}（WGS84）</p>
-              <button v-if="!albumsMode" type="button" class="secondary" @click="locateDetail">在地图中查看</button>
-            </template>
-          </div>
-          <p class="detail-path">{{ detail.relativePath }}</p>
-          <p class="status">{{ detail.capturedOn ?? "日期未知" }} · {{ formatBytes(detail.size) }}</p>
-          <button v-if="detail.isLivePhoto && !liveVideoUrl" type="button" :disabled="detailNavigating || rotationSaving || liveVideoLoading"
-            @click="playLivePhoto">
-            {{ liveVideoLoading ? "正在加载实况视频…" : "播放实况" }}
-          </button>
-          <p v-if="liveVideoError" class="error" role="alert">{{ liveVideoError }}</p>
+          <dl class="detail-file-path">
+            <dt>相对路径</dt>
+            <dd>{{ detail.relativePath }}</dd>
+          </dl>
           <div class="detail-actions">
             <button type="button" :disabled="!!fileAction || detailNavigating" @click="performFileAction('open')">
               {{ detail.kind === "video" ? "用系统播放器打开" : "用系统默认应用打开" }}
@@ -1054,13 +1137,13 @@ async function performFileAction(action: FileAction) {
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 16px; }
 .filter-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .filter-field > span { color: var(--muted); white-space: nowrap; font-size: 13px; }
-.kind-select, .date-select, .location-select { width: 120px; }
+.library-view-options { display: inline-flex; gap: 4px; }
+.library-view-options button { min-height: 32px; padding: 4px 10px; white-space: nowrap; font-size: 13px; }
+.library-view-options button[aria-pressed="true"]:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.kind-select, .location-select { width: 120px; }
 .sort-select { width: 200px; }
 .sort-field { margin-left: auto; }
 .favorite-filter { margin-right: 0; }
-.date-range { display: flex; flex-wrap: wrap; gap: 8px; }
-.date-range label { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; font-weight: 400; color: var(--muted); }
-.date-range input { max-width: 100%; }
 .relevance-note { margin-left: auto; color: var(--muted); font-size: 13px; }
 .location-selection { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--accent); font-size: 13px; }
 .scan-status, .library-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; padding: 12px 16px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
@@ -1098,7 +1181,7 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
 .timeline-months { display: flex; flex-wrap: wrap; gap: 8px; max-height: 160px; overflow-y: auto; margin: 20px 0; }
 .timeline-months button { font-size: 13px; }
 .timeline-months [aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.timeline-heading { grid-column: 1 / -1; margin-top: 20px; font-size: 20px; font-weight: 600; color: var(--text); }
+.timeline-heading { grid-column: 1 / -1; margin-top: 20px; }
 .timeline-intro { color: var(--muted); }
 .people-tools .filters { margin-top: 0; }
 .media-library > details { margin-top: 24px; }
@@ -1107,21 +1190,27 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
 .detail-header h2 { flex: 1; min-width: 0; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-navigation { justify-content: center; padding: 0 24px 16px; margin: 0; font-size: 13px; color: var(--muted); }
 .detail-navigation span { font-variant-numeric: tabular-nums; }
-.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: min(72vh, 820px); border-top: 1px solid var(--border); }
+.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: min(72vh, 820px); border-top: 1px solid var(--border); }
 .detail-viewer { display: grid; place-items: center; min-width: 0; min-height: 0; overflow: hidden; background: var(--viewer); color: var(--viewer-text); }
 .detail-viewer .status, .viewer-placeholder { padding: 24px; color: var(--viewer-text); text-align: center; }
 .detail-viewer .error { padding: 24px; color: var(--viewer-error); }
 .detail-viewer :deep(.rotatable-image.detail) { width: 100%; height: 100%; max-height: none; aspect-ratio: auto !important; background: var(--viewer); }
 .detail-image { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; background: var(--viewer); }
 .detail-information { min-width: 0; overflow-y: auto; padding: 24px; border-left: 1px solid var(--border); background: var(--surface); }
-.information-heading { margin: 0 0 20px; font-size: 14px; font-weight: 600; }
-.detail-location, .detail-path, .detail-information .status { font-size: 13px; }
-.detail-location { margin: 16px 0; color: var(--text-secondary); }
-.detail-path { padding-top: 16px; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
-.rotation-actions { gap: 8px; }
+.information-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 14px; }
+.information-header h3 { margin: 0; font-size: 16px; font-weight: 650; }
+.information-header button { padding: 6px 10px; min-height: 32px; font-size: 13px; }
+.detail-location, .detail-information .status { font-size: 13px; }
+.detail-location { padding-block: 14px; border-top: 1px solid var(--border); }
+.detail-location h4 { margin: 0 0 9px; font-size: 13px; font-weight: 650; }
+.detail-location p { margin: 0 0 6px; color: var(--text-secondary); }
+.detail-location p:last-child { margin-bottom: 0; }
+.rotation-actions { gap: 8px; margin-bottom: 14px; }
 .rotation-actions button { flex: 1; padding-inline: 8px; font-size: 12px; }
 .rotation-actions .status { flex-basis: 100%; }
 .detail-people { margin-top: 16px; padding-block: 16px; border-block: 1px solid var(--border); font-size: 13px; }
+.detail-file-path { display: block; margin: 14px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.detail-file-path dd { margin: 4px 0 0; font-size: inherit; font-weight: 500; }
 .detail-actions { align-items: stretch; flex-direction: column; gap: 8px; margin-top: 16px; }
 @media (max-width: 1199px) {
   .directory-toolbar { flex-basis: 100%; }
@@ -1149,9 +1238,6 @@ button.favorite:hover:not(:disabled) { background: var(--accent-soft); color: va
   .filter-field { flex: 1 1 150px; justify-content: space-between; }
   .filter-field :deep(.el-select) { flex: 1; min-width: 0; width: auto; }
   .sort-field { flex-basis: 100%; }
-  .date-range { width: 100%; }
-  .date-range label { flex: 1 1 100%; }
-  .date-range input { flex: 1; }
   .relevance-note { margin-left: 0; }
   .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   button.favorite { width: 40px; min-height: 40px; }
