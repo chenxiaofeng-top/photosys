@@ -671,7 +671,7 @@ fn avatar_search_filters_candidates_and_moves_only_the_confirmed_faces() {
         let visible = search(criteria);
         let write = confirm(&[0]);
         fs::set_permissions(&path, original).unwrap();
-        assert_eq!(visible.unwrap().faces.total, 5);
+        assert_eq!(visible.unwrap().faces.total, results.faces.total);
         assert!(write.is_err());
         assert_eq!(assigned(&store, ids[1][0]), None);
     }
@@ -2633,11 +2633,6 @@ fn database_backup_restores_legacy_people_and_dissolves_ignored_groups() {
     assert_ne!(id, new_id);
     assert!(query::people(id, "", 0, Default::default()).is_err());
     assert_projection(new_id);
-    let restored = status(new_id).unwrap();
-    assert_eq!(
-        serde_json::to_value(restored.grouping_settings).unwrap()["parameters"],
-        saved
-    );
     let scan = super::scan(new_id).unwrap();
     assert_eq!(
         Store::open(&scan, false)
@@ -2647,8 +2642,13 @@ fn database_backup_restores_legacy_people_and_dissolves_ignored_groups() {
             .unwrap(),
         5
     );
+    let restored = status(new_id).unwrap();
     assert_eq!(
-        Store::open(&scan, true)
+        serde_json::to_value(restored.grouping_settings).unwrap()["parameters"],
+        saved
+    );
+    assert_eq!(
+        Store::open(&scan, false)
             .unwrap()
             .unwrap()
             .schema_version()
