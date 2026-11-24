@@ -45,15 +45,22 @@ interface OpenedLibrary {
   summary: Summary;
 }
 
+interface ExportSummary {
+  succeeded: number;
+  skipped: number;
+  failed: number;
+}
+
 const props = withDefaults(defineProps<{ mode?: LibraryMode; active?: boolean }>(), { mode: "library", active: true });
 const peopleMode = computed(() => props.mode === "people");
 const albumsMode = computed(() => props.mode === "albums");
 const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [directory: string]; modeChange: [mode: LibraryMode] }>();
 const pageSize = 24;
 const directory = ref("");
-const task = ref<"starting" | "choosing" | "scanning" | "saving" | "database" | undefined>("starting");
+const task = ref<"starting" | "choosing" | "scanning" | "saving" | "database" | "choosingExport" | "exporting" | undefined>("starting");
 const indexStorageBusy = ref(false);
 const busy = computed(() => task.value !== undefined || indexStorageBusy.value);
+const exportBusy = computed(() => task.value === "choosingExport" || task.value === "exporting");
 watch(busy, (value) => emit("busyChange", value), { flush: "sync", immediate: true });
 
 const summary = shallowRef<Summary>();
@@ -188,6 +195,8 @@ const albumsWritable = ref(false);
 const targetAlbum = shallowRef<Album>();
 const addedAlbum = shallowRef<Album>();
 const albumError = ref("");
+const exportResult = shallowRef<ExportSummary & { destination: string }>();
+const exportError = ref("");
 const albumPicker = ref<InstanceType<typeof AlbumPicker>>();
 const { selected: selectedFiles, selecting, clear: clearSelection, toggle: toggleSelection, selectPage, stop: stopSelection } = useAlbumSelection([
   summary, filter, activeSort, searchMode, () => props.mode, () => selectedAlbum.value?.id,
@@ -401,6 +410,32 @@ function returnToAlbum(album: Album) {
   emit("modeChange", "albums");
 }
 function albumBusy(value: boolean) { task.value = value ? "saving" : undefined; }
+async function exportOriginals() {
+  const scanId = summary.value?.scanId;
+  if (scanId === undefined || busy.value || itemsLoading.value || searchPending.value || !selectedFiles.value.size) return;
+  const fileIds = [...selectedFiles.value];
+  task.value = "choosingExport";
+  try {
+    const destination = await invoke<string | null>("choose_folder", { title: "选择原件导出目录" });
+    if (destination === null) return;
+    exportResult.value = undefined;
+    exportError.value = "";
+    task.value = "exporting";
+    const result = await invoke<ExportSummary>("export_library_originals", { scanId, fileIds, destination });
+    exportResult.value = { ...result, destination };
+  } catch (cause) {
+    exportResult.value = undefined;
+    exportError.value = `导出原件失败。${String(cause)}`;
+  } finally {
+    task.value = undefined;
+  }
+}
+
+watch([summary, () => props.mode, () => selectedAlbum.value?.id, () => props.active], () => {
+  exportResult.value = undefined;
+  exportError.value = "";
+});
+
 async function removeFromAlbum() {
   const scanId = summary.value?.scanId; const album = selectedAlbum.value;
   if (scanId === undefined || !album || !selectedFiles.value.size || busy.value || !albumsWritable.value) return;
@@ -870,7 +905,7 @@ async function performFileAction(action: FileAction) {
       :revision="albumsRevision" @added="albumAdded" @busy-change="albumBusy" />
 
     <template v-if="summary && (peopleMode ? selectedPerson : albumsMode ? selectedAlbum : true)">
-      <div v-if="!peopleMode" class="album-selection-tools" role="group" aria-label="批量归类">
+      <div v-if="!peopleMode" class="album-selection-tools" role="group" aria-label="批量操作">
         <p v-if="targetAlbum && !albumsMode" role="status">正在为“{{ targetAlbum.name }}”选择照片和视频。 <button type="button" class="secondary" :disabled="busy" @click="targetAlbum = undefined">取消目标</button></p>
         <p v-if="addedAlbum" role="status">已加入“{{ addedAlbum.name }}”。 <button type="button" class="secondary" :disabled="busy" @click="returnToAlbum(addedAlbum!)">返回该相册</button></p>
         <div class="selection-actions">
@@ -880,10 +915,17 @@ async function performFileAction(action: FileAction) {
             <button type="button" class="secondary" :disabled="busy || itemsLoading || searchPending || !results?.items.length" @click="selectPage(results?.items.map(item => item.id) ?? [])">全选当前页</button>
             <button type="button" class="secondary" :disabled="busy || !selectedFiles.size" @click="clearSelection">清空</button>
             <button type="button" :disabled="busy || itemsLoading || searchPending || !selectedFiles.size" @click="albumPicker?.open(targetAlbum)">加入相册</button>
+            <button type="button" class="secondary" :disabled="busy || itemsLoading || searchPending || !selectedFiles.size" @click="exportOriginals">导出原件</button>
             <button v-if="albumsMode" type="button" class="secondary" :disabled="busy || !albumsWritable || !selectedFiles.size" @click="removeFromAlbum">从此相册移出</button>
           </template>
         </div>
         <p v-if="albumError" class="error" role="alert">{{ albumError }}</p>
+        <p v-if="task === 'exporting'" role="status">正在导出原件…</p>
+        <div v-if="exportResult" class="export-result" role="status">
+          <p>成功 {{ exportResult.succeeded }} 项 · 跳过 {{ exportResult.skipped }} 项 · 失败 {{ exportResult.failed }} 项</p>
+          <p>导出目录 {{ exportResult.destination }}</p>
+        </div>
+        <p v-if="exportError" class="error" role="alert">{{ exportError }}</p>
       </div>
       <p v-if="peopleMode" class="timeline-intro">按拍摄日期浏览成长记录，未知日期单独列出。</p>
       <nav v-if="peopleMode && months?.length" class="timeline-months" aria-label="成长时间线年月导航">
@@ -892,7 +934,7 @@ async function performFileAction(action: FileAction) {
           :aria-pressed="monthSelected(entry.month)" @click="selectMonth(entry.month)">{{ monthTitle(entry.month) }} · {{ entry.count }}</button>
       </nav>
       <p v-if="timelineError" class="error" role="alert">{{ timelineError }}</p>
-      <div class="library-tools" :class="{ 'people-tools': peopleMode }" role="search" aria-label="媒体搜索与筛选">
+      <div class="library-tools" :class="{ 'people-tools': peopleMode }" :inert="exportBusy" role="search" aria-label="媒体搜索与筛选">
         <div v-if="!peopleMode" class="search-row">
           <ElSelect v-if="!albumsMode" v-model="searchMode" class="mode-select" aria-label="搜索方式">
             <ElOption label="文件名" value="filename" />
@@ -946,7 +988,7 @@ async function performFileAction(action: FileAction) {
 
       <LocationMap v-if="!albumsMode" :scan-id="summary.scanId" :filter="filter" :person-id="peopleMode ? selectedPerson?.id ?? null : null"
         :content-query="!peopleMode && searchMode === 'content' ? query : null" :revision="revision + peopleRevision + aiRevision" :focus="mapFocus"
-        :suspended="indexStorageBusy" @select="selectLocation" />
+        :suspended="indexStorageBusy" :inert="exportBusy" @select="selectLocation" />
 
       <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
       <p v-else-if="searchMode === 'content' && !aiIndex?.enabled" role="status">请先点击“建立索引”，再描述照片内容进行搜索。</p>
@@ -985,7 +1027,7 @@ async function performFileAction(action: FileAction) {
         <h2>{{ searchMode === 'content' && !query ? '用一句话，找回那个瞬间' : summary.total ? '没有找到匹配的照片或视频' : '这里还没有照片或视频' }}</h2>
         <p>{{ searchMode === 'content' && !query ? '输入照片描述，按回车或点击“搜索照片”。' : summary.total ? '试试其他关键词，或调整类型、日期、位置和收藏筛选。' : '在目录中添加媒体文件后，点击刷新。' }}</p>
         <ElButton v-if="summary.total && (query || kind !== 'all' || dateFilter.mode !== 'all' || favoritesOnly || locationMode !== 'all' || locationSelection)"
-          @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
+          :disabled="exportBusy" @click="clearSearch(); kind = 'all'; dateFilter = ALL_DATES; favoritesOnly = false; locationMode = 'all'; locationSelection = null">清除搜索与筛选</ElButton>
         <ElButton v-else-if="!summary.total" :icon="Refresh" :disabled="busy" @click="scanDirectory(directory, 'refresh')">刷新目录</ElButton>
       </div>
 
@@ -1125,6 +1167,8 @@ async function performFileAction(action: FileAction) {
 <style scoped>
 .album-selection-tools { margin-block: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .selection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.export-result { margin-block-start: 10px; overflow-wrap: anywhere; }
+.export-result p { margin: 4px 0 0; }
 .media-select { display: flex; align-items: center; gap: 6px; padding: 8px 2px; }
 .card-selected { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px; }
 

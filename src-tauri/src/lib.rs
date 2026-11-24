@@ -132,6 +132,7 @@ pub fn run() {
             library::albums::albums_list,
             library::albums::album_items,
             library::albums::albums_edit,
+            library::export::export_library_originals,
             library::library_issues,
             library::details::library_media_details,
             library::library_preview,

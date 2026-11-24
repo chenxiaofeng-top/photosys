@@ -374,9 +374,9 @@ fn available_number(
 ) -> io::Result<Option<u64>> {
     let original = directory.join(name);
     match match_file(source, &original, size, on_compare)? {
-        Candidate::Missing => return Ok(Some(0)),
-        Candidate::Identical => return Ok(None),
-        Candidate::Occupied => {}
+        NameMatch::Missing => return Ok(Some(0)),
+        NameMatch::Identical => return Ok(None),
+        NameMatch::Occupied => {}
     }
 
     // Check existing suffixes beyond gaps, so deleting one numbered copy doesn't create duplicates.
@@ -391,34 +391,49 @@ fn available_number(
         {
             continue;
         }
-        let stem = path.file_stem().unwrap().as_encoded_bytes();
-        let Some(separator) = stem.iter().rposition(|&byte| byte == b'_') else {
-            continue;
-        };
-        let suffix = &stem[separator + 1..];
-        if suffix
-            .first()
-            .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
-            && let Ok(suffix) = std::str::from_utf8(suffix)
-            && let Ok(number) = suffix.parse::<u64>()
-        {
+        if let Some((_, number)) = numbered_suffix(&path.file_stem().unwrap().to_string_lossy()) {
             suffixes.insert(number);
         }
     }
 
+    available_numbered(suffixes, |number| {
+        match_file(
+            source,
+            &directory.join(numbered_name(name, number)),
+            size,
+            on_compare,
+        )
+    })
+}
+
+pub(crate) fn numbered_suffix(stem: &str) -> Option<(&str, u64)> {
+    let (base, suffix) = stem.rsplit_once('_')?;
+    if !suffix
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+    {
+        return None;
+    }
+    Some((base, suffix.parse().ok()?))
+}
+
+pub(crate) fn available_numbered(
+    suffixes: impl IntoIterator<Item = u64>,
+    mut matches: impl FnMut(u64) -> io::Result<NameMatch>,
+) -> io::Result<Option<u64>> {
     let mut available = 1;
     for number in suffixes {
-        let path = directory.join(numbered_name(name, number));
-        match match_file(source, &path, size, on_compare)? {
-            Candidate::Identical => return Ok(None),
-            Candidate::Occupied if number == available => available += 1,
+        match matches(number)? {
+            NameMatch::Identical => return Ok(None),
+            NameMatch::Occupied if number == available => available += 1,
             _ => {}
         }
     }
     Ok(Some(available))
 }
 
-enum Candidate {
+pub(crate) enum NameMatch {
     Missing,
     Identical,
     Occupied,
@@ -429,10 +444,10 @@ fn match_file(
     candidate: &Path,
     size: u64,
     on_compare: &mut impl FnMut(),
-) -> io::Result<Candidate> {
+) -> io::Result<NameMatch> {
     let metadata = match fs::symlink_metadata(candidate) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Candidate::Missing),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(NameMatch::Missing),
         Err(error) => return Err(error),
     };
     if metadata.is_file()
@@ -444,12 +459,12 @@ fn match_file(
             on_compare,
         )?
     {
-        return Ok(Candidate::Identical);
+        return Ok(NameMatch::Identical);
     }
-    Ok(Candidate::Occupied)
+    Ok(NameMatch::Occupied)
 }
 
-fn same_bytes(
+pub(crate) fn same_bytes(
     first: &mut File,
     second: &mut File,
     mut remaining: u64,
@@ -470,13 +485,13 @@ fn same_bytes(
     Ok(first.read(&mut left[..1])? == 0 && second.read(&mut right[..1])? == 0)
 }
 
-fn name_is_occupied(path: &Path, error: &io::Error) -> bool {
+pub(crate) fn name_is_occupied(path: &Path, error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists
         // Windows can report PermissionDenied when a directory occupies the name.
         || (error.kind() == io::ErrorKind::PermissionDenied && fs::symlink_metadata(path).is_ok())
 }
 
-fn numbered_name(name: &OsStr, number: u64) -> OsString {
+pub(crate) fn numbered_name(name: &OsStr, number: u64) -> OsString {
     if number == 0 {
         return name.to_os_string();
     }
