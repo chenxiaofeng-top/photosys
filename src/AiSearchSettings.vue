@@ -15,7 +15,7 @@ const props = defineProps<{ scanId?: number; libraryBusy: boolean; modelKind?: "
 const peopleModel = computed(() => props.modelKind === "people");
 const settingsId = computed(() => peopleModel.value ? "people-ai-settings" : "ai-settings-body");
 const directoryId = computed(() => peopleModel.value ? "people-model-directory" : "ai-model-directory");
-const emit = defineEmits<{ modelReady: [ready: boolean]; indexChange: [status: IndexStatus]; updated: []; modelChanged: []; rebuild: [] }>();
+const emit = defineEmits<{ modelReady: [ready: boolean]; indexChange: [status: IndexStatus]; updated: []; modelChanged: []; rebuild: []; storageBusyChange: [busy: boolean] }>();
 const model = ref<ModelStatus>();
 const catalog = ref<ModelOption[]>([]);
 const selectedModelId = ref("");
@@ -34,6 +34,11 @@ const open = ref(false);
 const source = ref<"mirror" | "official">("mirror");
 const modelTask = ref(false);
 const indexTask = ref(false);
+const optimizingStorage = ref(false);
+const storageOptimized = ref(false);
+const storageError = ref("");
+const canOptimizeStorage = computed(() => index.value?.canOptimizeStorage === true && !index.value.running
+  && !props.libraryBusy && !indexTask.value && !modelTask.value && !optimizingStorage.value);
 const cancelling = ref(false);
 const modelError = ref("");
 const indexError = ref("");
@@ -197,7 +202,7 @@ async function cancelInstall() {
 }
 
 async function refreshIndex(automatic = false) {
-  if (peopleModel.value || props.libraryBusy) return;
+  if (peopleModel.value || props.libraryBusy || optimizingStorage.value) return;
   const scanId = props.scanId;
   if (scanId === undefined) return;
   const request = indexRequest;
@@ -211,7 +216,7 @@ async function refreshIndex(automatic = false) {
 
 async function updateIndex(automatic = false) {
   const scanId = props.scanId;
-  if (props.libraryBusy || scanId === undefined || indexTask.value || modelTask.value || !model.value?.activeReady) return;
+  if (props.libraryBusy || scanId === undefined || indexTask.value || modelTask.value || optimizingStorage.value || !model.value?.activeReady) return;
   const request = ++indexRequest;
   indexTask.value = true;
   indexError.value = "";
@@ -231,6 +236,29 @@ async function updateIndex(automatic = false) {
   }
 }
 
+async function optimizeIndexStorage() {
+  const scanId = props.scanId;
+  if (scanId === undefined || !canOptimizeStorage.value) return;
+  indexRequest++;
+  storageOptimized.value = false;
+  storageError.value = "";
+  optimizingStorage.value = true;
+  emit("storageBusyChange", true);
+  try {
+    await invoke("ai_optimize_index_storage", { scanId });
+    if (mounted && scanId === props.scanId) {
+      if (index.value) setIndex({ ...index.value, canOptimizeStorage: false });
+      storageOptimized.value = true;
+    }
+  } catch (cause) {
+    if (mounted && scanId === props.scanId) storageError.value = String(cause);
+  } finally {
+    optimizingStorage.value = false;
+    emit("storageBusyChange", false);
+    if (mounted) await refreshIndex();
+  }
+}
+
 async function cancelIndex() {
   if (peopleModel.value) return;
   try { if (props.scanId !== undefined) await invoke(peopleModel.value ? "people_cancel_index" : "ai_cancel_index", { scanId: props.scanId }); }
@@ -247,6 +275,8 @@ watch(() => props.scanId, (id, oldId) => {
   issuesOpen.value = false;
   issuePage.value = 0;
   indexError.value = "";
+  storageOptimized.value = false;
+  storageError.value = "";
   confirmOpen.value = false;
   if (!peopleModel.value && oldId !== undefined) void invoke("ai_cancel_index", { scanId: oldId }).catch(() => {});
   if (id !== undefined) void refreshIndex(true);
@@ -286,7 +316,7 @@ defineExpose({ refreshIndex });
       <span v-if="index" role="status">{{ index.queued ? '排队中 · ' : indexTask || index.running ? '正在建立索引 · ' : '' }}已索引 {{ index.indexed }} / {{ index.total }} 张<span v-if="index.pending"> · 待处理 {{ index.pending }} 张</span><span v-if="index.failed"> · 失败 {{ index.failed }} 张</span></span>
       <ElButton v-if="indexTask" @click="cancelIndex">停止索引</ElButton>
       <ElButton v-else-if="!peopleModel && scanId !== undefined && model?.activeReady"
-        :disabled="libraryBusy || modelTask || !index?.writable" @click="updateIndex(false)">{{ index?.needsRebuild ? '重建内容索引' : index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>
+        :disabled="libraryBusy || modelTask || optimizingStorage || !index?.writable" @click="updateIndex(false)">{{ index?.needsRebuild ? '重建内容索引' : index?.enabled ? index.failed ? '更新索引 / 重试失败项' : '更新索引' : '建立索引' }}</ElButton>
       <ElButton class="settings-toggle" text :icon="Setting" :aria-expanded="open" :aria-controls="settingsId" @click="open = !open">{{ peopleModel ? '人物模型设置' : 'AI 搜索设置' }}</ElButton>
     </div>
     <div v-show="open" :id="settingsId" class="ai-settings-body">
@@ -305,7 +335,7 @@ defineExpose({ refreshIndex });
       <p v-for="reason in fallbackReasons" :key="reason" class="description">已回退到 CPU。{{ reason }}</p>
       <p v-if="deviceError" class="error" role="alert">{{ deviceError }}</p>
       <label class="model-picker">选择模型
-        <select v-model="selectedModelId" :disabled="modelTask" @change="selectModel">
+        <select v-model="selectedModelId" :disabled="modelTask || optimizingStorage" @change="selectModel">
           <option v-for="option in catalog" :key="option.id" :value="option.id">{{ option.name }}{{ option.id === model?.activeModelId ? '（当前使用）' : '' }}</option>
         </select>
       </label>
@@ -321,7 +351,7 @@ defineExpose({ refreshIndex });
       <div class="ai-directory">
         <label :for="directoryId">模型安装目录</label>
         <input :id="directoryId" :value="model?.directory ?? ''" placeholder="请手动指定目录" readonly />
-        <button class="secondary" type="button" :disabled="modelTask || indexTask || analysisBusy" @click="chooseDirectory">选择目录</button>
+        <button class="secondary" type="button" :disabled="modelTask || indexTask || analysisBusy || optimizingStorage" @click="chooseDirectory">选择目录</button>
       </div>
       <p class="description">多个相册可以共用此目录；更换目录不会搬动或删除原有模型。</p>
       <div class="ai-summary">
@@ -329,16 +359,20 @@ defineExpose({ refreshIndex });
           <option value="mirror">国内优先 · HF-Mirror（第三方镜像）</option>
           <option value="official">Hugging Face 原源</option>
         </select></label>
-        <button type="button" :disabled="!model?.directory || modelTask || model?.ready" @click="install(false)">
+        <button type="button" :disabled="!model?.directory || modelTask || model?.ready || optimizingStorage" @click="install(false)">
           {{ model?.resumableBytes ? '继续下载 / 重试安装' : '下载并安装模型' }}
         </button>
-        <button class="secondary" type="button" :disabled="!model?.directory || modelTask" @click="install(true)">导入离线模型包</button>
-        <button v-if="pendingSelection" type="button" :disabled="modelTask || !model?.ready" @click="prepareActivation">使用此模型</button>
+        <button class="secondary" type="button" :disabled="!model?.directory || modelTask || optimizingStorage" @click="install(true)">导入离线模型包</button>
+        <button v-if="pendingSelection" type="button" :disabled="modelTask || !model?.ready || optimizingStorage" @click="prepareActivation">使用此模型</button>
 
       </div>
       <p v-if="model?.resumableBytes && !progress">可继续下载：{{ formatBytes(model.resumableBytes) }}</p>
       <p v-if="index && !index.writable">当前相册不能写入 AI 索引，已有有效索引仍可搜索。</p>
       <p v-if="!peopleModel">首次点击“建立索引”；之后打开或刷新相册时自动更新新增和变化的照片。可中途停止，下次继续。</p>
+      <div v-if="index?.canOptimizeStorage || optimizingStorage" class="ai-summary">
+        <ElButton :disabled="!canOptimizeStorage" :loading="optimizingStorage" @click="optimizeIndexStorage">优化搜索速度</ElButton>
+        <p class="description">整理当前相册的已有索引，无需重新分析照片。</p>
+      </div>
       <p class="description">选择和安装不会更换当前模型；点击“使用此模型”后才生效。可导入与所选模型匹配的 PhotoSys 离线模型包（ZIP）。</p>
       <p class="description">模型选择对所有相册统一生效。{{ switchNotice }}</p>
       <p class="description">原照片、收藏和浏览方向保留，旧模型文件保留。其他相册下次打开时分别提示重建。</p>
@@ -348,7 +382,7 @@ defineExpose({ refreshIndex });
       <p>{{ displayedIndex.rebuildReason }} 当前待处理 {{ displayedIndex.pending }} 张照片。</p>
       <p>{{ switchNotice }}</p>
       <p v-if="!displayedIndex.writable">此相册只读，取得写入权限后才能重建。</p>
-      <ElButton :disabled="!model?.activeReady || !displayedIndex.writable || libraryBusy || modelTask || indexTask || analysisBusy" @click="rebuildIndex">{{ peopleModel ? '重建人物索引' : '重建内容索引' }}</ElButton>
+      <ElButton :disabled="!model?.activeReady || !displayedIndex.writable || libraryBusy || modelTask || indexTask || analysisBusy || optimizingStorage" @click="rebuildIndex">{{ peopleModel ? '重建人物索引' : '重建内容索引' }}</ElButton>
     </div>
     <ElDialog v-model="confirmOpen" title="更换本地 AI 模型" width="min(36rem, 94vw)" :close-on-click-modal="false" :close-on-press-escape="!modelTask" :show-close="!modelTask" append-to-body>
       <p>从「{{ activeModel?.name }}」更换为「{{ selectedModel?.name }}」。</p>
@@ -369,6 +403,9 @@ defineExpose({ refreshIndex });
       <p v-if="modelError" class="error" role="alert">{{ modelError }}</p>
     <p v-if="index?.message" class="error" role="alert">{{ index.message }}</p>
     <p v-if="indexError" class="error" role="alert">{{ indexError }}</p>
+    <p v-if="optimizingStorage" role="status">正在优化 AI 索引，完成后可继续搜索。</p>
+    <p v-else-if="storageOptimized" role="status">已优化当前相册的 AI 搜索速度。</p>
+    <p v-if="storageError" class="error" role="alert">{{ storageError }}</p>
     <details v-if="index?.failed" :open="issuesOpen" @toggle="issuesOpen = ($event.target as HTMLDetailsElement).open">
       <summary>AI 索引问题（{{ index.failed }}）</summary>
       <ul v-if="issues"><li v-for="issue in issues.items" :key="issue.path">{{ issue.path }} · {{ issue.reason }}</li></ul>

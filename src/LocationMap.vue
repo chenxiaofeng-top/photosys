@@ -10,7 +10,7 @@ import OfflineMapSettings from "./OfflineMapSettings.vue";
 import { mapArchives, type Coordinates, type MapPackage, type MapPoints, type MediaFilter, type Selection } from "./locations";
 import { resolvedTheme } from "./theme";
 
-const props = defineProps<{ scanId: number; filter: MediaFilter; personId: number | null; contentQuery: string | null; revision: number; focus: Coordinates | null }>();
+const props = defineProps<{ scanId: number; filter: MediaFilter; personId: number | null; contentQuery: string | null; revision: number; focus: Coordinates | null; suspended?: boolean }>();
 const emit = defineEmits<{ select: [selection: Selection | null] }>();
 const open = ref(false);
 const settingsVisited = ref(false);
@@ -140,8 +140,12 @@ function fitPoints() {
 function focusLocation(p: Coordinates) { map?.easeTo({ center: [p.longitude, Math.max(-85, Math.min(85, p.latitude))], zoom: 15 }); }
 watch(() => props.focus, async value => { if (value) { open.value = true; await nextTick(); await initialize(); focusLocation(value); } });
 watch(open, async value => { if (value) { settingsVisited.value = true; await nextTick(); await initialize(); map?.resize(); } else cancelDrawing(); });
-watch([() => props.scanId, () => props.filter, () => props.personId, () => props.contentQuery, () => props.revision, open], async (_, __, cleanup) => {
+watch([() => props.scanId, () => props.filter, () => props.personId, () => props.contentQuery, () => props.revision, () => props.suspended, open], async (_, __, cleanup) => {
   if (!open.value) return;
+  if (props.suspended) {
+    loading.value = false;
+    return;
+  }
   let active = true; cleanup(() => { active = false; }); loading.value = true; error.value = "";
   try {
     const data = await invoke<MapPoints>("library_map_points", { scanId: props.scanId, filter: props.filter, personId: props.personId, contentQuery: props.contentQuery });

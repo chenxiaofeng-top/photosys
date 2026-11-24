@@ -28,6 +28,7 @@ pub(crate) fn stop_and_wait() -> Result<std::sync::MutexGuard<'static, ()>, Stri
 }
 
 static ACTIVE: Active = Active::new();
+const INDEX_PAGE_SIZE: u32 = 16 * 1024;
 
 pub(crate) fn cancel_all() {
     ACTIVE.cancel(None);
@@ -51,6 +52,7 @@ pub(crate) struct IndexStatus {
     pending: usize,
     pub(super) reused: usize,
     writable: bool,
+    can_optimize_storage: bool,
     message: Option<String>,
     model_id: &'static str,
     needs_rebuild: bool,
@@ -66,30 +68,26 @@ struct Cache {
 
 impl Cache {
     fn open(scan: &Scan, writable: bool) -> Result<Option<Self>, String> {
-        let directory = favorites::data_directory(&scan.root)?
-            .ok_or("找不到媒体库数据目录，请重新选择相册。")?;
-        Self::at(&directory.join("ai.sqlite"), writable)
+        Self::at(&index_path(scan)?, writable)
     }
 
     fn at(path: &Path, writable: bool) -> Result<Option<Self>, String> {
-        match fs::symlink_metadata(path) {
-            Ok(m) if !m.is_file() || crate::duplicates::is_link(&m) => {
-                return Err("AI 索引必须是普通数据库文件。".into());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !writable => return Ok(None),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(error(e)),
-            _ => {}
+        let metadata = index_metadata(path)?;
+        if !writable && metadata.is_none() {
+            return Ok(None);
         }
         let flags = if writable {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
         } else {
             OpenFlags::SQLITE_OPEN_READ_ONLY
-        } | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags(path, flags).map_err(error)?;
-        connection
-            .busy_timeout(Duration::from_secs(3))
-            .map_err(error)?;
+        };
+        let connection = open_index_connection(path, flags)?;
         if writable {
+            if metadata.is_none_or(|metadata| metadata.len() == 0) {
+                connection
+                    .pragma_update(None, "page_size", INDEX_PAGE_SIZE)
+                    .map_err(error)?;
+            }
             connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS embeddings (
@@ -181,6 +179,102 @@ impl Cache {
     }
 }
 
+fn index_path(scan: &Scan) -> Result<std::path::PathBuf, String> {
+    let directory =
+        favorites::data_directory(&scan.root)?.ok_or("找不到媒体库数据目录，请重新选择相册。")?;
+    Ok(directory.join("ai.sqlite"))
+}
+
+fn index_metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() || crate::duplicates::is_link(&m) => {
+            Err("AI 索引必须是普通数据库文件。".into())
+        }
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(error(e)),
+    }
+}
+
+fn open_index_connection(path: &Path, flags: OpenFlags) -> Result<Connection, String> {
+    let connection = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(error)?;
+    connection
+        .busy_timeout(Duration::from_secs(3))
+        .map_err(error)?;
+    Ok(connection)
+}
+
+fn index_page_size(connection: &Connection) -> rusqlite::Result<u32> {
+    connection.query_row("PRAGMA page_size", [], |row| row.get(0))
+}
+
+fn index_uses_wal(connection: &Connection) -> rusqlite::Result<bool> {
+    connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .map(|mode| mode == "wal")
+}
+
+fn storage_optimization_error(cause: rusqlite::Error) -> String {
+    match cause.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            "AI 索引正被其他任务使用，请稍后重试。".into()
+        }
+        Some(rusqlite::ErrorCode::DiskFull) => "磁盘空间不足，请释放空间后重试。".into(),
+        Some(rusqlite::ErrorCode::ReadOnly) => "AI 索引为只读，无法优化存储布局。".into(),
+        _ => format!("无法优化 AI 索引。{cause}"),
+    }
+}
+
+fn optimize_index_storage(
+    scan_id: u64,
+    available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> Result<(), String> {
+    let _task = crate::file_task()?;
+    let _database = crate::database_access::maintenance()?;
+    let scan = scan(scan_id)?;
+    let path = index_path(&scan)?;
+    let metadata = index_metadata(&path)?.ok_or("尚未建立 AI 索引。")?;
+    if metadata.permissions().readonly() {
+        return Err("AI 索引为只读，无法优化存储布局。".into());
+    }
+    close_reader()?;
+
+    let connection = open_index_connection(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|cause| format!("无法以可写方式打开 AI 索引。{cause}"))?;
+    if index_page_size(&connection).map_err(storage_optimization_error)? >= INDEX_PAGE_SIZE {
+        return Ok(());
+    }
+    if index_uses_wal(&connection).map_err(storage_optimization_error)? {
+        return Err("AI 索引使用 WAL 模式，暂无法调整存储布局。".into());
+    }
+    connection
+        .prepare("SELECT path, stamp, rotation, version, vector, error FROM embeddings LIMIT 0")
+        .map_err(storage_optimization_error)?;
+    // SQLite can need twice the original file size in free space during VACUUM.
+    let directory = path.parent().expect("AI index has a parent directory");
+    if available_space(directory).map_err(error)? < metadata.len().saturating_mul(2) {
+        return Err("磁盘空间不足，请释放空间后重试。".into());
+    }
+    connection
+        .pragma_update(None, "page_size", INDEX_PAGE_SIZE)
+        .and_then(|()| connection.execute_batch("VACUUM"))
+        .map_err(storage_optimization_error)?;
+    if index_page_size(&connection).map_err(storage_optimization_error)? != INDEX_PAGE_SIZE {
+        return Err("未能调整 AI 索引的存储布局，请重试。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn ai_optimize_index_storage(scan_id: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        optimize_index_storage(scan_id, |directory| fs2::available_space(directory))
+    })
+    .await
+    .map_err(error)?
+}
+
 struct Record {
     stamp: Vec<u8>,
     rotation: u16,
@@ -212,15 +306,15 @@ fn is_writable(scan: &Scan) -> bool {
         return false;
     }
     let path = dir.join("ai.sqlite");
-    if path.exists() {
-        Connection::open_with_flags(
+    match index_metadata(&path) {
+        Ok(None) => true,
+        Ok(Some(metadata)) if !metadata.permissions().readonly() => Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .and_then(|c| c.execute_batch("BEGIN IMMEDIATE; ROLLBACK;"))
-        .is_ok()
-    } else {
-        true
+        .is_ok(),
+        _ => false,
     }
 }
 
@@ -242,6 +336,9 @@ fn status(scan_id: u64) -> Result<IndexStatus, String> {
             status.enabled = cache.enabled()?;
             status.needs_rebuild =
                 ai::index_policy::needs_rebuild(&cache.connection, spec, FEATURE_VERSION)?;
+            status.can_optimize_storage = status.writable
+                && index_page_size(&cache.connection).map_err(error)? < INDEX_PAGE_SIZE
+                && !index_uses_wal(&cache.connection).map_err(error)?;
             let records = cache.records()?;
             for item in scan.items.iter().filter(|i| eligible(i)) {
                 let rotation = rotations.get(&item.file.id).copied().unwrap_or(0);
@@ -650,6 +747,7 @@ pub(crate) struct SearchPage {
 fn vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
     vector_dim(bytes, DIM)
 }
+#[cfg(test)]
 fn vector_dim(bytes: &[u8], dim: usize) -> Result<Vec<f32>, String> {
     if bytes.len() != dim * 4 {
         return Err("AI 索引向量损坏，请更新索引。".into());
@@ -661,6 +759,19 @@ fn vector_dim(bytes: &[u8], dim: usize) -> Result<Vec<f32>, String> {
             .collect(),
         dim,
     )
+}
+
+fn decode_vector(bytes: &[u8], dim: usize, vector: &mut Vec<f32>) -> Result<(), String> {
+    if bytes.len() != dim * 4 {
+        return Err("AI 索引向量损坏，请更新索引。".into());
+    }
+    vector.clear();
+    vector.extend(
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())),
+    );
+    ai::inference::normalize_dim_in_place(vector, dim)
 }
 
 #[cfg(test)]
@@ -833,6 +944,7 @@ fn rank_index(
 
     let mut result = Ranked::default();
     let mut ranked = BinaryHeap::with_capacity(RESULT_LIMIT);
+    let mut vector = Vec::with_capacity(spec.dimension);
     let mut statement = connection
         .prepare("SELECT path, stamp, rotation, vector FROM embeddings WHERE version=?1")
         .map_err(error)?;
@@ -858,11 +970,15 @@ fn rank_index(
         if !matches {
             continue;
         }
-        let vector = vector_dim(stored.as_blob().map_err(error)?, spec.dimension)?;
+        decode_vector(
+            stored.as_blob().map_err(error)?,
+            spec.dimension,
+            &mut vector,
+        )?;
         if embedding.len() != vector.len() {
             return Err("查询与索引模型不兼容。".into());
         }
-        let score = embedding.iter().zip(vector).map(|(a, b)| a * b).sum();
+        let score = embedding.iter().zip(&vector).map(|(a, b)| a * b).sum();
         let entry = Scored {
             score,
             id: item.file.id,
@@ -978,7 +1094,9 @@ impl SearchReader {
             .connection
             .as_ref()
             .map(|connection| {
-                connection.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                connection
+                    .prepare_cached("PRAGMA data_version")?
+                    .query_row([], |row| row.get::<_, i64>(0))
             })
             .transpose()
             .map_err(error)?;
@@ -1078,6 +1196,9 @@ pub(crate) async fn ai_search(
 
 #[cfg(test)]
 mod ranking_tests;
+
+#[cfg(test)]
+mod storage_tests;
 
 #[cfg(test)]
 mod tests {

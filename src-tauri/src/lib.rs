@@ -102,6 +102,7 @@ pub fn run() {
             ai::ai_cancel_install,
             ai::ai_choose_model_package,
             library::ai_search::ai_index_status,
+            library::ai_search::ai_optimize_index_storage,
             library::ai_search::ai_update_index,
             library::ai_search::ai_cancel_index,
             library::ai_search::ai_index_issues,

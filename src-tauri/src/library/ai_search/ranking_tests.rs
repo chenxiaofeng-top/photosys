@@ -178,16 +178,15 @@ fn search_reuses_ranking_and_refreshes_on_index_metadata_or_scan_changes() {
     *session().unwrap() = None;
 }
 
-// Reference from before the optimization, including a separate status pass and a full sort.
+// Keep the allocating decode and full sort as an independent ranking oracle.
 fn reference(
     scan: &Scan,
     text: &[f32],
     filter: &Filter,
     favorites: &HashSet<usize>,
     rotations: &HashMap<usize, u16>,
-    page: usize,
-) -> Vec<usize> {
-    let _ = status(scan.id).unwrap();
+) -> Ranked {
+    let state = status(scan.id).unwrap();
     let cache = Cache::open(scan, false).unwrap().unwrap();
     let from = parse_date(filter.from.as_deref()).unwrap();
     let to = parse_date(filter.to.as_deref()).unwrap();
@@ -230,18 +229,19 @@ fn reference(
     }
     ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     ranked.truncate(RESULT_LIMIT);
-    if page != 0 {
-        let (_, offset) = Page::<ItemView>::bounds(page, ranked.len());
-        ranked = ranked
-            .into_iter()
-            .skip(offset)
-            .take(super::super::PAGE_SIZE)
-            .collect();
+    Ranked {
+        ids: ranked.into_iter().map(|(_, id)| id).collect(),
+        indexed: state.indexed,
+        failed: state.failed,
+        pending: state.pending,
     }
-    ranked.into_iter().map(|(_, id)| id).collect()
 }
 
-fn synthetic_album(path: &Path, count: usize) -> (Arc<Scan>, Vec<f32>) {
+fn synthetic_album(
+    path: &Path,
+    count: usize,
+    spec: &'static ai::catalog::ModelSpec,
+) -> (Arc<Scan>, Vec<f32>) {
     let root = crate::duplicates::Root::new(path).unwrap();
     favorites::initialize(&root).unwrap();
     let file = fs::File::create(path.join("seed")).unwrap();
@@ -253,7 +253,7 @@ fn synthetic_album(path: &Path, count: usize) -> (Arc<Scan>, Vec<f32>) {
             Item {
                 file: crate::duplicates::Candidate {
                     id: i,
-                    relative: name.clone().into(),
+                    relative: Path::new(&format!("album-{:02}", i % 18)).join(&name),
                     stamp: stamp.clone(),
                 },
                 search_path: name.clone(),
@@ -287,133 +287,250 @@ fn synthetic_album(path: &Path, count: usize) -> (Arc<Scan>, Vec<f32>) {
         .collect();
     *session().unwrap() = Some(Session::from_scan(scan, favorites, HashMap::new()));
     let scan = super::scan(id).unwrap();
+    super::storage_tests::start_legacy_database(&index_path(&scan).unwrap());
     let mut cache = Cache::open(&scan, true).unwrap().unwrap();
+    cache.spec = spec;
     for chunk in scan.items.chunks(256) {
         let entries = chunk
             .iter()
+            .filter(|item| item.file.id % 101 != 0)
             .map(|item| {
-                let mut vector = vec![0.; DIM];
-                vector[0] = (item.file.id % 129) as f32;
-                vector[1] = 129. - vector[0];
+                let id = item.file.id;
+                // Repeat patterns to guarantee ties and fill all dimensions to exercise rounding.
+                let value = if id % 97 == 0 {
+                    Err("test decoding failure".into())
+                } else {
+                    Ok((0..spec.dimension)
+                        .map(|i| (((id % 129 + i * 79) * (i + 1)) % 101) as f32 / 50. - 1.)
+                        .collect())
+                };
                 (
                     favorites::path_key(&item.file.relative),
-                    item.file.stamp.portable_key(),
-                    0,
-                    Ok(vector),
+                    if id % 107 == 0 {
+                        vec![]
+                    } else {
+                        item.file.stamp.portable_key()
+                    },
+                    if id % 109 == 0 { 90 } else { 0 },
+                    value,
                 )
             })
             .collect::<Vec<_>>();
         cache.save(&entries).unwrap();
     }
-    let mut embedding = vec![0.; DIM];
-    embedding[0] = 1.;
+    let embedding = ai::inference::normalize_dim(
+        (0..spec.dimension).map(|i| (i % 31) as f32 - 15.).collect(),
+        spec.dimension,
+    )
+    .unwrap();
     (scan, embedding)
+}
+
+#[test]
+fn reusable_vector_buffer_preserves_values_and_validation() {
+    for dim in [512, 768] {
+        let mut buffer = Vec::with_capacity(dim);
+        let allocation = buffer.as_ptr();
+        let encode = |values: Vec<f32>| {
+            values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        for bytes in [
+            encode((0..dim).map(|i| (i % 129) as f32 - 63.5).collect()),
+            encode(vec![1.; dim]),
+            vec![0; dim * 4],
+            encode(vec![f32::NAN; dim]),
+            encode(vec![f32::INFINITY; dim]),
+            encode(vec![f32::MAX; dim]),
+            vec![0; dim * 4 - 1],
+        ] {
+            let result = decode_vector(&bytes, dim, &mut buffer);
+            match vector_dim(&bytes, dim) {
+                Ok(expected) => {
+                    result.unwrap();
+                    assert!(
+                        buffer
+                            .iter()
+                            .zip(expected)
+                            .all(|(new, old)| new.to_bits() == old.to_bits())
+                    );
+                }
+                Err(expected) => assert_eq!(result.unwrap_err(), expected),
+            }
+            assert_eq!(buffer.as_ptr(), allocation);
+        }
+    }
+}
+
+fn open_reader(path: &Path, scan_id: u64, cache_statements: bool) -> SearchReader {
+    let connection = Cache::at(path, false).unwrap().unwrap().connection;
+    if !cache_statements {
+        connection.set_prepared_statement_cache_capacity(0);
+    }
+    SearchReader {
+        scan_id: Some(scan_id),
+        connection: Some(connection),
+        ..SearchReader::default()
+    }
+}
+
+fn percentile(times: &mut [Duration], percent: usize) -> f64 {
+    times.sort_unstable();
+    times[(times.len() * percent).div_ceil(100) - 1].as_secs_f64() * 1000.
+}
+
+#[test]
+#[ignore = "requires an installed model at PHOTOSYS_AI_MODEL_DIR"]
+fn benchmark_content_search_text_encoding() {
+    let model = std::path::PathBuf::from(std::env::var_os("PHOTOSYS_AI_MODEL_DIR").unwrap());
+    let id = model.file_name().unwrap().to_str().unwrap();
+    let spec = ai::catalog::find(ai::ModelKind::Search, id).unwrap();
+    let library = format!(
+        "{}onnxruntime{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    ai::inference::initialize_from(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries/onnxruntime")
+            .join(std::env::consts::ARCH)
+            .join(library),
+    )
+    .unwrap();
+    let runtime = ai::inference::Runtime::load_spec(&model, spec).unwrap();
+    let mut times = Vec::new();
+    for query in ["照片", "海边日落", "雪地里的小狗", "春节的红灯笼"] {
+        runtime.encode_text(query).unwrap();
+        for _ in 0..6 {
+            let start = Instant::now();
+            assert_eq!(runtime.encode_text(query).unwrap().len(), spec.dimension);
+            times.push(start.elapsed());
+        }
+    }
+    println!(
+        "{} CPU text encoding P50 {:.3} ms, P95 {:.3} ms",
+        spec.id,
+        percentile(&mut times, 50),
+        percentile(&mut times, 95),
+    );
 }
 
 #[test]
 #[ignore = "10k/100k synthetic exact-search benchmark"]
 fn benchmark_content_search_ranking_and_pagination() {
     let _session = TEST_SESSION.lock().unwrap();
-    let percentile = |times: &mut [Duration], percent: usize| {
-        times.sort_unstable();
-        times[(times.len() * percent).div_ceil(100) - 1].as_secs_f64() * 1000.
+    struct RestoreModel(&'static ai::catalog::ModelSpec);
+    impl Drop for RestoreModel {
+        fn drop(&mut self) {
+            ai::catalog::select(self.0);
+        }
+    }
+    let _restore = RestoreModel(ai::catalog::active(ai::ModelKind::Search));
+    let large = ai::catalog::find(ai::ModelKind::Search, "chinese-clip-vit-l14-fp32-v1").unwrap();
+    for spec in [ai::catalog::default_model(ai::ModelKind::Search), large] {
+        ai::catalog::select(spec);
+        for count in [10_000, 100_000] {
+            benchmark_album(count, spec);
+        }
+    }
+}
+
+fn benchmark_album(count: usize, spec: &'static ai::catalog::ModelSpec) {
+    let album = tempfile::tempdir().unwrap();
+    let (scan, embedding) = synthetic_album(album.path(), count, spec);
+    let (favorites, rotations) = {
+        let lock = session().unwrap();
+        let state = current(&lock, scan.id).unwrap();
+        (state.favorites.clone(), state.rotations.clone())
     };
-    for count in [10_000, 100_000] {
-        let album = tempfile::tempdir().unwrap();
-        let (scan, embedding) = synthetic_album(album.path(), count);
-        let (favorites, rotations) = {
-            let lock = session().unwrap();
-            let state = current(&lock, scan.id).unwrap();
-            (state.favorites.clone(), state.rotations.clone())
-        };
-        let mut combined = all();
-        combined.favorites_only = true;
-        combined.from = Some("2020-01-01".into());
-        combined.to = Some("2021-12-31".into());
-        combined.location_selection = Some(locations::Selection::Bounds {
-            west: 101.,
-            south: 29.,
-            east: 104.,
-            north: 31.,
-        });
-        for filter in [all(), combined] {
-            let expected = reference(&scan, &embedding, &filter, &favorites, &rotations, 0);
-            let mut reader = SearchReader::default();
+    let mut combined = all();
+    combined.favorites_only = true;
+    combined.from = Some("2020-01-01".into());
+    combined.to = Some("2021-12-31".into());
+    combined.location_selection = Some(locations::Selection::Bounds {
+        west: 101.,
+        south: 29.,
+        east: 104.,
+        north: 31.,
+    });
+    let expected = [&all(), &combined]
+        .map(|filter| reference(&scan, &embedding, filter, &favorites, &rotations));
+    let optimized = index_path(&scan).unwrap();
+    let legacy = album.path().join("legacy.sqlite");
+    fs::copy(&optimized, &legacy).unwrap();
+    optimize_index_storage(scan.id, |directory| fs2::available_space(directory)).unwrap();
+    let paths = [&legacy, &optimized];
+    for (label, filter, expected) in [
+        ("unfiltered", all(), &expected[0]),
+        ("combined", combined, &expected[1]),
+    ] {
+        for (index, path) in paths.into_iter().enumerate() {
+            let mut reader = open_reader(path, scan.id, index != 0);
             let map = reader
                 .search(scan.id, "照片", filter.clone(), 0, 200, |_| {
                     Ok(embedding.clone())
                 })
                 .unwrap();
-            assert_eq!(ids(&map.items), expected);
-            for (page, items) in expected.chunks(24).enumerate() {
-                assert_eq!(
-                    ids(&reader
-                        .search(scan.id, "照片", filter.clone(), page, 24, |_| panic!(
-                            "cached text"
-                        ))
-                        .unwrap()
-                        .items),
-                    items
+            assert_eq!(ids(&map.items), expected.ids);
+            assert_eq!(
+                (map.indexed, map.failed, map.pending),
+                (expected.indexed, expected.failed, expected.pending)
+            );
+            for (page, items) in expected.ids.chunks(24).enumerate() {
+                let page = reader
+                    .search(scan.id, "照片", filter.clone(), page, 24, |_| {
+                        panic!("cached text")
+                    })
+                    .unwrap();
+                assert_eq!(ids(&page.items), items);
+            }
+        }
+        let mut cold: [Vec<Duration>; 2] = Default::default();
+        let mut warm: [Vec<Duration>; 2] = Default::default();
+        for round in 0..12 {
+            let mut readers = [SearchReader::default(), SearchReader::default()];
+            for offset in 0..2 {
+                let index = (round + offset) % 2;
+                let start = Instant::now();
+                let mut reader = open_reader(paths[index], scan.id, index != 0);
+                let result = reader
+                    .search(scan.id, "照片", filter.clone(), 0, 24, |_| {
+                        Ok(embedding.clone())
+                    })
+                    .unwrap();
+                cold[index].push(start.elapsed());
+                assert_eq!(result.total, expected.ids.len());
+                readers[index] = reader;
+            }
+            for page in [1, 0, 1, 0, 1, 0, 1, 0] {
+                for offset in 0..2 {
+                    let index = (round + offset + page) % 2;
+                    let start = Instant::now();
+                    let result = readers[index]
+                        .search(scan.id, "照片", filter.clone(), page, 24, |_| {
+                            panic!("cached text")
+                        })
+                        .unwrap();
+                    warm[index].push(start.elapsed());
+                    assert_eq!(
+                        ids(&result.items),
+                        expected.ids.chunks(24).nth(result.page).unwrap()
+                    );
+                }
+            }
+        }
+        for (index, layout) in ["4KiB", "16KiB"].into_iter().enumerate() {
+            for (phase, times) in [("first", &mut cold[index]), ("page", &mut warm[index])] {
+                println!(
+                    "{count:>6} {}d {label:<10} {layout:<5} {phase:<5} P50 {:.3} ms, P95 {:.3} ms",
+                    spec.dimension,
+                    percentile(times, 50),
+                    percentile(times, 95),
                 );
             }
         }
-        let (mut old_first, mut old_page, mut cold, mut warm) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for _ in 0..12 {
-            let start = Instant::now();
-            std::hint::black_box(reference(
-                &scan,
-                &embedding,
-                &all(),
-                &favorites,
-                &rotations,
-                0,
-            ));
-            old_first.push(start.elapsed());
-            let start = Instant::now();
-            std::hint::black_box(reference(
-                &scan,
-                &embedding,
-                &all(),
-                &favorites,
-                &rotations,
-                1,
-            ));
-            old_page.push(start.elapsed());
-            let mut reader = SearchReader::default();
-            let start = Instant::now();
-            assert_eq!(
-                reader
-                    .search(scan.id, "照片", all(), 0, 24, |_| Ok(embedding.clone()))
-                    .unwrap()
-                    .total,
-                RESULT_LIMIT
-            );
-            cold.push(start.elapsed());
-            let start = Instant::now();
-            assert_eq!(
-                reader
-                    .search(scan.id, "照片", all(), 1, 24, |_| panic!("cached text"))
-                    .unwrap()
-                    .items
-                    .len(),
-                24
-            );
-            warm.push(start.elapsed());
-        }
-        for (label, times) in [
-            ("before first", &mut old_first),
-            ("before page", &mut old_page),
-            ("after first", &mut cold),
-            ("after page", &mut warm),
-        ] {
-            println!(
-                "{count:>6} {label:<12} P50 {:.3} ms, P95 {:.3} ms",
-                percentile(times, 50),
-                percentile(times, 95)
-            );
-        }
-        assert!(percentile(&mut warm, 95) <= percentile(&mut old_page, 95) / 2.);
-        *session().unwrap() = None;
     }
+    *session().unwrap() = None;
 }

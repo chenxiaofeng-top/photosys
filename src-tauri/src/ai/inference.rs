@@ -345,6 +345,11 @@ pub(crate) fn normalize(vector: Vec<f32>) -> Result<Vec<f32>, String> {
 }
 
 pub(crate) fn normalize_dim(mut vector: Vec<f32>, dimension: usize) -> Result<Vec<f32>, String> {
+    normalize_dim_in_place(&mut vector, dimension)?;
+    Ok(vector)
+}
+
+pub(crate) fn normalize_dim_in_place(vector: &mut [f32], dimension: usize) -> Result<(), String> {
     if vector.len() != dimension || vector.iter().any(|v| !v.is_finite()) {
         return Err("模型返回了不兼容的向量。".into());
     }
@@ -352,10 +357,10 @@ pub(crate) fn normalize_dim(mut vector: Vec<f32>, dimension: usize) -> Result<Ve
     if !norm.is_finite() || norm <= 1e-12 {
         return Err("模型返回了无效的向量。".into());
     }
-    for value in &mut vector {
+    for value in vector {
         *value /= norm;
     }
-    Ok(vector)
+    Ok(())
 }
 
 /// Matches the pinned ChineseCLIPImageProcessor: RGB, square resize, no center crop.

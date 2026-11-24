@@ -26,5 +26,6 @@ export interface IndexStatus {
   pending: number;
   reused: number;
   writable: boolean;
+  canOptimizeStorage: boolean;
   message: string | null;
 }

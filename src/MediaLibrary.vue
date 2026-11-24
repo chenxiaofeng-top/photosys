@@ -52,7 +52,8 @@ const emit = defineEmits<{ busyChange: [busy: boolean]; directoryChange: [direct
 const pageSize = 24;
 const directory = ref("");
 const task = ref<"starting" | "choosing" | "scanning" | "saving" | "database" | undefined>("starting");
-const busy = computed(() => task.value !== undefined);
+const indexStorageBusy = ref(false);
+const busy = computed(() => task.value !== undefined || indexStorageBusy.value);
 watch(busy, (value) => emit("busyChange", value), { flush: "sync", immediate: true });
 
 const summary = shallowRef<Summary>();
@@ -144,7 +145,7 @@ function scheduleSearch() {
 }
 
 function submitContentSearch(event?: KeyboardEvent) {
-  if (composing.value || event?.isComposing || !aiReady.value) return;
+  if (composing.value || event?.isComposing || !aiReady.value || busy.value) return;
   query.value = searchInput.value.trim();
   requestedPage.value = 0;
   aiRevision.value++;
@@ -260,8 +261,12 @@ async function fetchPage(scanId: number, currentFilter: typeof filter.value, cur
   return invoke<Page<Item>>("library_items", { scanId, filter: currentFilter, sort: currentSort, page });
 }
 watch([filter, activeSort], () => { requestedPage.value = 0; }, { flush: "sync" });
-watch([summary, filter, activeSort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
+watch([summary, filter, activeSort, requestedPage, revision, searchMode, aiRevision, () => props.mode, selectedPerson, () => selectedAlbum.value?.id, albumsRevision, indexStorageBusy], async ([scan, currentFilter, currentSort, page], _, onCleanup) => {
   if (!scan) return;
+  if (indexStorageBusy.value) {
+    itemsLoading.value = false;
+    return;
+  }
   const requestedLibrarySort = canChooseLibraryView.value ? currentSort : undefined;
   let receiving = true;
   onCleanup(() => { receiving = false; });
@@ -834,7 +839,8 @@ async function performFileAction(action: FileAction) {
       </div>
     </header>
 
-    <AiSearchSettings v-show="!peopleMode && !albumsMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="busy"
+    <AiSearchSettings v-show="!peopleMode && !albumsMode" ref="aiPanel" :scan-id="summary?.scanId" :library-busy="task !== undefined"
+      @storage-busy-change="indexStorageBusy = $event"
       @model-ready="aiReady = $event" @index-change="aiIndex = $event" @updated="aiRevision++" @model-changed="results = undefined; requestedPage = 0; aiRevision++" />
 
     <div v-if="task === 'starting' || task === 'scanning'" class="scan-status" role="status">
@@ -939,7 +945,8 @@ async function performFileAction(action: FileAction) {
       </div>
 
       <LocationMap v-if="!albumsMode" :scan-id="summary.scanId" :filter="filter" :person-id="peopleMode ? selectedPerson?.id ?? null : null"
-        :content-query="!peopleMode && searchMode === 'content' ? query : null" :revision="revision + peopleRevision + aiRevision" :focus="mapFocus" @select="selectLocation" />
+        :content-query="!peopleMode && searchMode === 'content' ? query : null" :revision="revision + peopleRevision + aiRevision" :focus="mapFocus"
+        :suspended="indexStorageBusy" @select="selectLocation" />
 
       <p v-if="searchMode === 'content' && !aiReady" role="status">请在“AI 搜索设置”中选择模型目录并下载安装。</p>
       <p v-else-if="searchMode === 'content' && !aiIndex?.enabled" role="status">请先点击“建立索引”，再描述照片内容进行搜索。</p>
